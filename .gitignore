@@ -1,0 +1,64 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# --- Virtual environment ---
+.venv/
+venv/
+env/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Claude config ---
+.claude/
+
+# --- Project data (large raw datasets) ---
+Data/*.nc
+
+# --- Output predictions & logs ---
+outputs/
+logs/
+*.log
+checkpoints/
+
+# --- Jupyter Notebook checkpoints ---
+.ipynb_checkpoints/
+
+# --- LaTeX build artifacts ---
+Paper/**/*.pdf
+Paper/**/*.aux
+Paper/**/*.bbl
+Paper/**/*.blg
+Paper/**/*.log
+Paper/**/*.out
+Paper/**/*.fls
+Paper/**/*.fdb_latexmk
+Paper/**/*.synctex.gz
+Paper/**/*.toc
+Paper/**/*.lof
+Paper/**/*.lot
+Paper/**/*.dvi
+Paper/**/*.ps
+
+# --- Large archives ---
+*.zip
+*.7z
+*.rar
+*.tar.gz
+
+# --- Docker ---
+Dockerfile

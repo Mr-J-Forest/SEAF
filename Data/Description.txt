@@ -1,0 +1,114 @@
+
+netcdf .\data\FullData_preprocessed.nc {
+  dimensions:
+    LONGITUDE = 360;
+    LATITUDE = 180;
+    LEVEL = 27;
+    TIME = UNLIMITED;   // (121 currently)
+  variables:
+    float LONGITUDE(LONGITUDE=360);
+      :_FillValue = NaNf; // float
+      :units = "degrees_east";
+      :title = "Longitude";
+      :long_name = "Longitude";
+      :axis = "X";
+
+    float LATITUDE(LATITUDE=180);
+      :_FillValue = NaNf; // float
+      :units = "degrees_north";
+      :title = "Latitude";
+      :long_name = "Latitude";
+      :axis = "Y";
+
+    float LEVEL(LEVEL=27);
+      :_FillValue = NaNf; // float
+      :units = "meters";
+      :positive = "down";
+      :title = "Depth Level";
+      :long_name = "Depth Level";
+      :axis = "Z";
+
+    float TEMP(TIME=121, LEVEL=27, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = NaNf; // float
+      :units = "degC";
+      :title = "Argo Temperature Monthly Mean";
+      :long_name = "Argo Temperature Monthly Mean";
+      :_ChunkSizes = 1U, 27U, 180U, 360U; // uint
+
+    float SALT(TIME=121, LEVEL=27, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = NaNf; // float
+      :units = "PSU";
+      :title = "Argo Salinity Monthly Mean";
+      :long_name = "Argo Salinity Monthly Mean";
+      :_ChunkSizes = 1U, 27U, 180U, 360U; // uint
+
+    float PTEMP(TIME=121, LEVEL=27, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = NaNf; // float
+      :title = "Argo Potential Temperature Monthly Mean";
+      :long_name = "Argo Potential Temperature Monthly Mean";
+      :units = "degC";
+      :_ChunkSizes = 1U, 27U, 180U, 360U; // uint
+
+    float PDEN(TIME=121, LEVEL=27, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = NaNf; // float
+      :units = "kg/m3";
+      :title = "Argo Potential Density Monthly Mean";
+      :long_name = "Argo Potential Density Monthly Mean";
+      :_ChunkSizes = 1U, 27U, 180U, 360U; // uint
+
+    float ADDEP(TIME=121, LEVEL=27, LATITUDE=180, LONGITUDE=360);
+      :title = "Argo-Aviso Absolute Dynamic Depth Monthly Mean";
+      :long_name = "Argo-Aviso Absolute Dynamic Depth Monthly Mean";
+      :_FillValue = NaNf; // float
+      :units = "dynamic meters";
+      :_ChunkSizes = 1U, 27U, 180U, 360U; // uint
+
+    float SPICE(TIME=121, LEVEL=27, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = NaNf; // float
+      :units = "unity";
+      :title = "Argo Spiciness Monthly Mean";
+      :long_name = "Argo Spiciness Monthly Mean";
+      :_ChunkSizes = 1U, 27U, 180U, 360U; // uint
+
+    int TIME(TIME=121);
+      :units = "YYYYMM format";
+      :long_name = "Time in year-month format";
+      :calendar = "gregorian";
+      :description = "Time converted from months since 2005-01-15 to YYYYMM format";
+      :title = "Months in Monthly Means";
+      :axis = "T";
+      :_ChunkSizes = 121U; // uint
+
+    double SSHA(TIME=121, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = NaN; // double
+      :long_name = "Sea Surface Height Anomaly";
+      :units = "m";
+      :description = "Sea Surface Height Anomaly from Jason-1 and Jason-2 satellites";
+      :fill_value = -999.0; // double
+      :_ChunkSizes = 1U, 180U, 360U; // uint
+
+    float UWND(TIME=121, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = -999.0f; // float
+      :long_name = "Eastward wind at 10m";
+      :units = "m s-1";
+      :description = "CCMP eastward wind interpolated to SSH grid";
+      :_ChunkSizes = 1U, 180U, 360U; // uint
+
+    float VWND(TIME=121, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = -999.0f; // float
+      :long_name = "Northward wind at 10m";
+      :units = "m s-1";
+      :description = "CCMP northward wind interpolated to SSH grid";
+      :_ChunkSizes = 1U, 180U, 360U; // uint
+
+    float SSW(TIME=121, LATITUDE=180, LONGITUDE=360);
+      :_FillValue = -999.0f; // float
+      :long_name = "Wind speed at 10m";
+      :units = "m s-1";
+      :description = "CCMP wind speed interpolated to SSH grid";
+      :_ChunkSizes = 1U, 180U, 360U; // uint
+
+  // global attributes:
+  :title = "Argo 1x1 degree variationaly interpolated monthly means";
+  :modification_history = "Time variable converted from \"months since 2005-01-15\" to YYYYMM format on 2025-06-21 22:47:18";
+}

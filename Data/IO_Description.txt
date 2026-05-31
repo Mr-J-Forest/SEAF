@@ -1,0 +1,8 @@
+data_path: "Data/FullData_preprocessed.nc"  # 数据文件路径
+input_variables: ["TEMP", "SALT", "LEVEL", "LATITUDE", "LONGITUDE", "TIME", "SSHA", "UWND", "VWND"]  # 输入变量
+同一处的所有深度的"SSHA", "UWND", "VWND"都用同一个值来填充
+target_variables: ["TEMP", "SALT"]     # 目标变量
+输入输出的范围
+经度范围: [130.5, 162.5]  # 经度范围，间隔1度
+纬度范围: [6.5, 27.5]  # 纬度范围，间隔1度
+深度范围: [0, 2000.0]  # 深度,间隔75米
