@@ -5,99 +5,92 @@ ConvLSTM海洋预测脚本 - 统一配置版本
 使用统一配置文件确保与训练脚本参数一致
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib
-import matplotlib.font_manager as fm
 import xarray as xr
 import os
 import json
-import glob
 from datetime import datetime
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Sequence
 import warnings
 warnings.filterwarnings('ignore')
 
 # 导入统一配置
 from config import DEFAULT_CONFIG, load_config, merge_configs, save_config
-from convlstm_model import OceanConvLSTMPredictor
+from convlstm_model import create_ocean_model
 from data_loader import OceanDataset
-
-# 设置matplotlib以支持中文显示
-def setup_chinese_fonts():
-    """设置中文字体支持"""
-    import matplotlib
-    
-    # 设置matplotlib使用Agg后端（无GUI，适合服务器环境）
-    matplotlib.use('Agg')
-    
-    # 获取系统所有可用字体
-    available_fonts = set([f.name for f in fm.fontManager.ttflist])
-    print(f"系统总字体数: {len(available_fonts)}")
-    
-    # 中文字体候选列表（按优先级排序）- 现在包含新安装的字体
-    chinese_fonts = [
-        'Noto Sans CJK SC',        # Google Noto 简体中文 (新安装)
-        'WenQuanYi Micro Hei',     # 文泉驿微米黑 (新安装)
-        'WenQuanYi Zen Hei',       # 文泉驿正黑 (新安装)
-        'SimHei',                  # 黑体 (Windows)
-        'Microsoft YaHei',         # 微软雅黑 (Windows)
-        'Source Han Sans SC',      # 思源黑体 (Adobe)
-        'Hiragino Sans GB',        # 冬青黑体 (macOS)
-        'PingFang SC',             # 苹方 (macOS)
-        'Arial Unicode MS',        # Unicode 字体 (macOS)
-        'STHeiti',                 # 华文黑体
-        'STSong',                  # 华文宋体
-        'Liberation Sans',         # 自由字体
-        'FreeSans',               # GNU字体
-        'DejaVu Sans'              # 备用字体
-    ]
-    
-    # 查找可用的中文字体
-    found_font = None
-    for font in chinese_fonts:
-        if font in available_fonts:
-            found_font = font
-            break
-    
-    # 设置字体
-    if found_font:
-        plt.rcParams['font.sans-serif'] = [found_font] + chinese_fonts
-        print(f"✓ 找到并设置中文字体: {found_font}")
-    else:
-        # 如果没有找到专门的中文字体，使用Unicode编码
-        plt.rcParams['font.sans-serif'] = chinese_fonts
-        print("⚠ 未找到专门的中文字体，使用Unicode编码显示")
-    
-    # 重要：设置负号正确显示
-    plt.rcParams['axes.unicode_minus'] = False
-    
-    # 设置字体编码为UTF-8
-    plt.rcParams['font.family'] = 'sans-serif'
-    
-    # 设置字体大小
-    plt.rcParams['font.size'] = 11
-    plt.rcParams['axes.titlesize'] = 14
-    plt.rcParams['axes.labelsize'] = 12
-    plt.rcParams['xtick.labelsize'] = 10
-    plt.rcParams['ytick.labelsize'] = 10
-    plt.rcParams['legend.fontsize'] = 10
-    
-    return found_font
+from font_config import setup_chinese_fonts
 
 # 初始化中文字体
 setup_chinese_fonts()
 
+
+def generate_cosine_weights(height: int, width: int, taper_ratio: float = 0.25,
+                            min_weight: float = 1e-3) -> np.ndarray:
+    """
+    生成2D余弦衰减权重，用于 overlap-tile 融合。
+
+    窗口中心区域权重=1，四周 taper_ratio 比例区域做余弦衰减。
+    W_2d = W_h × W_w（外积），边缘最低权重 clamp 到 min_weight。
+
+    Args:
+        height: 窗口高度（纬度方向格点数）
+        width: 窗口宽度（经度方向格点数）
+        taper_ratio: 衰减带占窗口尺寸的比例，默认0.25
+        min_weight: 边缘最低权重，避免除零/空洞
+
+    Returns:
+        (height, width) float32 权重数组
+    """
+    taper_h = max(1, int(height * taper_ratio))
+    taper_w = max(1, int(width * taper_ratio))
+
+    def _cosine_taper_1d(size: int, taper: int) -> np.ndarray:
+        w = np.ones(size, dtype=np.float32)
+        for i in range(taper):
+            cos_val = 0.5 * (1.0 - np.cos(np.pi * i / max(taper - 1, 1)))
+            val = min_weight + (1.0 - min_weight) * cos_val
+            w[i] = val
+            w[-(i + 1)] = val
+        return w
+
+    h_weights = _cosine_taper_1d(height, taper_h)
+    w_weights = _cosine_taper_1d(width, taper_w)
+    return np.outer(h_weights, w_weights).astype(np.float32)
+
+
+def build_validity_mask(data_2d: np.ndarray) -> np.ndarray:
+    """
+    根据数据构建有效性 mask：NaN → weight=0，有效 → weight=1。
+
+    用于融合时将陆地/缺失区域排除在加权平均之外。
+
+    Args:
+        data_2d: (H, W) 二维数据数组
+
+    Returns:
+        (H, W) float32 mask 数组
+    """
+    mask = (~np.isnan(data_2d)).astype(np.float32)
+    return mask
+
+
 class SmartOceanPredictor:
-    """智能海洋预测器 - 使用统一配置自动匹配模型"""
+    """智能海洋预测器 - 使用统一配置并按编号加载模型"""
     
-    def __init__(self, config: Optional[Dict] = None, output_dir: Optional[str] = None):
+    def __init__(self,
+                 model_index: int,
+                 config: Optional[Dict] = None,
+                 output_dir: Optional[str] = None,
+                 selected_variables: Optional[Sequence[str]] = None):
         """
         初始化预测器
         
         Args:
+            model_index: 结果目录编号（outputs/results/<index>_*）
             config: 配置字典，如果为None则使用默认配置
             output_dir: 输出目录，默认自动生成
         """
@@ -106,94 +99,84 @@ class SmartOceanPredictor:
             self.config = DEFAULT_CONFIG.copy()
         else:
             self.config = config
-            
+
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_index = model_index
         
         # 创建输出目录
         if output_dir is None:
             timestamp = datetime.now().strftime(self.config['timestamp_format'])
-            self.output_dir = os.path.join(self.config['predictions_dir'], f"predictions_{timestamp}")
+            self.output_dir = os.path.join(
+                self.config['predictions_dir'],
+                f"predictions_model{model_index}_{timestamp}"
+            )
         else:
             self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # 自动查找并加载最佳匹配的模型
-        self.model_path, self.model_config = self._find_best_model()
-        print(f"使用模型: {self.model_path}")
-        print(f"模型配置与统一配置合并完成")
+        self.model_dir, self.model_path = self._resolve_model_by_index(model_index)
+        print(f"使用模型目录: {self.model_dir}")
+        print(f"使用权重: {self.model_path}")
         
         # 加载模型
         self._load_model()
+
+        self.target_variables = self.config.get('target_variables', [])
+        self.selected_variables = list(selected_variables) if selected_variables else None
+        if self.selected_variables:
+            # 保留与模型配置交集，保持原始顺序
+            filtered = [var for var in self.target_variables if var in self.selected_variables]
+            if not filtered:
+                print(f"警告: 选择的变量 {self.selected_variables} 不在模型目标变量 {self.target_variables} 中，采用模型默认变量")
+                self.active_target_variables = list(self.target_variables)
+            else:
+                self.active_target_variables = filtered
+        else:
+            self.active_target_variables = list(self.target_variables)
+
+        self.target_channel_slices: Dict[str, slice] = self._slice_map_from_config('target_channel_slices')
         
         print(f"预测结果将保存到: {self.output_dir}")
-    
-    def _find_best_model(self) -> Tuple[str, Dict]:
-        """查找最佳匹配的模型和配置"""
-        print("正在搜索可用的模型...")
-        
-        # 查找所有模型文件
-        model_patterns = [
-            f"{self.config['results_dir']}/**/{self.config['model_filename']}",
-            f"{self.config['results_dir']}/**/{self.config['checkpoint_filename']}",
-            f"{self.config['results_dir']}/**/*.pth"
-        ]
-        
-        model_candidates = []
-        for pattern in model_patterns:
-            model_candidates.extend(glob.glob(pattern, recursive=True))
-        
-        if not model_candidates:
-            raise FileNotFoundError("未找到任何模型文件(.pth)")
-        
-        # 按修改时间排序，优先使用最新的
-        model_candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        
-        # 尝试每个模型，找到第一个能成功加载的
-        for model_path in model_candidates:
-            print(f"尝试模型: {model_path}")
-            
-            # 查找对应的config.json
-            model_dir = os.path.dirname(model_path)
-            config_path = os.path.join(model_dir, self.config['config_filename'])
-            
-            if not os.path.exists(config_path):
-                print(f"  跳过: 未找到配置文件 {config_path}")
-                continue
-            
-            try:
-                # 读取模型配置
-                model_config = load_config(config_path)
-                
-                # 合并模型配置和统一配置
-                merged_config = merge_configs(model_config, self.config)
-                
-                # 尝试创建模型并加载权重
-                test_model = OceanConvLSTMPredictor(merged_config)
-                checkpoint = torch.load(model_path, map_location='cpu')
-                
-                if 'model_state_dict' in checkpoint:
-                    test_model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    test_model.load_state_dict(checkpoint)
-                
-                print(f"  成功: 模型结构匹配")
-                
-                # 更新当前配置为合并后的配置
-                self.config = merged_config
-                return model_path, merged_config
-                
-            except Exception as e:
-                print(f"  失败: {str(e)[:100]}...")
-                continue
-        
-        raise RuntimeError("未找到任何可用的模型，请检查模型文件和配置是否匹配")
+
+    def _slice_map_from_config(self, key: str) -> Dict[str, slice]:
+        raw_map = self.config.get(key, {})
+        slice_map: Dict[str, slice] = {}
+        if not isinstance(raw_map, dict):
+            return slice_map
+        for name, bounds in raw_map.items():
+            if isinstance(bounds, (list, tuple)) and len(bounds) >= 2:
+                slice_map[name] = slice(int(bounds[0]), int(bounds[1]))
+        return slice_map
+
+    def _resolve_model_by_index(self, model_index: int) -> Tuple[str, str]:
+        base_dir = self.config['results_dir']
+        dirs = sorted([d for d in os.listdir(base_dir)
+                       if os.path.isdir(os.path.join(base_dir, d)) and d.split('_')[0].isdigit()])
+        candidates = [d for d in dirs if int(d.split('_')[0]) == model_index]
+        if not candidates:
+            raise ValueError(f"未找到编号 {model_index} 的模型目录")
+        result_dir = os.path.join(base_dir, candidates[0])
+        config_path = os.path.join(result_dir, self.config['config_filename'])
+        model_path = os.path.join(result_dir, self.config['model_filename'])
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型文件不存在: {model_path}")
+        model_config = load_config(config_path)
+        merged_config = merge_configs(model_config, self.config)
+        if 'enable_climatology_anomaly' not in model_config:
+            # Older checkpoints were trained without anomaly/climatology channels.
+            merged_config['enable_climatology_anomaly'] = False
+            merged_config['include_climatology_features'] = False
+        self.config = merged_config
+        return result_dir, model_path
     
     def _load_model(self):
         """加载模型"""
         print("加载模型...")
         
         # 创建模型
-        self.model = OceanConvLSTMPredictor(self.config).to(self.device)
+        self.model = create_ocean_model(self.config).to(self.device)
         
         # 加载权重
         checkpoint = torch.load(self.model_path, map_location=self.device)
@@ -209,6 +192,22 @@ class SmartOceanPredictor:
         
         self.model.eval()
         print("模型加载成功!")
+
+    def _extract_variable_channels(self, tensor: torch.Tensor, variables: Sequence[str]) -> torch.Tensor:
+        """根据选定变量提取通道"""
+        if not variables or not self.target_channel_slices:
+            return tensor
+        parts = []
+        for var in variables:
+            sl = self.target_channel_slices.get(var)
+            if sl is None:
+                continue
+            parts.append(tensor[:, sl, :, :])
+        if not parts:
+            return tensor
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)
     
     def predict(self, num_samples: Optional[int] = None):
         """
@@ -222,8 +221,11 @@ class SmartOceanPredictor:
             
         print(f"开始预测 {num_samples} 个样本...")
         
-        # 创建测试数据集
+        # 创建测试数据集（包含所有100%海洋窗口）
         test_dataset = OceanDataset(self.config['data_path'], self.config, mode='test')
+        dataset_slices = getattr(test_dataset, 'target_channel_slices', {}) or {}
+        if dataset_slices:
+            self.target_channel_slices = dataset_slices
         
         if len(test_dataset) == 0:
             print("测试集为空，无法进行预测")
@@ -235,27 +237,35 @@ class SmartOceanPredictor:
         predictions = []
         targets = []
         inputs_list = []
+        sample_indices = []
         
         print(f"数据集大小: {len(test_dataset)}")
         print(f"实际预测样本数: {num_samples}")
-        
+
         with torch.no_grad():
             for i in range(num_samples):
-                inputs, target = test_dataset[i]
+                sample = test_dataset[i]
+                if isinstance(sample, (list, tuple)) and len(sample) == 3:
+                    inputs, target, _ = sample
+                else:
+                    inputs, target = sample
                 inputs = inputs.unsqueeze(0).to(self.device)  # 添加batch维度
-                
+
                 # 模型预测
                 output = self.model(inputs)
-                
+
                 # 检查输出是否有效
                 if torch.isnan(output).any() or torch.isinf(output).any():
                     print(f"警告: 样本 {i} 的预测结果包含NaN或Inf，跳过")
                     continue
-                
+
+                output_cpu = output.cpu()
+
                 # 转换回CPU并保存
-                predictions.append(output.cpu().squeeze(0))
+                predictions.append(output_cpu.squeeze(0))
                 targets.append(target)
                 inputs_list.append(inputs.cpu().squeeze(0))
+                sample_indices.append(i)
                 
                 if (i + 1) % 5 == 0:
                     print(f"已完成 {i + 1}/{num_samples} 个样本的预测")
@@ -267,7 +277,12 @@ class SmartOceanPredictor:
         print(f"成功预测 {len(predictions)} 个样本")
         
         # 反标准化预测结果和目标
-        predictions_original, targets_original = self._denormalize_predictions(predictions, targets, test_dataset)
+        predictions_original, targets_original = self._denormalize_predictions(
+            predictions,
+            targets,
+            test_dataset,
+            sample_indices=sample_indices,
+        )
         
         # 计算评估指标（使用反标准化后的数据）
         metrics = self._compute_metrics(predictions_original, targets_original)
@@ -277,21 +292,563 @@ class SmartOceanPredictor:
         self._visualize_results(predictions_original, targets_original, inputs_list, metrics, test_dataset)
         
         print(f"预测完成！结果保存在: {self.output_dir}")
-    
-    def _denormalize_predictions(self, predictions, targets, dataset):
-        """反标准化预测结果和目标数据"""
+
+    def predict_full_map(self, target_lon_range=None, target_lat_range=None,
+                         base_time_index=None, pred_step: int = 0):
+        """
+        全图 overlap-tile 推理：用密集滑窗覆盖目标区域，逐窗口预测后用余弦权重融合。
+
+        Args:
+            target_lon_range: [min_lon, max_lon]，默认使用数据完整经度范围
+            target_lat_range: [min_lat, max_lat]，默认使用数据完整纬度范围
+            base_time_index: 输入序列结束的时间索引（在 test 时间段内），默认取 test 段最后一个可用位置
+            pred_step: 取第几个预测步的输出（0-indexed）
+
+        Returns:
+            dict: {
+                'blended_pred': (channels, H, W) 融合后的预测,
+                'blended_target': (channels, H, W) 融合后的真实值,
+                'weight_sum': (H, W) 每个格点的权重和,
+                'lons': 经度坐标,
+                'lats': 纬度坐标
+            }
+        """
+        return self._predict_full_map_with_dataset(
+            target_lon_range=target_lon_range,
+            target_lat_range=target_lat_range,
+            base_time_index=base_time_index,
+            pred_step=pred_step,
+        )
+
+        taper_ratio = self.config.get('taper_ratio', 0.25)
+        min_weight = self.config.get('min_blend_weight', 1e-3)
+        stride_lon = self.config.get('inference_stride_lon', 4.0)
+        stride_lat = self.config.get('inference_stride_lat', 4.0)
+        seq_len = self.config['sequence_length']
+
+        # 1. 获取 scalers（用 train 模式快速获取）
+        print("获取标准化参数...")
+        ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
+        scalers = ref_dataset.scalers
+        input_vars = self.config['input_variables']
+        target_vars = self.config['target_variables']
+        available_vars = ref_dataset.available_variables
+        ref_dataset.dataset.close()
+
+        # 2. 打开数据
+        ds = xr.open_dataset(self.config['data_path'])
+        ds = ds.sel(LEVEL=slice(self.config['depth_range'][0], self.config['depth_range'][1]))
+
+        all_lons = ds.LONGITUDE.values.astype(np.float64)
+        all_lats = ds.LATITUDE.values.astype(np.float64)
+        times = ds.TIME.values
+
+        # 验证输入变量
+        valid_input_vars = [v for v in input_vars if v in available_vars and v in ds.data_vars]
+
+        # 3. 确定目标范围
+        if target_lon_range is None:
+            target_lon_range = [float(all_lons.min()), float(all_lons.max())]
+        if target_lat_range is None:
+            target_lat_range = [float(all_lats.min()), float(all_lats.max())]
+
+        # 窗口尺寸（度）
+        win_lon = self.config['lon_range'][1] - self.config['lon_range'][0]
+        win_lat = self.config['lat_range'][1] - self.config['lat_range'][0]
+
+        # 4. 确定时间索引
+        total_t = len(times)
+        train_end = int(total_t * self.config.get('train_ratio', 0.6))
+        val_end = int(total_t * (self.config.get('train_ratio', 0.6) + self.config.get('val_ratio', 0.2)))
+        test_start = val_end
+
+        if base_time_index is None:
+            base_time_index = min(test_start + seq_len, total_t - self.config['prediction_length'] - 1)
+        base_time_index = max(test_start + seq_len - 1, min(base_time_index, total_t - self.config['prediction_length'] - 1))
+
+        print(f"全图推理: 输入序列结束于时间索引 {base_time_index}")
+        print(f"  目标范围: 经度 [{target_lon_range[0]:.1f}, {target_lon_range[1]:.1f}], "
+              f"纬度 [{target_lat_range[0]:.1f}, {target_lat_range[1]:.1f}]")
+        print(f"  推理步长: 经度={stride_lon}°, 纬度={stride_lat}°")
+        print(f"  余弦衰减: taper_ratio={taper_ratio}, min_weight={min_weight}")
+
+        # 5. 生成窗口位置网格
+        lon_starts = np.arange(target_lon_range[0], target_lon_range[1] - win_lon + stride_lon * 0.5, stride_lon)
+        lat_starts = np.arange(target_lat_range[0], target_lat_range[1] - win_lat + stride_lat * 0.5, stride_lat)
+
+        if len(lon_starts) == 0:
+            lon_starts = np.array([target_lon_range[0]])
+        if len(lat_starts) == 0:
+            lat_starts = np.array([target_lat_range[0]])
+
+        print(f"  窗口网格: {len(lon_starts)} (经度) × {len(lat_starts)} (纬度) = {len(lon_starts) * len(lat_starts)} 个窗口")
+
+        # 6. 确定全图格点范围
+        lon_res = float(all_lons[1] - all_lons[0]) if len(all_lons) > 1 else 1.0
+        lat_res = float(all_lats[1] - all_lats[0]) if len(all_lats) > 1 else 1.0
+
+        full_lon_start_idx = max(0, int(np.searchsorted(all_lons, target_lon_range[0])))
+        full_lon_end_idx = min(len(all_lons), int(np.searchsorted(all_lons, target_lon_range[1])) + 1)
+        full_lat_start_idx = max(0, int(np.searchsorted(all_lats, target_lat_range[0])))
+        full_lat_end_idx = min(len(all_lats), int(np.searchsorted(all_lats, target_lat_range[1])) + 1)
+
+        full_h = full_lat_end_idx - full_lat_start_idx
+        full_w = full_lon_end_idx - full_lon_start_idx
+        full_lons = all_lons[full_lon_start_idx:full_lon_end_idx]
+        full_lats = all_lats[full_lat_start_idx:full_lat_end_idx]
+
+        # 窗口格点数（从第一个窗口推算）
+        first_win_lon_end = target_lon_range[0] + win_lon
+        first_win_lat_end = target_lat_range[0] + win_lat
+        win_w = int(np.searchsorted(all_lons, first_win_lon_end) - np.searchsorted(all_lons, target_lon_range[0]))
+        win_h = int(np.searchsorted(all_lats, first_win_lat_end) - np.searchsorted(all_lats, target_lat_range[0]))
+
+        # 输出通道数（从模型配置获取）
+        # 用第一个预测样本的形状推断
+        num_target_vars = len(target_vars)
+
+        # 7. 余弦权重模板
+        cos_weights = generate_cosine_weights(win_h, win_w, taper_ratio, min_weight)  # (win_h, win_w)
+
+        # 8. 累积器
+        # 输出通道数 = 深度层数 × 目标变量数，用第一个窗口的实际输出确定
+        total_out_channels = None
+        blended_pred = None
+        blended_target = None
+        weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
+
+        # 9. 逐窗口预测并融合
+        self.model.eval()
+        valid_windows = 0
+
+        with torch.no_grad():
+            for lat_start in lat_starts:
+                for lon_start in lon_starts:
+                    lon_end = lon_start + win_lon
+                    lat_end = lat_start + win_lat
+
+                    # 切片数据
+                    try:
+                        win_ds = ds.sel(
+                            LONGITUDE=slice(lon_start, lon_end),
+                            LATITUDE=slice(lat_start, lat_end)
+                        )
+                    except Exception:
+                        continue
+
+                    # 检查数据有效性
+                    if 'TEMP' not in win_ds.data_vars:
+                        continue
+                    temp_check = win_ds.TEMP.isel(TIME=0, LEVEL=0).values
+                    if temp_check.size == 0 or np.all(np.isnan(temp_check)):
+                        continue
+
+                    # 提取输入序列
+                    input_seq_data = {}
+                    for var in valid_input_vars:
+                        if var in win_ds.data_vars:
+                            data = win_ds[var].values
+                            input_seq_data[var] = data[base_time_index - seq_len + 1:base_time_index + 1]
+
+                    # 提取目标序列
+                    target_seq_data = {}
+                    for var in target_vars:
+                        if var in win_ds.data_vars:
+                            data = win_ds[var].values
+                            t_start = base_time_index + 1
+                            t_end = t_start + self.config['prediction_length']
+                            target_seq_data[var] = data[t_start:t_end]
+
+                    if not input_seq_data:
+                        continue
+
+                    # 填充缺失值 + 标准化
+                    for var in input_seq_data:
+                        if np.isnan(input_seq_data[var]).any():
+                            input_seq_data[var] = self._fill_nan(input_seq_data[var])
+                    for var in target_seq_data:
+                        if np.isnan(target_seq_data[var]).any():
+                            target_seq_data[var] = self._fill_nan(target_seq_data[var])
+
+                    # 构建输入张量 (seq_len, lat, lon, channels)
+                    input_arrays = []
+                    for var in valid_input_vars:
+                        if var in input_seq_data:
+                            v = input_seq_data[var]
+                            if v.ndim == 4:  # (seq, level, lat, lon) → (seq, lat, lon, level)
+                                v = v.transpose(0, 2, 3, 1)
+                            elif v.ndim == 3:
+                                v = v[:, :, :, np.newaxis]
+                            else:
+                                continue
+                            # 标准化
+                            if var in scalers:
+                                orig_shape = v.shape
+                                v_2d = v.reshape(-1, 1)
+                                v_2d = scalers[var].transform(v_2d)
+                                v = v_2d.reshape(orig_shape)
+                            input_arrays.append(v.astype(np.float32))
+
+                    if not input_arrays:
+                        continue
+
+                    input_tensor = torch.from_numpy(
+                        np.concatenate(input_arrays, axis=-1)
+                    ).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)  # (1, seq, C, H, W)
+
+                    # 构建目标张量
+                    target_arrays = []
+                    for var in target_vars:
+                        if var in target_seq_data:
+                            v = target_seq_data[var]
+                            if v.ndim == 4:
+                                v = v.transpose(0, 2, 3, 1)
+                            elif v.ndim == 3:
+                                v = v[:, :, :, np.newaxis]
+                            else:
+                                continue
+                            if var in scalers:
+                                orig_shape = v.shape
+                                v_2d = v.reshape(-1, 1)
+                                v_2d = scalers[var].transform(v_2d)
+                                v = v_2d.reshape(orig_shape)
+                            target_arrays.append(v.astype(np.float32))
+
+                    target_tensor = None
+                    if target_arrays:
+                        target_tensor = torch.from_numpy(
+                            np.concatenate(target_arrays, axis=-1)
+                        ).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)
+
+                    # 模型预测
+                    output = self.model(input_tensor)  # (1, pred_len, C, H, W)
+                    pred = output[0, pred_step].cpu().numpy()  # (C, H, W)
+                    target = target_tensor[0, pred_step].cpu().numpy() if target_tensor is not None else None
+
+                    if total_out_channels is None:
+                        total_out_channels = pred.shape[0]
+                        blended_pred = np.zeros((total_out_channels, full_h, full_w), dtype=np.float64)
+                        blended_target = np.zeros((total_out_channels, full_h, full_w), dtype=np.float64)
+
+                    # 反标准化
+                    for var_idx, var_name in enumerate(target_vars):
+                        if var_name in scalers:
+                            ch_slice = self.target_channel_slices.get(var_name)
+                            if ch_slice is not None:
+                                ch_start, ch_stop = ch_slice.start, ch_slice.stop
+                                if ch_start is not None and ch_stop is not None:
+                                    var_pred = pred[ch_start:ch_stop]
+                                    var_shape = var_pred.shape
+                                    var_2d = var_pred.reshape(-1, 1)
+                                    var_2d = scalers[var_name].inverse_transform(var_2d)
+                                    pred[ch_start:ch_stop] = var_2d.reshape(var_shape)
+                                    if target is not None:
+                                        var_target = target[ch_start:ch_stop]
+                                        var_2d_t = var_target.reshape(-1, 1)
+                                        var_2d_t = scalers[var_name].inverse_transform(var_2d_t)
+                                        target[ch_start:ch_stop] = var_2d_t.reshape(var_shape)
+
+                    # 确定在全图中的位置
+                    lon_idx_start = int(np.searchsorted(all_lons, lon_start)) - full_lon_start_idx
+                    lat_idx_start = int(np.searchsorted(all_lats, lat_start)) - full_lat_start_idx
+                    lon_idx_end = lon_idx_start + win_w
+                    lat_idx_end = lat_idx_start + win_h
+
+                    # Clip to full map bounds
+                    p_h_start = 0
+                    p_w_start = 0
+                    p_h_end = win_h
+                    p_w_end = win_w
+
+                    if lat_idx_start < 0:
+                        p_h_start = -lat_idx_start
+                        lat_idx_start = 0
+                    if lon_idx_start < 0:
+                        p_w_start = -lon_idx_start
+                        lon_idx_start = 0
+                    if lat_idx_end > full_h:
+                        p_h_end = win_h - (lat_idx_end - full_h)
+                        lat_idx_end = full_h
+                    if lon_idx_end > full_w:
+                        p_w_end = win_w - (lon_idx_end - full_w)
+                        lon_idx_end = full_w
+
+                    if lat_idx_end <= lat_idx_start or lon_idx_end <= lon_idx_start:
+                        continue
+
+                    # 应用余弦权重并累积
+                    weights_slice = cos_weights[p_h_start:p_h_end, p_w_start:p_w_end]  # (h_slice, w_slice)
+                    weights_3d = weights_slice[np.newaxis, :, :]  # (1, h, w)
+
+                    pred_slice = pred[:, p_h_start:p_h_end, p_w_start:p_w_end]  # (C, h, w)
+
+                    blended_pred[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += pred_slice * weights_3d
+                    if target is not None:
+                        target_slice = target[:, p_h_start:p_h_end, p_w_start:p_w_end]
+                        blended_target[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += target_slice * weights_3d
+
+                    weight_sum[lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += weights_slice
+                    valid_windows += 1
+
+        ds.close()
+
+        if valid_windows == 0:
+            raise RuntimeError("没有有效窗口可用于全图推理")
+
+        # 10. 归一化
+        weight_sum_3d = np.maximum(weight_sum, min_weight)[np.newaxis, :, :]
+        blended_pred /= weight_sum_3d
+        blended_target /= weight_sum_3d
+
+        print(f"全图推理完成: {valid_windows} 个有效窗口融合")
+        print(f"  输出尺寸: {blended_pred.shape}")
+
+        return {
+            'blended_pred': blended_pred.astype(np.float32),
+            'blended_target': blended_target.astype(np.float32),
+            'weight_sum': weight_sum.astype(np.float32),
+            'lons': full_lons,
+            'lats': full_lats
+        }
+
+    def _predict_full_map_with_dataset(self, target_lon_range=None, target_lat_range=None,
+                                       base_time_index=None, pred_step: int = 0):
+        """使用 OceanDataset 生成密集窗口，确保训练和全图推理的输入通道一致。"""
+        taper_ratio = self.config.get('taper_ratio', 0.25)
+        min_weight = self.config.get('min_blend_weight', 1e-3)
+        stride_lon = self.config.get('inference_stride_lon', 4.0)
+        stride_lat = self.config.get('inference_stride_lat', 4.0)
+        seq_len = self.config['sequence_length']
+        pred_len = self.config['prediction_length']
+
+        print("获取训练期标准化参数...")
+        ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
+        scalers = ref_dataset.scalers
+
+        print("构建密集推理窗口数据集...")
+        dense_dataset = OceanDataset(
+            self.config['data_path'],
+            self.config,
+            mode='test',
+            scalers=scalers,
+            override_stride_lon=stride_lon,
+            override_stride_lat=stride_lat,
+        )
+
+        try:
+            all_lons = dense_dataset.dataset.LONGITUDE.values.astype(np.float64)
+            all_lats = dense_dataset.dataset.LATITUDE.values.astype(np.float64)
+            times = dense_dataset.times
+
+            if target_lon_range is None:
+                target_lon_range = [float(all_lons.min()), float(all_lons.max())]
+            if target_lat_range is None:
+                target_lat_range = [float(all_lats.min()), float(all_lats.max())]
+
+            total_t = len(times)
+            val_end = int(total_t * (
+                self.config.get('train_ratio', 0.6) + self.config.get('val_ratio', 0.2)
+            ))
+            test_start = val_end
+
+            if base_time_index is None:
+                base_time_index = min(test_start + seq_len, total_t - pred_len - 1)
+            base_time_index = max(test_start + seq_len - 1, min(base_time_index, total_t - pred_len - 1))
+            sequence_start = base_time_index - seq_len + 1
+            pred_step = max(0, min(int(pred_step), pred_len - 1))
+
+            lon_indices = np.where((all_lons >= target_lon_range[0]) & (all_lons <= target_lon_range[1]))[0]
+            lat_indices = np.where((all_lats >= target_lat_range[0]) & (all_lats <= target_lat_range[1]))[0]
+            if len(lon_indices) == 0 or len(lat_indices) == 0:
+                raise ValueError("目标经纬度范围没有覆盖任何网格点")
+
+            full_lon_start_idx = int(lon_indices[0])
+            full_lon_end_idx = int(lon_indices[-1]) + 1
+            full_lat_start_idx = int(lat_indices[0])
+            full_lat_end_idx = int(lat_indices[-1]) + 1
+            full_lons = all_lons[full_lon_start_idx:full_lon_end_idx]
+            full_lats = all_lats[full_lat_start_idx:full_lat_end_idx]
+            full_h = len(full_lats)
+            full_w = len(full_lons)
+
+            candidate_indices = []
+            for sample_idx, (start_idx, region_idx) in enumerate(dense_dataset.sequences):
+                if start_idx != sequence_start:
+                    continue
+                region = dense_dataset.all_regions_data[region_idx]
+                lon_range = region['lon_range']
+                lat_range = region['lat_range']
+                if lon_range[1] < target_lon_range[0] or lon_range[0] > target_lon_range[1]:
+                    continue
+                if lat_range[1] < target_lat_range[0] or lat_range[0] > target_lat_range[1]:
+                    continue
+                candidate_indices.append(sample_idx)
+
+            if not candidate_indices:
+                raise RuntimeError("没有匹配目标时间和范围的推理窗口")
+
+            print(f"全图推理: 输入序列结束于时间索引 {base_time_index}")
+            print(f"  目标范围: 经度 [{target_lon_range[0]:.1f}, {target_lon_range[1]:.1f}], "
+                  f"纬度 [{target_lat_range[0]:.1f}, {target_lat_range[1]:.1f}]")
+            print(f"  推理步长: 经度={stride_lon}°, 纬度={stride_lat}°")
+            print(f"  候选窗口: {len(candidate_indices)}")
+
+            blended_pred = None
+            blended_target = None
+            weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
+            valid_windows = 0
+
+            self.model.eval()
+            with torch.no_grad():
+                for sample_idx in candidate_indices:
+                    start_idx, region_idx = dense_dataset.sequences[sample_idx]
+                    region = dense_dataset.all_regions_data[region_idx]
+                    coords = region['coords']
+                    window_lons = coords['lons'].astype(np.float64)
+                    window_lats = coords['lats'].astype(np.float64)
+
+                    inputs, target_tensor = dense_dataset[sample_idx]
+                    output = self.model(inputs.unsqueeze(0).to(self.device))
+                    if torch.isnan(output).any() or torch.isinf(output).any():
+                        print(f"警告: 窗口 {sample_idx} 输出包含 NaN/Inf，已跳过")
+                        continue
+
+                    pred_phys = dense_dataset.inverse_transform_targets(
+                        output.cpu().numpy(),
+                        sample_indices=[sample_idx],
+                    )[0, pred_step]
+                    target_phys = dense_dataset.inverse_transform_targets(
+                        target_tensor.unsqueeze(0).numpy(),
+                        sample_indices=[sample_idx],
+                    )[0, pred_step]
+
+                    if blended_pred is None:
+                        out_channels = pred_phys.shape[0]
+                        blended_pred = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
+                        blended_target = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
+
+                    win_h = len(window_lats)
+                    win_w = len(window_lons)
+                    weights = generate_cosine_weights(win_h, win_w, taper_ratio, min_weight)
+
+                    lon_idx_start = int(np.searchsorted(all_lons, window_lons[0])) - full_lon_start_idx
+                    lat_idx_start = int(np.searchsorted(all_lats, window_lats[0])) - full_lat_start_idx
+                    lon_idx_end = lon_idx_start + win_w
+                    lat_idx_end = lat_idx_start + win_h
+
+                    p_h_start = 0
+                    p_w_start = 0
+                    p_h_end = win_h
+                    p_w_end = win_w
+
+                    if lat_idx_start < 0:
+                        p_h_start = -lat_idx_start
+                        lat_idx_start = 0
+                    if lon_idx_start < 0:
+                        p_w_start = -lon_idx_start
+                        lon_idx_start = 0
+                    if lat_idx_end > full_h:
+                        p_h_end = win_h - (lat_idx_end - full_h)
+                        lat_idx_end = full_h
+                    if lon_idx_end > full_w:
+                        p_w_end = win_w - (lon_idx_end - full_w)
+                        lon_idx_end = full_w
+
+                    if lat_idx_end <= lat_idx_start or lon_idx_end <= lon_idx_start:
+                        continue
+
+                    weights_slice = weights[p_h_start:p_h_end, p_w_start:p_w_end]
+                    weights_3d = weights_slice[np.newaxis, :, :]
+                    pred_slice = pred_phys[:, p_h_start:p_h_end, p_w_start:p_w_end]
+                    target_slice = target_phys[:, p_h_start:p_h_end, p_w_start:p_w_end]
+
+                    blended_pred[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += pred_slice * weights_3d
+                    blended_target[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += target_slice * weights_3d
+                    weight_sum[lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += weights_slice
+                    valid_windows += 1
+
+            if valid_windows == 0 or blended_pred is None:
+                raise RuntimeError("没有有效窗口可用于全图推理")
+
+            weight_sum_3d = np.maximum(weight_sum, min_weight)[np.newaxis, :, :]
+            blended_pred /= weight_sum_3d
+            blended_target /= weight_sum_3d
+
+            print(f"全图推理完成: {valid_windows} 个有效窗口融合")
+            print(f"  输出尺寸: {blended_pred.shape}")
+
+            return {
+                'blended_pred': blended_pred.astype(np.float32),
+                'blended_target': blended_target.astype(np.float32),
+                'weight_sum': weight_sum.astype(np.float32),
+                'lons': full_lons,
+                'lats': full_lats,
+            }
+        finally:
+            dense_dataset.dataset.close()
+            ref_dataset.dataset.close()
+
+    @staticmethod
+    def _fill_nan(data: np.ndarray) -> np.ndarray:
+        """填充 NaN 值（使用有效值均值）"""
+        if not np.isnan(data).any():
+            return data
+        valid_mask = ~np.isnan(data)
+        if valid_mask.sum() == 0:
+            return np.zeros_like(data)
+        global_mean = float(np.nanmean(data))
+        if data.ndim == 4:
+            for t in range(data.shape[0]):
+                for d in range(data.shape[1]):
+                    sl = data[t, d]
+                    nan_mask = np.isnan(sl)
+                    if nan_mask.any():
+                        sl_mean = np.nanmean(sl)
+                        sl[nan_mask] = sl_mean if not np.isnan(sl_mean) else global_mean
+                        data[t, d] = sl
+        elif data.ndim == 3:
+            for t in range(data.shape[0]):
+                sl = data[t]
+                nan_mask = np.isnan(sl)
+                if nan_mask.any():
+                    sl_mean = np.nanmean(sl)
+                    sl[nan_mask] = sl_mean if not np.isnan(sl_mean) else global_mean
+                    data[t] = sl
+        data[np.isnan(data)] = global_mean
+        return data
+
+    def _denormalize_predictions(self, predictions, targets, dataset, sample_indices=None):
+        """反标准化预测结果和目标数据，anomaly 模式下同时加回气候态。"""
         print("反标准化预测结果...")
-        
+
+        if hasattr(dataset, 'inverse_transform_targets'):
+            try:
+                pred_np = torch.stack(predictions).numpy()
+                target_np = torch.stack(targets).numpy()
+                pred_original = dataset.inverse_transform_targets(
+                    pred_np,
+                    sample_indices=sample_indices,
+                )
+                target_original = dataset.inverse_transform_targets(
+                    target_np,
+                    sample_indices=sample_indices,
+                )
+                predictions_original = [torch.from_numpy(arr.astype(np.float32)) for arr in pred_original]
+                targets_original = [torch.from_numpy(arr.astype(np.float32)) for arr in target_original]
+                print("反标准化完成")
+                return predictions_original, targets_original
+            except Exception as exc:
+                print(f"警告: 目标物理量恢复失败，回退到普通反标准化: {exc}")
+
         if not hasattr(dataset, 'scalers') or not dataset.scalers:
             print("警告: 未找到标准化器，使用原始数据")
             return predictions, targets
-        
+
         predictions_original = []
         targets_original = []
         
         target_variables = self.config['target_variables']
-        total_channels = predictions[0].shape[1]  # 获取总通道数
-        channels_per_var = total_channels // len(target_variables)  # 每个变量的通道数
+        channel_slices = getattr(dataset, 'target_channel_slices', {}) or self.target_channel_slices
         
         for i in range(len(predictions)):
             pred = predictions[i].clone()  # (pred_len, channels, height, width)
@@ -301,24 +858,19 @@ class SmartOceanPredictor:
             for var_idx, var_name in enumerate(target_variables):
                 if var_name in dataset.scalers:
                     scaler = dataset.scalers[var_name]
-                    
-                    # 计算该变量对应的通道范围
-                    start_ch = var_idx * channels_per_var
-                    end_ch = (var_idx + 1) * channels_per_var
-                    
-                    # 反标准化预测结果
-                    pred_var = pred[:, start_ch:end_ch, :, :]  # 选择该变量的所有通道
+                    slice_indices = channel_slices.get(var_name, slice(var_idx, var_idx + 1))
+
+                    pred_var = pred[:, slice_indices, :, :]
                     original_shape = pred_var.shape
-                    pred_2d = pred_var.reshape(-1, 1)
+                    pred_2d = pred_var.reshape(-1, 1).numpy()
                     pred_denorm = scaler.inverse_transform(pred_2d)
-                    pred[:, start_ch:end_ch, :, :] = torch.tensor(pred_denorm.reshape(original_shape), dtype=pred.dtype)
-                    
-                    # 反标准化目标数据
-                    target_var = target[:, start_ch:end_ch, :, :]
+                    pred[:, slice_indices, :, :] = torch.from_numpy(pred_denorm.reshape(original_shape)).to(pred.dtype)
+
+                    target_var = target[:, slice_indices, :, :]
                     original_shape = target_var.shape
-                    target_2d = target_var.reshape(-1, 1)
+                    target_2d = target_var.reshape(-1, 1).numpy()
                     target_denorm = scaler.inverse_transform(target_2d)
-                    target[:, start_ch:end_ch, :, :] = torch.tensor(target_denorm.reshape(original_shape), dtype=target.dtype)
+                    target[:, slice_indices, :, :] = torch.from_numpy(target_denorm.reshape(original_shape)).to(target.dtype)
             
             predictions_original.append(pred)
             targets_original.append(target)
@@ -350,6 +902,8 @@ class SmartOceanPredictor:
         # 保存模型路径信息
         info = {
             'model_path': self.model_path,
+            'model_index': self.model_index,
+            'model_dir': self.model_dir,
             'data_path': self.config['data_path'],
             'num_samples': len(predictions),
             'prediction_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -390,7 +944,13 @@ class SmartOceanPredictor:
             # 在图像上添加指标文本
             if 'temperature' in metrics:
                 temp_metrics = metrics['temperature']
-                metrics_text = f"MSE: {temp_metrics['MSE']:.6f}\nMAE: {temp_metrics['MAE']:.6f}\nRMSE: {temp_metrics['RMSE']:.6f}\nCorr: {temp_metrics['Correlation']:.6f}"
+                metrics_text = (
+                    f"MSE: {temp_metrics['MSE']:.6f}\n"
+                    f"MAE: {temp_metrics['MAE']:.6f}\n"
+                    f"RMSE: {temp_metrics['RMSE']:.6f}\n"
+                    f"Corr: {temp_metrics['Correlation']:.6f}\n"
+                    f"R²: {temp_metrics['R2']:.6f}"
+                )
                 fig.text(0.02, 0.98, metrics_text, transform=fig.transFigure, fontsize=10, 
                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
             
@@ -451,7 +1011,13 @@ class SmartOceanPredictor:
                 # 在图像上添加盐度指标文本
                 if 'salinity' in metrics:
                     salt_metrics = metrics['salinity']
-                    metrics_text = f"MSE: {salt_metrics['MSE']:.6f}\nMAE: {salt_metrics['MAE']:.6f}\nRMSE: {salt_metrics['RMSE']:.6f}\nCorr: {salt_metrics['Correlation']:.6f}"
+                    metrics_text = (
+                        f"MSE: {salt_metrics['MSE']:.6f}\n"
+                        f"MAE: {salt_metrics['MAE']:.6f}\n"
+                        f"RMSE: {salt_metrics['RMSE']:.6f}\n"
+                        f"Corr: {salt_metrics['Correlation']:.6f}\n"
+                        f"R²: {salt_metrics['R2']:.6f}"
+                    )
                     fig.text(0.02, 0.98, metrics_text, transform=fig.transFigure, fontsize=10, 
                             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
                 
@@ -506,7 +1072,14 @@ class SmartOceanPredictor:
             
             # 在图像上添加整体指标文本
             overall_metrics = metrics['overall']
-            metrics_text = f"整体指标:\nMSE: {overall_metrics['MSE']:.6f}\nMAE: {overall_metrics['MAE']:.6f}\nRMSE: {overall_metrics['RMSE']:.6f}\nCorr: {overall_metrics['Correlation']:.6f}"
+            metrics_text = (
+                f"整体指标:\n"
+                f"MSE: {overall_metrics['MSE']:.6f}\n"
+                f"MAE: {overall_metrics['MAE']:.6f}\n"
+                f"RMSE: {overall_metrics['RMSE']:.6f}\n"
+                f"Corr: {overall_metrics['Correlation']:.6f}\n"
+                f"R²: {overall_metrics['R2']:.6f}"
+            )
             fig.text(0.02, 0.98, metrics_text, transform=fig.transFigure, fontsize=9, 
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
             
@@ -841,28 +1414,45 @@ class SmartOceanPredictor:
         
         pred_stack = torch.stack(predictions)
         target_stack = torch.stack(targets)
+
+        def _to_serializable(value):
+            if isinstance(value, (np.ndarray, np.generic)):
+                value = float(value)
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if isinstance(value, (float, int)):
+                if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+                    return None
+                return float(value)
+            return value
         
         # 获取损失权重
+        # 获取目标变量信息
+        target_variables = self.config.get('target_variables', [])
+        var_count = max(1, len(target_variables))
+        num_channels = pred_stack.shape[2]
+        channels_per_var = num_channels // var_count
+
         temp_weight = self.config.get('temp_weight', 0.7)
         salt_weight = self.config.get('salt_weight', 0.3)
-        
-        # 计算加权损失
-        num_channels = pred_stack.shape[2]
-        temp_channels = num_channels // 2
-        
+
         weighted_loss = 0.0
         temp_loss = 0.0
         salt_loss = 0.0
-        
-        if temp_channels > 0:
-            pred_temp = pred_stack[:, :, :temp_channels, :, :]
-            target_temp = target_stack[:, :, :temp_channels, :, :]
+
+        if var_count == 1:
+            # 单变量直接计算整体MSE
+            temp_loss = torch.mean((pred_stack - target_stack) ** 2).item()
+            weighted_loss = temp_loss
+        else:
+            # 双变量（保留原逻辑）
+            pred_temp = pred_stack[:, :, :channels_per_var, :, :]
+            target_temp = target_stack[:, :, :channels_per_var, :, :]
             temp_loss = torch.mean((pred_temp - target_temp) ** 2).item()
             weighted_loss += temp_weight * temp_loss
-        
-        if temp_channels < num_channels:
-            pred_salt = pred_stack[:, :, temp_channels:, :, :]
-            target_salt = target_stack[:, :, temp_channels:, :, :]
+
+            pred_salt = pred_stack[:, :, channels_per_var:, :, :]
+            target_salt = target_stack[:, :, channels_per_var:, :, :]
             salt_loss = torch.mean((pred_salt - target_salt) ** 2).item()
             weighted_loss += salt_weight * salt_loss
         
@@ -872,69 +1462,74 @@ class SmartOceanPredictor:
         rmse = np.sqrt(mse)
         
         # 计算相关系数
-        pred_flat = pred_stack.reshape(-1).numpy()
-        target_flat = target_stack.reshape(-1).numpy()
+        # 转换为 float64 以确保计算精度
+        pred_flat = pred_stack.reshape(-1).numpy().astype(np.float64)
+        target_flat = target_stack.reshape(-1).numpy().astype(np.float64)
         correlation = np.corrcoef(pred_flat, target_flat)[0, 1]
+
+        # 计算R^2
+        target_mean = target_flat.mean()
+        ss_tot = np.sum((target_flat - target_mean) ** 2)
+        ss_res = np.sum((pred_flat - target_flat) ** 2)
+        r2 = float('nan') if ss_tot == 0 else 1 - ss_res / ss_tot
         
         metrics = {
             'overall': {
-                'MSE': mse,
-                'MAE': mae,
-                'RMSE': rmse,
-                'Correlation': correlation
-            },
-            'weighted': {
-                'Weighted_MSE': weighted_loss,
-                'Temp_MSE': temp_loss,
-                'Salt_MSE': salt_loss,
-                'Temp_Weight': temp_weight,
-                'Salt_Weight': salt_weight
+                'MSE': _to_serializable(mse),
+                'MAE': _to_serializable(mae),
+                'RMSE': _to_serializable(rmse),
+                'Correlation': _to_serializable(correlation),
+                'R2': _to_serializable(r2)
             },
             'num_samples': len(predictions)
         }
-        
-        # 分别计算温度和盐度的指标
-        num_channels = pred_stack.shape[2]
-        temp_channels = num_channels // 2
-        
-        if temp_channels > 0:
-            # 温度指标
-            pred_temp = pred_stack[:, :, :temp_channels, :, :]
-            target_temp = target_stack[:, :, :temp_channels, :, :]
-            
-            temp_mse = torch.mean((pred_temp - target_temp) ** 2).item()
-            temp_mae = torch.mean(torch.abs(pred_temp - target_temp)).item()
-            temp_rmse = np.sqrt(temp_mse)
-            
-            pred_temp_flat = pred_temp.reshape(-1).numpy()
-            target_temp_flat = target_temp.reshape(-1).numpy()
-            temp_correlation = np.corrcoef(pred_temp_flat, target_temp_flat)[0, 1]
-            
-            metrics['temperature'] = {
-                'MSE': temp_mse,
-                'MAE': temp_mae,
-                'RMSE': temp_rmse,
-                'Correlation': temp_correlation
+            # 仅在多变量时保留加权结构
+        if var_count > 1:
+            metrics['weighted'] = {
+                'Weighted_MSE': _to_serializable(weighted_loss),
+                'Temp_MSE': _to_serializable(temp_loss),
+                'Salt_MSE': _to_serializable(salt_loss),
+                'Temp_Weight': _to_serializable(temp_weight),
+                'Salt_Weight': _to_serializable(salt_weight)
+            }
+        else:
+            metrics['weighted'] = {
+                'Weighted_MSE': _to_serializable(weighted_loss),
+                f'{target_variables[0] if target_variables else "Var"}_MSE': _to_serializable(temp_loss)
             }
         
-        if temp_channels < num_channels:
-            # 盐度指标
-            pred_salt = pred_stack[:, :, temp_channels:, :, :]
-            target_salt = target_stack[:, :, temp_channels:, :, :]
-            
-            salt_mse = torch.mean((pred_salt - target_salt) ** 2).item()
-            salt_mae = torch.mean(torch.abs(pred_salt - target_salt)).item()
-            salt_rmse = np.sqrt(salt_mse)
-            
-            pred_salt_flat = pred_salt.reshape(-1).numpy()
-            target_salt_flat = target_salt.reshape(-1).numpy()
-            salt_correlation = np.corrcoef(pred_salt_flat, target_salt_flat)[0, 1]
-            
-            metrics['salinity'] = {
-                'MSE': salt_mse,
-                'MAE': salt_mae,
-                'RMSE': salt_rmse,
-                'Correlation': salt_correlation
+        # 分别计算温度和盐度的指标
+        # 按变量分别计算指标
+        for var_idx in range(var_count):
+            start_ch = var_idx * channels_per_var
+            end_ch = (var_idx + 1) * channels_per_var
+            pred_var = pred_stack[:, :, start_ch:end_ch, :, :]
+            target_var = target_stack[:, :, start_ch:end_ch, :, :]
+
+            var_mse = torch.mean((pred_var - target_var) ** 2).item()
+            var_mae = torch.mean(torch.abs(pred_var - target_var)).item()
+            var_rmse = np.sqrt(var_mse)
+
+            pred_var_flat = pred_var.reshape(-1).numpy()
+            target_var_flat = target_var.reshape(-1).numpy()
+            var_corr = np.corrcoef(pred_var_flat, target_var_flat)[0, 1]
+            var_target_mean = target_var_flat.mean()
+            var_ss_tot = np.sum((target_var_flat - var_target_mean) ** 2)
+            var_ss_res = np.sum((pred_var_flat - target_var_flat) ** 2)
+            var_r2 = float('nan') if var_ss_tot == 0 else 1 - var_ss_res / var_ss_tot
+
+            name_map = {
+                'TEMP': 'temperature',
+                'SALT': 'salinity'
+            }
+            var_name_key = target_variables[var_idx] if var_idx < len(target_variables) else f'var{var_idx}'
+            metrics_key = name_map.get(var_name_key, var_name_key.lower())
+            metrics[metrics_key] = {
+                'MSE': _to_serializable(var_mse),
+                'MAE': _to_serializable(var_mae),
+                'RMSE': _to_serializable(var_rmse),
+                'Correlation': _to_serializable(var_corr),
+                'R2': _to_serializable(var_r2)
             }
         
         # 保存指标
@@ -973,6 +1568,11 @@ class SmartOceanPredictor:
 
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description="ConvLSTM 海洋预测脚本")
+    parser.add_argument('--model', type=int, required=True, help='选择 outputs/results 下模型编号')
+    parser.add_argument('--samples', type=int, default=None, help='预测样本数（覆盖配置）')
+    parser.add_argument('--output_dir', type=str, default=None, help='自定义预测输出目录')
+    args = parser.parse_args()
     print("ConvLSTM海洋预测系统 - 统一配置版本")
     print("=" * 50)
     
@@ -997,13 +1597,13 @@ def main():
     
     try:
         # 创建预测器
-        predictor = SmartOceanPredictor(config)
-        
+        predictor = SmartOceanPredictor(model_index=args.model, config=config, output_dir=args.output_dir)
+
         # 进行预测
-        predictor.predict()
-        
+        predictor.predict(num_samples=args.samples)
+
         print("预测任务完成!")
-        
+
     except Exception as e:
         print(f"预测过程中出现错误: {e}")
         import traceback

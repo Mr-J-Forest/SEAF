@@ -5,103 +5,96 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
 import json
 import time
+import random
 from datetime import datetime
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 from tqdm import tqdm
 
 # 导入统一配置
 from config import DEFAULT_CONFIG, save_config, validate_config, update_config
-from convlstm_model import OceanConvLSTMPredictor
+from convlstm_model import create_ocean_model
 from data_loader import create_data_loaders
-
-# 设置中文字体支持
-def setup_chinese_fonts():
-    """设置中文字体支持"""
-    # 获取系统所有可用字体
-    available_fonts = set([f.name for f in fm.fontManager.ttflist])
-    
-    # 中文字体候选列表（按优先级排序）
-    chinese_fonts = [
-        'WenQuanYi Micro Hei', # 文泉驿微米黑 (Linux)
-        'WenQuanYi Zen Hei',   # 文泉驿正黑 (Linux)
-        'SimHei',              # 黑体 (Windows)
-        'Microsoft YaHei',     # 微软雅黑 (Windows)
-        'Noto Sans CJK SC',    # 思源黑体 (Google)
-        'Source Han Sans SC',  # 思源黑体 (Adobe)
-        'Hiragino Sans GB',    # 冬青黑体 (macOS)
-        'PingFang SC',         # 苹方 (macOS)
-        'Arial Unicode MS',    # Unicode 字体 (macOS)
-        'STHeiti',             # 华文黑体
-        'STSong',              # 华文宋体
-        'DejaVu Sans'          # 备用字体
-    ]
-    
-    # 查找可用的中文字体
-    found_font = None
-    for font in chinese_fonts:
-        if font in available_fonts:
-            found_font = font
-            break
-    
-    # 设置字体
-    if found_font:
-        plt.rcParams['font.sans-serif'] = [found_font] + chinese_fonts
-        print(f"✓ 成功设置中文字体: {found_font}")
-    else:
-        # 如果没有找到中文字体，使用matplotlib默认配置
-        plt.rcParams['font.sans-serif'] = chinese_fonts
-        print("⚠ 未找到中文字体，使用默认配置")
-    
-    # 设置负号正确显示
-    plt.rcParams['axes.unicode_minus'] = False
-    
-    # 设置字体大小
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['axes.titlesize'] = 12
-    plt.rcParams['axes.labelsize'] = 10
-    plt.rcParams['xtick.labelsize'] = 9
-    plt.rcParams['ytick.labelsize'] = 9
-    plt.rcParams['legend.fontsize'] = 9
-    
-    return found_font
+from font_config import setup_chinese_fonts
 
 # 初始化中文字体
 setup_chinese_fonts()
+
+
+def _sanitize_note_for_path(note: str, max_length: int = 40) -> str:
+    """将备注内容转换为适合路径命名的短标识"""
+    if not note:
+        return ""
+    cleaned = note.strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[\\/:*?\"<>|]", "-", cleaned)
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = cleaned.strip("-_")
+    if not cleaned:
+        return ""
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length].rstrip("-_")
+    return cleaned
+
+def set_seed(seed: int) -> None:
+    """Set random seed for reproducibility across all random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 class OceanModelTrainer:
     """
     海洋模型训练器
     """
-    
+
     def __init__(self, config: dict = None):
         """
         初始化训练器
-        
+
         Args:
             config: 统一配置字典，如果为None则使用默认配置
         """
         if config is None:
             config = DEFAULT_CONFIG
-        
+
         self.config = config
+
+        # Set seed for reproducibility (if specified in config)
+        seed = config.get('seed', None)
+        if seed is not None:
+            set_seed(seed)
+        elif config.get('cudnn_benchmark', False):
+            torch.backends.cudnn.benchmark = True
+        self.ensemble_enabled = config.get('enable_arima_xgboost', False)
+        if self.ensemble_enabled:
+            print("Warning: ARIMA-XGBoost ensemble is no longer supported. Ignoring.")
+            self.ensemble_enabled = False
         
         # 设置设备
         if config['device'] == 'auto':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(config['device'])
+        
+        # 更新配置中的设备，确保后续模型初始化使用正确的设备字符串
+        config['device'] = str(self.device)
         print(f"使用设备: {self.device}")
         
-        # 设置性能优化
-        if config['cudnn_benchmark']:
+        # 设置性能优化（仅在未指定随机种子时启用，以确保可复现性）
+        if config.get('cudnn_benchmark', False) and config.get('seed') is None:
             torch.backends.cudnn.benchmark = True
             print("启用cuDNN benchmark")
         
@@ -111,13 +104,21 @@ class OceanModelTrainer:
             config['data_path'], 
             config, 
             batch_size=config['batch_size'],
-            num_workers=config['num_workers']
+            num_workers=config['num_workers'],
+            persistent_workers=config.get('persistent_workers', False),
+            prefetch_factor=config.get('prefetch_factor', 2),
         )
         
         # 获取第一个批次来确定实际的输入输出维度
         print("检测数据维度...")
         sample_batch = next(iter(self.train_loader))
-        sample_input, sample_target = sample_batch
+        if isinstance(sample_batch, (list, tuple)):
+            if len(sample_batch) < 2:
+                raise ValueError("训练数据批次缺少输入或目标张量")
+            sample_input = sample_batch[0]
+            sample_target = sample_batch[1]
+        else:
+            raise TypeError("训练数据批次类型不受支持，期望为tuple或list")
         actual_input_channels = sample_input.shape[2]  # [batch, seq, channels, height, width]
         actual_output_channels = sample_target.shape[2]  # [batch, pred, channels, height, width]
         
@@ -127,9 +128,26 @@ class OceanModelTrainer:
         # 更新配置
         config['actual_input_channels'] = actual_input_channels
         config['actual_output_channels'] = actual_output_channels
+
+        def _serialize_channel_slices(slice_map):
+            serialized = {}
+            for name, channel_slice in getattr(slice_map, "items", lambda: [])():
+                if isinstance(channel_slice, slice):
+                    serialized[name] = [channel_slice.start, channel_slice.stop]
+            return serialized
+
+        train_dataset = getattr(self.train_loader, 'dataset', None)
+        if train_dataset is not None:
+            input_slices = _serialize_channel_slices(getattr(train_dataset, 'input_channel_slices', {}))
+            target_slices = _serialize_channel_slices(getattr(train_dataset, 'target_channel_slices', {}))
+            if input_slices:
+                config['input_channel_slices'] = input_slices
+            if target_slices:
+                config['target_channel_slices'] = target_slices
         
-        # 创建模型（使用实际维度）
-        self.model = OceanConvLSTMPredictor(config).to(self.device)
+        # 创建模型
+        self.model = create_ocean_model(config).to(self.device)
+        
         print(f"模型参数数量: {sum(p.numel() for p in self.model.parameters()):,}")
         
         # 设置损失函数和优化器
@@ -142,9 +160,9 @@ class OceanModelTrainer:
         # 计算每个变量的通道数
         self.target_variables = config['target_variables']
         self.channels_per_var = None  # 将在第一次前向传播时确定
-        
+
         self.optimizer = optim.Adam(
-            self.model.parameters(), 
+            self.model.parameters(),
             lr=config['learning_rate'], 
             weight_decay=config['weight_decay']
         )
@@ -155,6 +173,13 @@ class OceanModelTrainer:
             patience=config['scheduler_patience'], 
             min_lr=config['min_lr']
         )
+        # 温度收敛后追加压低学习率以便盐度优化
+        self.temp_lr_threshold = config.get('temp_lr_threshold', 0.05)
+        self.temp_lr_decay_factor = config.get('temp_lr_decay_factor', 0.5)
+        self.temp_lr_cooldown = config.get('temp_lr_cooldown', 1)
+        self.temp_lr_min = config.get('temp_lr_min', config.get('min_lr', 1e-6))
+        self.last_temp_decay_epoch = -1
+        self.last_epoch_temp_loss = None
         
         # 训练状态
         self.best_val_loss = float('inf')
@@ -162,12 +187,23 @@ class OceanModelTrainer:
         self.val_losses = []
         self.epoch = 0
         
-        # 创建结果目录
-        base_dir = config['results_dir']
-        os.makedirs(base_dir, exist_ok=True)
-        timestamp = datetime.now().strftime(config['timestamp_format'])
-        self.result_dir = f"{base_dir}/results_{timestamp}"
-        os.makedirs(self.result_dir, exist_ok=True)
+        # 创建结果目录（自动编号）或使用现有目录
+        if config.get('resume_dir') and os.path.exists(config['resume_dir']):
+            self.result_dir = config['resume_dir']
+            print(f"恢复训练，使用现有目录: {self.result_dir}")
+        else:
+            base_dir = config['results_dir']
+            os.makedirs(base_dir, exist_ok=True)
+            timestamp = datetime.now().strftime(config['timestamp_format'])
+            note_slug = _sanitize_note_for_path(config.get('training_note', ''))
+            result_dir_name = f"results_{timestamp}"
+            if note_slug:
+                result_dir_name += f"_{note_slug}"
+            result_index = self._next_result_index(base_dir)
+            numbered_name = f"{result_index}_{result_dir_name}"
+            self.result_dir = os.path.join(base_dir, numbered_name)
+            os.makedirs(self.result_dir, exist_ok=True)
+            print(f"结果目录编号: {result_index} -> {self.result_dir}")
         
         # TensorBoard日志
         self.writer = SummaryWriter(os.path.join(self.result_dir, 'logs'))
@@ -176,7 +212,61 @@ class OceanModelTrainer:
         config_file = os.path.join(self.result_dir, config['config_filename'])
         with open(config_file, 'w') as f:
             json.dump(config, f, indent=4)
+
+        # 保存训练备注
+        if config.get('training_note'):
+            note_path = os.path.join(self.result_dir, 'training_note.txt')
+            # 如果是追加模式，使用 'a'
+            mode = 'a' if config.get('resume_dir') else 'w'
+            with open(note_path, mode, encoding='utf-8') as note_file:
+                if mode == 'a':
+                    note_file.write("\n--- 继续训练 ---\n")
+                note_file.write(f"备注: {config['training_note']}\n")
+                note_file.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     
+    @staticmethod
+    def _next_result_index(base_dir: str) -> int:
+        existing = []
+        try:
+            for name in os.listdir(base_dir):
+                path = os.path.join(base_dir, name)
+                if not os.path.isdir(path):
+                    continue
+                prefix = name.split('_', 1)[0]
+                if prefix.isdigit():
+                    existing.append(int(prefix))
+        except FileNotFoundError:
+            return 0
+        return max(existing) + 1 if existing else 0
+
+    def compute_gradient_loss(self, pred, target):
+        """
+        计算梯度分布匹配损失 (Gradient Profile Loss)
+        L_gp = MSE(|∇P|, |∇T|)
+        """
+        # pred, target: (B, T, C, H, W)
+        # 计算空间梯度 (Sobel算子近似)
+        # 定义Sobel核
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+        
+        b, t, c, h, w = pred.shape
+        pred_flat = pred.reshape(b*t*c, 1, h, w)
+        target_flat = target.reshape(b*t*c, 1, h, w)
+        
+        # 计算梯度
+        grad_pred_x = F.conv2d(pred_flat, sobel_x, padding=1)
+        grad_pred_y = F.conv2d(pred_flat, sobel_y, padding=1)
+        grad_pred_mag = torch.sqrt(grad_pred_x**2 + grad_pred_y**2 + 1e-6)
+        
+        grad_target_x = F.conv2d(target_flat, sobel_x, padding=1)
+        grad_target_y = F.conv2d(target_flat, sobel_y, padding=1)
+        grad_target_mag = torch.sqrt(grad_target_x**2 + grad_target_y**2 + 1e-6)
+        
+        # 计算梯度的MSE损失
+        loss = F.mse_loss(grad_pred_mag, grad_target_mag)
+        return loss
+
     def compute_weighted_loss(self, outputs, targets):
         """
         计算温度和盐度的加权损失
@@ -188,29 +278,37 @@ class OceanModelTrainer:
         Returns:
             加权损失值
         """
-        # 确定通道划分（如果还没有确定）
+        # 支持单变量或多变量（当前主要是1或2变量）
+        num_vars = len(self.target_variables)
+        total_channels = outputs.shape[2]
         if self.channels_per_var is None:
-            total_channels = outputs.shape[2]
-            num_vars = len(self.target_variables)
-            self.channels_per_var = total_channels // num_vars
-        
+            self.channels_per_var = total_channels // max(1, num_vars)
+
+        # 计算梯度损失
+        grad_loss = 0.0
+        if self.config.get('use_gradient_loss', True):
+            grad_loss = self.compute_gradient_loss(outputs, targets)
+            grad_weight = self.config.get('gradient_loss_weight', 0.1) # 默认权重0.1
+            grad_loss = grad_loss * grad_weight
+
+        if num_vars == 1:
+            mse_loss = self.criterion(outputs, targets)
+            total_loss = mse_loss + grad_loss
+            return total_loss, mse_loss.item(), 0.0, 0.0
+
+        # 双变量拆分（保持原逻辑）
         temp_channels = self.channels_per_var
-        
-        # 分离温度和盐度
         temp_outputs = outputs[:, :, :temp_channels, :, :]
         temp_targets = targets[:, :, :temp_channels, :, :]
-        
         salt_outputs = outputs[:, :, temp_channels:, :, :]
         salt_targets = targets[:, :, temp_channels:, :, :]
-        
-        # 计算各变量损失
+
         temp_loss = self.criterion(temp_outputs, temp_targets)
         salt_loss = self.criterion(salt_outputs, salt_targets)
-        
-        # 加权求和
-        weighted_loss = self.temp_weight * temp_loss + self.salt_weight * salt_loss
-        
-        return weighted_loss, temp_loss.item(), salt_loss.item()
+
+        weighted_loss = self.temp_weight * temp_loss + self.salt_weight * salt_loss + grad_loss
+
+        return weighted_loss, temp_loss.item(), salt_loss.item(), 0.0
     
     def train_epoch(self) -> float:
         """
@@ -224,17 +322,24 @@ class OceanModelTrainer:
         num_batches = len(self.train_loader)
         
         progress_bar = tqdm(self.train_loader, desc=f'Epoch {self.epoch+1} 训练')
+        temp_loss_sum = 0.0
+        temp_loss_count = 0
         
-        for batch_idx, (inputs, targets) in enumerate(progress_bar):
+        for batch_idx, batch in enumerate(progress_bar):
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                inputs, targets, _ = batch
+            else:
+                inputs, targets = batch
+
             inputs = inputs.to(self.device)  # (batch_size, seq_len, channels, height, width)
             targets = targets.to(self.device)  # (batch_size, pred_len, channels, height, width)
             
             # 前向传播
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)  # (batch_size, pred_len, output_channels, height, width)
+            outputs = self.model(inputs)
             
             # 计算加权损失
-            loss, temp_loss_val, salt_loss_val = self.compute_weighted_loss(outputs, targets)
+            loss, temp_loss_val, salt_loss_val, _ = self.compute_weighted_loss(outputs, targets)
             
             # 检查损失是否为NaN
             if torch.isnan(loss):
@@ -263,20 +368,31 @@ class OceanModelTrainer:
             total_loss += loss.item()
             
             # 更新进度条
-            progress_bar.set_postfix({
-                'Loss': f'{loss.item():.6f}',
-                'Temp': f'{temp_loss_val:.6f}',
-                'Salt': f'{salt_loss_val:.6f}',
-                'Avg Loss': f'{total_loss/(batch_idx+1):.6f}'
-            })
+            if len(self.target_variables) > 1:
+                postfix = {
+                    'Loss': f'{loss.item():.6f}',
+                    'Temp': f'{temp_loss_val:.6f}',
+                    'Salt': f'{salt_loss_val:.6f}',
+                    'Avg Loss': f'{total_loss/(batch_idx+1):.6f}'
+                }
+                progress_bar.set_postfix(postfix)
+                temp_loss_sum += float(temp_loss_val)
+                temp_loss_count += 1
+            else:
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.6f}',
+                    'Avg Loss': f'{total_loss/(batch_idx+1):.6f}'
+                })
             
             # 记录到TensorBoard
             global_step = self.epoch * num_batches + batch_idx
             self.writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-            self.writer.add_scalar('Loss/Train_Temp', temp_loss_val, global_step)
-            self.writer.add_scalar('Loss/Train_Salt', salt_loss_val, global_step)
+            if len(self.target_variables) > 1:
+                self.writer.add_scalar('Loss/Train_Temp', temp_loss_val, global_step)
+                self.writer.add_scalar('Loss/Train_Salt', salt_loss_val, global_step)
         
         avg_loss = total_loss / num_batches
+        self.last_epoch_temp_loss = (temp_loss_sum / temp_loss_count) if temp_loss_count > 0 else None
         return avg_loss
     
     def validate_epoch(self) -> float:
@@ -300,14 +416,19 @@ class OceanModelTrainer:
         with torch.no_grad():
             progress_bar = tqdm(self.val_loader, desc=f'Epoch {self.epoch+1} 验证')
             
-            for inputs, targets in progress_bar:
+            for batch in progress_bar:
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    inputs, targets, _ = batch
+                else:
+                    inputs, targets = batch
+
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
                 outputs = self.model(inputs)
                 
                 # 计算加权损失
-                loss, temp_loss_val, salt_loss_val = self.compute_weighted_loss(outputs, targets)
+                loss, temp_loss_val, salt_loss_val, _ = self.compute_weighted_loss(outputs, targets)
                 
                 # 检查损失和输出是否包含异常值
                 if not (torch.isnan(loss) or torch.isnan(outputs).any() or torch.isinf(outputs).any()):
@@ -317,19 +438,27 @@ class OceanModelTrainer:
                     print(f"验证中发现NaN/Inf，跳过该批次")
                     continue
                 
-                progress_bar.set_postfix({
-                    'Val Loss': f'{loss.item():.6f}',
-                    'Temp': f'{temp_loss_val:.6f}',
-                    'Salt': f'{salt_loss_val:.6f}',
-                    'Avg Val Loss': f'{total_loss/max(valid_batches, 1):.6f}'
-                })
+                if len(self.target_variables) > 1:
+                    postfix = {
+                        'Val Loss': f'{loss.item():.6f}',
+                        'Temp': f'{temp_loss_val:.6f}',
+                        'Salt': f'{salt_loss_val:.6f}',
+                        'Avg Val Loss': f'{total_loss/max(valid_batches, 1):.6f}'
+                    }
+                    progress_bar.set_postfix(postfix)
+                else:
+                    progress_bar.set_postfix({
+                        'Val Loss': f'{loss.item():.6f}',
+                        'Avg Val Loss': f'{total_loss/max(valid_batches, 1):.6f}'
+                    })
                 
                 # 记录验证损失到TensorBoard
                 if valid_batches == 1:  # 只记录第一个批次，避免过多记录
                     val_step = self.epoch
                     self.writer.add_scalar('Loss/Val_Batch', loss.item(), val_step)
-                    self.writer.add_scalar('Loss/Val_Temp', temp_loss_val, val_step)
-                    self.writer.add_scalar('Loss/Val_Salt', salt_loss_val, val_step)
+                    if len(self.target_variables) > 1:
+                        self.writer.add_scalar('Loss/Val_Temp', temp_loss_val, val_step)
+                        self.writer.add_scalar('Loss/Val_Salt', salt_loss_val, val_step)
         
         # 防止除零错误
         if valid_batches == 0:
@@ -387,6 +516,18 @@ class OceanModelTrainer:
             print(f"从检查点恢复训练，epoch: {self.epoch}, 最佳验证损失: {self.best_val_loss:.6f}")
         else:
             print(f"检查点文件不存在: {checkpoint_path}")
+
+    def _load_best_model_weights(self) -> bool:
+        """尝试加载最佳模型权重。"""
+        best_model_path = os.path.join(self.result_dir, self.config['model_filename'])
+        if os.path.exists(best_model_path):
+            checkpoint = torch.load(best_model_path, map_location=self.device)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            self.model.load_state_dict(state_dict)
+            if 'best_val_loss' in checkpoint:
+                self.best_val_loss = checkpoint['best_val_loss']
+            return True
+        return False
     
     def plot_training_curves(self):
         """
@@ -442,6 +583,7 @@ class OceanModelTrainer:
             # 训练
             train_loss = self.train_epoch()
             
+            print(f"Epoch {epoch+1} 训练完成，开始验证...")
             # 验证
             val_loss = self.validate_epoch()
             
@@ -457,6 +599,22 @@ class OceanModelTrainer:
             # 记录损失
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
+
+            # 温度收敛后额外降学习率，便于盐度优化
+            if (
+                len(self.target_variables) > 1
+                and self.last_epoch_temp_loss is not None
+                and self.last_epoch_temp_loss <= self.temp_lr_threshold
+                and (epoch - self.last_temp_decay_epoch) >= self.temp_lr_cooldown
+            ):
+                manual_old_lr = self.optimizer.param_groups[0]['lr']
+                manual_new_lr = max(manual_old_lr * self.temp_lr_decay_factor, self.temp_lr_min)
+                if manual_new_lr < manual_old_lr:
+                    for pg in self.optimizer.param_groups:
+                        pg['lr'] = manual_new_lr
+                    self.last_temp_decay_epoch = epoch
+                    print(f"温度收敛触发额外降学习率: {manual_old_lr:.2e} -> {manual_new_lr:.2e} (TempLoss={self.last_epoch_temp_loss:.4f})")
+                    self.writer.add_scalar('Learning_Rate_TempTriggered', manual_new_lr, epoch)
             
             # 记录到TensorBoard
             self.writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
@@ -468,9 +626,9 @@ class OceanModelTrainer:
             if not np.isinf(val_loss) and val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 is_best = True
-                print(f"✓ 新的最佳验证损失: {val_loss:.6f}")
+                print(f"[BEST] New best val loss: {val_loss:.6f}")
             elif np.isinf(val_loss):
-                print("⚠️  验证损失为无穷大，跳过模型更新")
+                print("[WARN] Val loss is inf, skipping model update")
             
             # 保存检查点
             self.save_checkpoint(is_best)
@@ -495,6 +653,7 @@ class OceanModelTrainer:
         
         # 最终保存
         self.plot_training_curves()
+
         self.writer.close()
         
         print(f"训练完成！最佳验证损失: {self.best_val_loss:.6f}")
@@ -511,11 +670,10 @@ class OceanModelTrainer:
             评估结果字典
         """
         if use_best_model:
-            best_model_path = os.path.join(self.result_dir, 'best_model.pth')
-            if os.path.exists(best_model_path):
-                checkpoint = torch.load(best_model_path, map_location=self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+            if self._load_best_model_weights():
                 print("使用最佳模型进行评估")
+            else:
+                print("未找到最佳模型权重，使用当前权重评估")
         
         self.model.eval()
         
@@ -527,12 +685,17 @@ class OceanModelTrainer:
         targets_list = []
         
         with torch.no_grad():
-            for inputs, targets in tqdm(self.test_loader, desc="测试集评估"):
+            for batch in tqdm(self.test_loader, desc="测试集评估"):
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    inputs, targets, _ = batch
+                else:
+                    inputs, targets = batch
+
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
                 outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
+                loss, _, _, _ = self.compute_weighted_loss(outputs, targets)
                 test_loss += loss.item()
                 
                 # 收集预测结果
@@ -567,25 +730,140 @@ class OceanModelTrainer:
         predictions = np.concatenate(predictions, axis=0)
         targets_array = np.concatenate(targets_list, axis=0)
         
-        # 计算MAE和RMSE
-        mae = np.mean(np.abs(predictions - targets_array))
-        rmse = np.sqrt(np.mean((predictions - targets_array) ** 2))
+        # 转换为 float64 以确保计算精度 (防止大数组累加时的精度丢失)
+        predictions_f64 = predictions.astype(np.float64)
+        targets_f64 = targets_array.astype(np.float64)
         
-        # 计算相关系数
+        # 标准化空间指标保留为 normalized_*，主指标优先使用反标准化后的物理单位。
+        normalized_mae = np.mean(np.abs(predictions_f64 - targets_f64))
+        normalized_rmse = np.sqrt(np.mean((predictions_f64 - targets_f64) ** 2))
+
+        eval_dataset = getattr(self.test_loader, 'dataset', None)
+        scalers = getattr(eval_dataset, 'scalers', {}) if eval_dataset is not None else {}
+        channel_slices = getattr(eval_dataset, 'target_channel_slices', {}) if eval_dataset is not None else {}
+        num_vars = len(self.target_variables)
+        total_channels = predictions.shape[2]
+        fallback_channels_per_var = total_channels // max(1, num_vars)
+
+        physical_predictions_f64 = predictions_f64.copy()
+        physical_targets_f64 = targets_f64.copy()
+        physical_units_available = False
+
+        if eval_dataset is not None and hasattr(eval_dataset, 'inverse_transform_targets'):
+            try:
+                physical_predictions_f64 = eval_dataset.inverse_transform_targets(predictions_f64).astype(np.float64)
+                physical_targets_f64 = eval_dataset.inverse_transform_targets(targets_f64).astype(np.float64)
+                physical_units_available = True
+            except Exception as exc:
+                print(f"警告: 目标物理量恢复失败，回退到普通反标准化: {exc}")
+
+        if not physical_units_available:
+            for i, var_name in enumerate(self.target_variables):
+                scaler = scalers.get(var_name) if scalers else None
+                if scaler is None:
+                    continue
+                ch_slice = channel_slices.get(var_name)
+                if ch_slice is None:
+                    start_ch = i * fallback_channels_per_var
+                    end_ch = (i + 1) * fallback_channels_per_var
+                else:
+                    start_ch = ch_slice.start or 0
+                    end_ch = ch_slice.stop or start_ch
+                if end_ch <= start_ch:
+                    continue
+
+                pred_var = physical_predictions_f64[:, :, start_ch:end_ch, :, :]
+                target_var = physical_targets_f64[:, :, start_ch:end_ch, :, :]
+                pred_shape = pred_var.shape
+                target_shape = target_var.shape
+                physical_predictions_f64[:, :, start_ch:end_ch, :, :] = scaler.inverse_transform(
+                    pred_var.reshape(-1, 1)
+                ).reshape(pred_shape)
+                physical_targets_f64[:, :, start_ch:end_ch, :, :] = scaler.inverse_transform(
+                    target_var.reshape(-1, 1)
+                ).reshape(target_shape)
+                physical_units_available = True
+
+        metric_predictions_f64 = physical_predictions_f64 if physical_units_available else predictions_f64
+        metric_targets_f64 = physical_targets_f64 if physical_units_available else targets_f64
+
+        # 计算整体MAE和RMSE
+        mae = np.mean(np.abs(metric_predictions_f64 - metric_targets_f64))
+        rmse = np.sqrt(np.mean((metric_predictions_f64 - metric_targets_f64) ** 2))
+        
+        # 计算整体相关系数
         if predictions.size > 0 and targets_array.size > 0:
-            correlation = np.corrcoef(predictions.flatten(), targets_array.flatten())[0, 1]
+            # corrcoef 内部会自动处理精度，但传入 float64 更稳妥
+            correlation = np.corrcoef(metric_predictions_f64.flatten(), metric_targets_f64.flatten())[0, 1]
             if np.isnan(correlation):
                 correlation = 0.0
+            target_mean = np.mean(metric_targets_f64)
+            ss_tot = np.sum((metric_targets_f64 - target_mean) ** 2)
+            ss_res = np.sum((metric_predictions_f64 - metric_targets_f64) ** 2)
+            r2 = float('nan') if ss_tot == 0 else 1 - ss_res / ss_tot
         else:
             correlation = 0.0
+            r2 = float('nan')
         
         results = {
             'test_loss': float(avg_test_loss),
             'mae': float(mae),
             'rmse': float(rmse),
-            'correlation': float(correlation)
+            'metric_units': 'physical' if physical_units_available else 'normalized',
+            'physical_mae': float(mae) if physical_units_available else None,
+            'physical_rmse': float(rmse) if physical_units_available else None,
+            'normalized_mae': float(normalized_mae),
+            'normalized_rmse': float(normalized_rmse),
+            'correlation': float(correlation),
+            'r2': float(r2) if not np.isnan(r2) else None,
+            # uppercase aliases for ablation script compatibility
+            'MAE': float(mae),
+            'RMSE': float(rmse),
+            'R^2': float(r2) if not np.isnan(r2) else None,
         }
-        
+
+        # 计算分变量指标
+        for i, var_name in enumerate(self.target_variables):
+            ch_slice = channel_slices.get(var_name) if channel_slices else None
+            if ch_slice is None:
+                start_ch = i * fallback_channels_per_var
+                end_ch = (i + 1) * fallback_channels_per_var
+            else:
+                start_ch = ch_slice.start or 0
+                end_ch = ch_slice.stop or start_ch
+            
+            # 使用 float64 切片
+            pred_var = metric_predictions_f64[:, :, start_ch:end_ch, :, :]
+            target_var = metric_targets_f64[:, :, start_ch:end_ch, :, :]
+            pred_var_norm = predictions_f64[:, :, start_ch:end_ch, :, :]
+            target_var_norm = targets_f64[:, :, start_ch:end_ch, :, :]
+            
+            var_mae = np.mean(np.abs(pred_var - target_var))
+            var_rmse = np.sqrt(np.mean((pred_var - target_var) ** 2))
+            var_normalized_mae = np.mean(np.abs(pred_var_norm - target_var_norm))
+            var_normalized_rmse = np.sqrt(np.mean((pred_var_norm - target_var_norm) ** 2))
+            
+            if pred_var.size > 0 and target_var.size > 0:
+                var_corr = np.corrcoef(pred_var.flatten(), target_var.flatten())[0, 1]
+                if np.isnan(var_corr): var_corr = 0.0
+                
+                v_mean = np.mean(target_var)
+                v_ss_tot = np.sum((target_var - v_mean) ** 2)
+                v_ss_res = np.sum((pred_var - target_var) ** 2)
+                var_r2 = float('nan') if v_ss_tot == 0 else 1 - v_ss_res / v_ss_tot
+            else:
+                var_corr = 0.0
+                var_r2 = float('nan')
+            
+            results[f'mae_{var_name}'] = float(var_mae)
+            results[f'rmse_{var_name}'] = float(var_rmse)
+            results[f'physical_mae_{var_name}'] = float(var_mae) if physical_units_available else None
+            results[f'physical_rmse_{var_name}'] = float(var_rmse) if physical_units_available else None
+            results[f'normalized_mae_{var_name}'] = float(var_normalized_mae)
+            results[f'normalized_rmse_{var_name}'] = float(var_normalized_rmse)
+            results[f'correlation_{var_name}'] = float(var_corr)
+            results[f'r2_{var_name}'] = float(var_r2) if not np.isnan(var_r2) else None
+
         print(f"测试结果:")
         if not np.isnan(avg_test_loss):
             print(f"  测试损失: {avg_test_loss:.6f}")
@@ -596,13 +874,22 @@ class OceanModelTrainer:
         else:
             print(f"  MAE: nan")
         if not np.isnan(rmse):
-            print(f"  RMSE: {rmse:.6f}")
+            print(f"  RMSE: {rmse:.6f} ({results['metric_units']})")
         else:
             print(f"  RMSE: nan")
+        print(f"  Normalized MAE/RMSE: {normalized_mae:.6f} / {normalized_rmse:.6f}")
         if not np.isnan(correlation):
             print(f"  相关系数: {correlation:.6f}")
         else:
             print(f"  相关系数: nan")
+        if r2 is not None and not np.isnan(r2):
+            print(f"  R^2: {r2:.6f}")
+        else:
+            print("  R^2: nan")
+            
+        # 打印分变量结果
+        for var_name in self.target_variables:
+            print(f"  [{var_name}] MAE: {results[f'mae_{var_name}']:.6f} | RMSE: {results[f'rmse_{var_name}']:.6f} | R^2: {results[f'r2_{var_name}'] if results[f'r2_{var_name}'] is not None else 'nan'}")
         
         # 保存评估结果
         with open(os.path.join(self.result_dir, 'evaluation_results.json'), 'w') as f:
@@ -640,8 +927,28 @@ def main():
     print(f"  批次大小: {config['batch_size']}")
     print(f"  训练轮数: {config['epochs']}")
     print(f"  Dropout: {config['dropout']}")
+    print("-" * 50)
+    print("TSC-Fusion 组件状态:")
+    print(f"  [PosEncode] 位置编码: {'开启' if config.get('enable_positional_encoding', False) else '关闭'}")
+    print(f"  [TimeEncode] 时间编码: {'开启' if config.get('enable_time_encoding', False) else '关闭'}")
+    print(f"  [TSC] 热盐结构记忆: {'关闭(消融)' if config.get('ablation_disable_tsc', False) else '开启'}")
+    print(f"  [Spectral] 全局频谱分支: {'关闭(消融)' if config.get('ablation_disable_spectral', False) else '开启'}")
+    print(f"  [3D] 三维结构分支: {'关闭(消融)' if config.get('ablation_disable_3d', False) else '开启'}")
+    print(f"  [Ensemble] 门控集成: {'关闭(消融)' if config.get('ablation_disable_ensemble', False) else '开启'}")
     print("=" * 50)
     
+    # 获取本次训练备注
+    try:
+        training_note = input("请输入本次训练的备注（可留空直接回车）: ").strip()
+    except EOFError:
+        training_note = ""
+
+    if training_note:
+        print(f"本次训练备注: {training_note}")
+        config['training_note'] = training_note
+    else:
+        print("未输入备注，使用默认配置继续训练。")
+
     try:
         # 创建训练器
         trainer = OceanModelTrainer(config)
