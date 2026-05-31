@@ -28,7 +28,7 @@
 - **总体范式**：从全海洋有效窗口训练一个共享总模型；任意窗口输入历史序列后，模型输出该窗口未来预测。
 - **数据工程**：在全海洋数据范围内进行 2D（经度+纬度）滑动窗口采样，仅保留 100% 纯海洋覆盖的 32°×21° 窗口；训练/验证/测试使用不同步长（密集/稀疏），推理阶段使用密集重叠滑窗 + 余弦权重融合实现全图无缝拼接。
 - **气候态 anomaly**：默认基于训练时间段计算每个窗口的月气候态，TEMP/SALT 以 anomaly 形式训练和预测，同时把气候态作为输入特征；评估和预测输出会自动加回气候态恢复到物理量。
-- **模型**：TSC-Fusion 架构 — 热盐结构记忆、全局频谱低模态分支、三维时空结构分支、局部空间分支、特征融合与门控集成预测。
+- **模型**：TSC-Fusion 架构 — 热盐结构记忆、全局频谱低模态分支、三维时空结构分支、局部空间分支、Global Token Bank 跨窗口注意力、特征融合与门控集成预测。
 - **数据源**：`Data/FullData_preprocessed.nc`。
 
 ---
@@ -180,6 +180,7 @@ python predict.py --model 0 --samples 5
 - **三维结构分支**：以变量-时间-空间立方体为输入，使用 3D 卷积与时间注意力聚合结构特征。
 - **局部空间分支**：对展平后的历史序列执行 Conv + GroupNorm + GELU 局部上下文建模。
 - **特征融合与门控集成**：拼接多分支特征，经 1×1 融合、残差细化、空间 Transformer 和多成员门控集成输出多步预测。
+- **Global Token Bank**：将同一历史起点 batch 内各空间窗口池化为全局 token bank，每个窗口的网格特征通过 cross-attention 读取其它窗口上下文，用同一套权重补充远场信号。该模块解决的是 ENSO、季风遥相关、上游传播等可能超出 32°×21° 局地窗口的问题；窗口内 spectral 分支仍只负责窗口内低频结构。
 - **持久性残差**：从最后一个历史步的目标变量构造 residual base，提升多步预测稳定性。
 
 ### 配置开关
@@ -189,6 +190,7 @@ python predict.py --model 0 --samples 5
 | 空间位置编码 | `enable_positional_encoding` | 经纬度/深度正弦-余弦编码 |
 | 时间编码 | `enable_time_encoding` | 月份傅里叶 + 年份趋势 |
 | 气候态 anomaly | `enable_climatology_anomaly` | 训练期月气候态 + anomaly 目标 |
+| Global Token Bank | `enable_global_token_bank` | 同时间跨窗口 attention，引入远地空间上下文 |
 | TSC 消融 | `ablation_disable_tsc` | 关闭热盐结构记忆，用于消融实验 |
 | 频谱消融 | `ablation_disable_spectral` | 关闭全局频谱分支 |
 | 3D 消融 | `ablation_disable_3d` | 关闭三维结构分支 |
@@ -249,6 +251,7 @@ TRAINING_CONFIG = {
     'epochs': 20,
     'learning_rate': 1.57e-4,
     'batch_size': 8,
+    'group_batches_by_time': True,
     'weight_decay': 1e-4,
     'grad_clip_norm': 1.0,
     'scheduler_patience': 10,
@@ -268,14 +271,15 @@ TRAINING_CONFIG = {
 
 1. **初始化**：加载配置 → 创建数据加载器（自动检测通道数）→ 构建模型。
 2. **数据增强**：2D 滑动搜索 100% 海洋窗口，train/val/test 按步长分别采样。
-3. **目标构造**：用训练时间段计算月气候态，TEMP/SALT 默认转为 anomaly，并把局地气候态拼回输入通道。
-4. **训练循环**：
+3. **同时间分组**：`group_batches_by_time=True` 时，DataLoader 将同一历史起点的不同空间窗口放入同一 batch，供 Global Token Bank 做跨窗口注意力。
+4. **目标构造**：用训练时间段计算月气候态，TEMP/SALT 默认转为 anomaly，并把局地气候态拼回输入通道。
+5. **训练循环**：
    - 每 epoch 执行 train_epoch + validate_epoch。
    - 梯度裁剪（`max_norm=1.0`）+ ReduceLROnPlateau 调度。
    - 温度收敛后自动触发额外降学习率（优化盐度）。
    - NaN/Inf 检测与自动跳过。
    - 自动保存最佳模型和检查点。
-5. **评估**：加载最佳模型，在测试集上计算 MSE/MAE/RMSE/Correlation/R²；主指标为恢复气候态后的物理量，同时保留 normalized 指标。
+6. **评估**：加载最佳模型，在测试集上计算 MSE/MAE/RMSE/Correlation/R²；主指标为恢复气候态后的物理量，同时保留 normalized 指标。分组 batch 会携带样本 index，保证反标准化、加回气候态和 baseline 对齐原始窗口。
 
 ---
 
@@ -308,6 +312,8 @@ result = predictor.predict_full_map(
 # result['weight_sum']     — (H, W) 每格点权重和
 # result['lons'] / ['lats'] — 坐标
 ```
+
+全图推理会把同一输入时间的候选窗口按 `batch_size` 成批送入模型，因此启用 Global Token Bank 时，密拼窗口之间也会共享远地上下文；若 batch 只有 1 个窗口，该模块自动退化为局地推理。
 
 **融合策略**：
 1. 在目标区域以 `inference_stride`（默认 4°）生成密集重叠窗口。
@@ -373,6 +379,12 @@ cd /root/TSC-Fusion
 ---
 
 ## 更新日志
+
+### v4.2.0 · 2026-05-31
+
+- **Global Token Bank**：同一历史时间起点的多空间窗口共享 token bank，并通过 cross-attention 引入远地上下文。
+- **同时间 batch sampler**：新增 `group_batches_by_time`，保证 token bank 内样本时间一致，避免把不同月份/年份状态混到同一次 attention。
+- **评估对齐**：训练评估支持分组 batch 的样本 index 对齐，物理量恢复、气候态加回和 persistence/climatology baseline 指标仍对应原始窗口。
 
 ### v4.1.0 · 2026-05-31
 

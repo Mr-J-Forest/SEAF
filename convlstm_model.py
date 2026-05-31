@@ -273,6 +273,44 @@ class TransformerRefiner(nn.Module):
         return tokens
 
 
+class GlobalTokenBankAttention(nn.Module):
+    """Cross-window attention over windows from the same historical time."""
+
+    def __init__(self, channels: int, heads: int, ffn_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.token_norm = nn.LayerNorm(channels)
+        self.query_norm = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=channels,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.out_norm = nn.LayerNorm(channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(ffn_dim, channels),
+        )
+        self.gate = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if b <= 1:
+            return x
+
+        pooled_tokens = x.mean(dim=(2, 3))
+        bank = self.token_norm(pooled_tokens).unsqueeze(0).expand(b, -1, -1)
+
+        queries = x.view(b, c, h * w).permute(0, 2, 1)
+        queries = self.query_norm(queries)
+        context, _ = self.attn(queries, bank, bank, need_weights=False)
+        context = context + self.ffn(self.out_norm(context))
+        context = context.permute(0, 2, 1).view(b, c, h, w)
+        return x + torch.tanh(self.gate) * context
+
+
 class ThermohalineMemory(nn.Module):
     """Learned water-mass memory over TEMP/SALT/PTEMP/PDEN/SPICE profiles.
 
@@ -572,6 +610,20 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
         else:
             self.fusion_transformer = None
 
+        if config.get('enable_global_token_bank', False):
+            bank_heads = int(config.get('global_token_bank_heads', 4))
+            if hidden_dim % bank_heads != 0:
+                bank_heads = 1
+            self.global_token_bank = GlobalTokenBankAttention(
+                hidden_dim,
+                heads=bank_heads,
+                ffn_dim=int(config.get('global_token_bank_ffn_dim', hidden_dim * 2)),
+                dropout=float(config.get('global_token_bank_dropout', dropout)),
+            )
+            print(f"启用 Global Token Bank (heads={bank_heads})")
+        else:
+            self.global_token_bank = None
+
         members = int(config.get('tsc_fusion_ensemble_members', 4))
         out_channels = self.pred_len * self.output_dim
         self.member_heads = nn.ModuleList([
@@ -660,6 +712,8 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
         fused = self.fusion(torch.cat(branch_features, dim=1))
         if self.fusion_transformer is not None:
             fused = fused + self.fusion_transformer(fused)
+        if self.global_token_bank is not None:
+            fused = self.global_token_bank(fused)
 
         if self.disable_ensemble:
             # Single head, no gate — direct prediction

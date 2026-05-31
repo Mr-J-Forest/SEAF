@@ -15,7 +15,7 @@ MODULE_SWITCHES = {
 DATA_CONFIG = {
     'data_path': 'Data/FullData_preprocessed.nc',
     'input_variables': ['TEMP', 'SALT', 'SSHA', 'UWND', 'VWND'],
-    'target_variables': ['TEMP'],
+    'target_variables': ['TEMP', 'SALT'],
     'sequence_length': 12,
     'prediction_length': 5,
     # 数据分割比例 - 为了确保验证集有足够数据，调整分割比例
@@ -68,6 +68,10 @@ DATA_CONFIG = {
     'climatology_period': 12,                    # 月气候态周期
     'include_climatology_features': True,        # 将目标变量气候态作为额外输入通道
     'climatology_feature_variables': ['TEMP', 'SALT'],
+
+    # 预处理持久化缓存（避免每次训练重复滑窗搜索、气候态计算、标准化拟合）
+    'cache_preprocessed': True,                  # 是否启用预处理缓存
+    'cache_preprocessed_dir': '.cache/preprocessed',  # 缓存存放路径
 }
 
 # ========== 模型相关参数 ==========
@@ -94,6 +98,10 @@ MODEL_CONFIG = {
     'tsc_fusion_transformer_layers': 1,
     'tsc_fusion_transformer_ffn_dim': 256,
     'tsc_fusion_persistence_init': 0.5,
+    'enable_global_token_bank': True,
+    'global_token_bank_heads': 4,
+    'global_token_bank_ffn_dim': 128,
+    'global_token_bank_dropout': 0.05,
 }
 
 # ========== 训练相关参数 ==========
@@ -105,6 +113,7 @@ TRAINING_CONFIG = {
     'persistent_workers': True,    # 多进程数据加载是否持久化worker
     'prefetch_factor': 4,          # 每个worker预取的批次数（num_workers>0时生效）
     'pin_memory': True,            # 是否使用pin_memory
+    'group_batches_by_time': True, # 将同一历史起点的不同窗口组织到同一batch，供Global Token Bank使用
     
     # 优化器参数
     'weight_decay': 1e-4,          # 权重衰减
@@ -260,6 +269,13 @@ def validate_config(config):
                 errors.append("tsc_fusion_transformer_heads 必须为正")
             elif hidden % heads != 0:
                 errors.append("tsc_fusion_hidden_dim 必须能被 tsc_fusion_transformer_heads 整除")
+        if config.get('enable_global_token_bank', False):
+            hidden = config.get('tsc_fusion_hidden_dim', 0)
+            heads = config.get('global_token_bank_heads', 1)
+            if heads <= 0:
+                errors.append("global_token_bank_heads 必须为正")
+            elif hidden % heads != 0:
+                errors.append("tsc_fusion_hidden_dim 必须能被 global_token_bank_heads 整除")
     
     if errors:
         raise ValueError("配置验证失败:\n" + "\n".join(f"- {error}" for error in errors))

@@ -45,7 +45,8 @@ def test_data_loading():
         )
 
         print("\n3. 测试数据批次...")
-        for i, (inputs, targets) in enumerate(train_loader):
+        for i, batch in enumerate(train_loader):
+            inputs, targets = batch[:2]
             print(f"批次 {i}:")
             print(f"  输入形状: {inputs.shape}")
             print(f"  目标形状: {targets.shape}")

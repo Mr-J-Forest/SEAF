@@ -23,6 +23,7 @@ from config import DEFAULT_CONFIG, load_config, merge_configs, save_config
 from convlstm_model import create_ocean_model
 from data_loader import OceanDataset
 from font_config import setup_chinese_fonts
+from metrics_utils import compute_metric_report
 
 # 初始化中文字体
 setup_chinese_fonts()
@@ -285,7 +286,14 @@ class SmartOceanPredictor:
         )
         
         # 计算评估指标（使用反标准化后的数据）
-        metrics = self._compute_metrics(predictions_original, targets_original)
+        metrics = self._compute_metrics(
+            predictions_original,
+            targets_original,
+            normalized_predictions=predictions,
+            normalized_targets=targets,
+            dataset=test_dataset,
+            sample_indices=sample_indices,
+        )
         
         # 保存和可视化结果
         self._save_results(predictions_original, targets_original, inputs_list, test_dataset)
@@ -636,8 +644,8 @@ class SmartOceanPredictor:
         )
 
         try:
-            all_lons = dense_dataset.dataset.LONGITUDE.values.astype(np.float64)
-            all_lats = dense_dataset.dataset.LATITUDE.values.astype(np.float64)
+            all_lons = dense_dataset.lons.astype(np.float64)
+            all_lats = dense_dataset.lats.astype(np.float64)
             times = dense_dataset.times
 
             if target_lon_range is None:
@@ -697,75 +705,90 @@ class SmartOceanPredictor:
             blended_target = None
             weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
             valid_windows = 0
+            inference_batch_size = max(1, int(self.config.get('batch_size', 8)))
 
             self.model.eval()
             with torch.no_grad():
-                for sample_idx in candidate_indices:
-                    start_idx, region_idx = dense_dataset.sequences[sample_idx]
-                    region = dense_dataset.all_regions_data[region_idx]
-                    coords = region['coords']
-                    window_lons = coords['lons'].astype(np.float64)
-                    window_lats = coords['lats'].astype(np.float64)
+                for offset in range(0, len(candidate_indices), inference_batch_size):
+                    batch_indices = candidate_indices[offset:offset + inference_batch_size]
+                    batch_inputs = []
+                    batch_targets = []
+                    for sample_idx in batch_indices:
+                        inputs, target_tensor = dense_dataset[sample_idx]
+                        batch_inputs.append(inputs)
+                        batch_targets.append(target_tensor)
 
-                    inputs, target_tensor = dense_dataset[sample_idx]
-                    output = self.model(inputs.unsqueeze(0).to(self.device))
-                    if torch.isnan(output).any() or torch.isinf(output).any():
-                        print(f"警告: 窗口 {sample_idx} 输出包含 NaN/Inf，已跳过")
-                        continue
+                    inputs_tensor = torch.stack(batch_inputs, dim=0).to(self.device)
+                    outputs = self.model(inputs_tensor)
+                    if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                        print(f"警告: batch {offset // inference_batch_size} 输出包含 NaN/Inf，逐窗口过滤")
 
-                    pred_phys = dense_dataset.inverse_transform_targets(
-                        output.cpu().numpy(),
-                        sample_indices=[sample_idx],
-                    )[0, pred_step]
-                    target_phys = dense_dataset.inverse_transform_targets(
-                        target_tensor.unsqueeze(0).numpy(),
-                        sample_indices=[sample_idx],
-                    )[0, pred_step]
+                    pred_phys_batch = dense_dataset.inverse_transform_targets(
+                        outputs.cpu().numpy(),
+                        sample_indices=batch_indices,
+                    )[:, pred_step]
+                    target_phys_batch = dense_dataset.inverse_transform_targets(
+                        torch.stack(batch_targets, dim=0).numpy(),
+                        sample_indices=batch_indices,
+                    )[:, pred_step]
 
-                    if blended_pred is None:
-                        out_channels = pred_phys.shape[0]
-                        blended_pred = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
-                        blended_target = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
+                    for local_idx, sample_idx in enumerate(batch_indices):
+                        pred_phys = pred_phys_batch[local_idx]
+                        target_phys = target_phys_batch[local_idx]
+                        if not np.isfinite(pred_phys).all():
+                            print(f"警告: 窗口 {sample_idx} 输出包含 NaN/Inf，已跳过")
+                            continue
 
-                    win_h = len(window_lats)
-                    win_w = len(window_lons)
-                    weights = generate_cosine_weights(win_h, win_w, taper_ratio, min_weight)
+                        _, region_idx = dense_dataset.sequences[sample_idx]
+                        region = dense_dataset.all_regions_data[region_idx]
+                        coords = region['coords']
+                        window_lons = coords['lons'].astype(np.float64)
+                        window_lats = coords['lats'].astype(np.float64)
 
-                    lon_idx_start = int(np.searchsorted(all_lons, window_lons[0])) - full_lon_start_idx
-                    lat_idx_start = int(np.searchsorted(all_lats, window_lats[0])) - full_lat_start_idx
-                    lon_idx_end = lon_idx_start + win_w
-                    lat_idx_end = lat_idx_start + win_h
+                        if blended_pred is None:
+                            out_channels = pred_phys.shape[0]
+                            blended_pred = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
+                            blended_target = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
 
-                    p_h_start = 0
-                    p_w_start = 0
-                    p_h_end = win_h
-                    p_w_end = win_w
+                        win_h = len(window_lats)
+                        win_w = len(window_lons)
+                        weights = generate_cosine_weights(win_h, win_w, taper_ratio, min_weight)
 
-                    if lat_idx_start < 0:
-                        p_h_start = -lat_idx_start
-                        lat_idx_start = 0
-                    if lon_idx_start < 0:
-                        p_w_start = -lon_idx_start
-                        lon_idx_start = 0
-                    if lat_idx_end > full_h:
-                        p_h_end = win_h - (lat_idx_end - full_h)
-                        lat_idx_end = full_h
-                    if lon_idx_end > full_w:
-                        p_w_end = win_w - (lon_idx_end - full_w)
-                        lon_idx_end = full_w
+                        lon_idx_start = int(np.searchsorted(all_lons, window_lons[0])) - full_lon_start_idx
+                        lat_idx_start = int(np.searchsorted(all_lats, window_lats[0])) - full_lat_start_idx
+                        lon_idx_end = lon_idx_start + win_w
+                        lat_idx_end = lat_idx_start + win_h
 
-                    if lat_idx_end <= lat_idx_start or lon_idx_end <= lon_idx_start:
-                        continue
+                        p_h_start = 0
+                        p_w_start = 0
+                        p_h_end = win_h
+                        p_w_end = win_w
 
-                    weights_slice = weights[p_h_start:p_h_end, p_w_start:p_w_end]
-                    weights_3d = weights_slice[np.newaxis, :, :]
-                    pred_slice = pred_phys[:, p_h_start:p_h_end, p_w_start:p_w_end]
-                    target_slice = target_phys[:, p_h_start:p_h_end, p_w_start:p_w_end]
+                        if lat_idx_start < 0:
+                            p_h_start = -lat_idx_start
+                            lat_idx_start = 0
+                        if lon_idx_start < 0:
+                            p_w_start = -lon_idx_start
+                            lon_idx_start = 0
+                        if lat_idx_end > full_h:
+                            p_h_end = win_h - (lat_idx_end - full_h)
+                            lat_idx_end = full_h
+                        if lon_idx_end > full_w:
+                            p_w_end = win_w - (lon_idx_end - full_w)
+                            lon_idx_end = full_w
 
-                    blended_pred[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += pred_slice * weights_3d
-                    blended_target[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += target_slice * weights_3d
-                    weight_sum[lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += weights_slice
-                    valid_windows += 1
+                        if lat_idx_end <= lat_idx_start or lon_idx_end <= lon_idx_start:
+                            continue
+
+                        weights_slice = weights[p_h_start:p_h_end, p_w_start:p_w_end]
+                        weights_3d = weights_slice[np.newaxis, :, :]
+                        pred_slice = pred_phys[:, p_h_start:p_h_end, p_w_start:p_w_end]
+                        target_slice = target_phys[:, p_h_start:p_h_end, p_w_start:p_w_end]
+
+                        blended_pred[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += pred_slice * weights_3d
+                        blended_target[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += target_slice * weights_3d
+                        weight_sum[lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += weights_slice
+                        valid_windows += 1
 
             if valid_windows == 0 or blended_pred is None:
                 raise RuntimeError("没有有效窗口可用于全图推理")
@@ -785,8 +808,10 @@ class SmartOceanPredictor:
                 'lats': full_lats,
             }
         finally:
-            dense_dataset.dataset.close()
-            ref_dataset.dataset.close()
+            if getattr(dense_dataset, 'dataset', None) is not None:
+                dense_dataset.dataset.close()
+            if getattr(ref_dataset, 'dataset', None) is not None:
+                ref_dataset.dataset.close()
 
     @staticmethod
     def _fill_nan(data: np.ndarray) -> np.ndarray:
@@ -1408,7 +1433,15 @@ class SmartOceanPredictor:
                    dpi=150, bbox_inches='tight')
         plt.close()
     
-    def _compute_metrics(self, predictions, targets):
+    def _compute_metrics(
+        self,
+        predictions,
+        targets,
+        normalized_predictions=None,
+        normalized_targets=None,
+        dataset=None,
+        sample_indices=None,
+    ):
         """计算评估指标"""
         print("计算评估指标...")
         
@@ -1432,6 +1465,38 @@ class SmartOceanPredictor:
         var_count = max(1, len(target_variables))
         num_channels = pred_stack.shape[2]
         channels_per_var = num_channels // var_count
+        channel_slices = getattr(dataset, 'target_channel_slices', {}) if dataset is not None else self.target_channel_slices
+        if not channel_slices:
+            channel_slices = self.target_channel_slices
+
+        baseline_refs = {'physical': {}, 'normalized': {}}
+        if dataset is not None and hasattr(dataset, 'build_reference_forecasts'):
+            try:
+                baseline_refs = dataset.build_reference_forecasts(sample_indices=sample_indices)
+            except Exception as exc:
+                print(f"警告: baseline 指标构造失败: {exc}")
+
+        pred_np = pred_stack.numpy()
+        target_np = target_stack.numpy()
+        physical_report = compute_metric_report(
+            pred_np,
+            target_np,
+            target_variables,
+            channel_slices=channel_slices,
+            baselines=baseline_refs.get('physical'),
+        )
+
+        normalized_report = None
+        if normalized_predictions is not None and normalized_targets is not None:
+            norm_pred_np = torch.stack(normalized_predictions).numpy()
+            norm_target_np = torch.stack(normalized_targets).numpy()
+            normalized_report = compute_metric_report(
+                norm_pred_np,
+                norm_target_np,
+                target_variables,
+                channel_slices=channel_slices,
+                baselines=baseline_refs.get('normalized'),
+            )
 
         temp_weight = self.config.get('temp_weight', 0.7)
         salt_weight = self.config.get('salt_weight', 0.3)
@@ -1480,6 +1545,16 @@ class SmartOceanPredictor:
                 'RMSE': _to_serializable(rmse),
                 'Correlation': _to_serializable(correlation),
                 'R2': _to_serializable(r2)
+            },
+            'physical_report': physical_report,
+            'normalized_report': normalized_report,
+            'baseline_reports': {
+                'physical': physical_report.get('baselines', {}),
+                'normalized': normalized_report.get('baselines', {}) if normalized_report else {},
+            },
+            'baseline_comparison': {
+                'physical': physical_report.get('comparison', {}),
+                'normalized': normalized_report.get('comparison', {}) if normalized_report else {},
             },
             'num_samples': len(predictions)
         }
@@ -1560,6 +1635,32 @@ class SmartOceanPredictor:
             print("  盐度指标:")
             for key, value in metrics['salinity'].items():
                 print(f"    {key}: {value:.6f}")
+
+        if normalized_report is not None:
+            norm_overall = normalized_report.get('overall', {})
+            norm_rmse = norm_overall.get('rmse')
+            norm_mae = norm_overall.get('mae')
+            norm_r2 = norm_overall.get('r2')
+            print("  Normalized/anomaly 指标:")
+            print(
+                "    "
+                f"RMSE: {norm_rmse:.6f}" if norm_rmse is not None else "    RMSE: nan",
+                "|",
+                f"MAE: {norm_mae:.6f}" if norm_mae is not None else "MAE: nan",
+                "|",
+                f"R2: {norm_r2:.6f}" if norm_r2 is not None else "R2: nan",
+            )
+
+        print("  Baseline 对比 (RMSE improvement %, 越高越好):")
+        for space_name, comparison in metrics['baseline_comparison'].items():
+            if not comparison:
+                continue
+            print(f"    [{space_name}]")
+            for key, value in comparison.items():
+                if value is None:
+                    print(f"      {key}: nan")
+                else:
+                    print(f"      {key}: {value:.2f}%")
         
         print(f"  样本数量: {metrics['num_samples']}")
         

@@ -5,8 +5,13 @@
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import xarray as xr
+import pickle
+import hashlib
+import json
+import os
+import random
 from typing import Tuple, List, Dict, Optional
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import warnings
@@ -54,6 +59,7 @@ class OceanDataset(Dataset):
         self.climatology_feature_variables = list(
             config.get('climatology_feature_variables', self.target_variables)
         )
+        self.return_sample_index = bool(config.get('return_sample_index', False))
         # 数据范围设置（优先使用配置中的范围）
         self.lon_range = list(config.get('lon_range', [130.5, 162.5]))
         self.lat_range = list(config.get('lat_range', [6.5, 27.5]))
@@ -75,11 +81,28 @@ class OceanDataset(Dataset):
         # 实际可用的变量（根据NetCDF文件描述）
         self.available_variables = ['TEMP', 'SALT', 'PTEMP', 'PDEN', 'ADDEP', 'SPICE', 'SSHA', 'UWND', 'VWND', 'SSW']
         self.coord_variables = ['LONGITUDE', 'LATITUDE', 'LEVEL', 'TIME']
-        
+
         # 加载和预处理数据
         self._load_data()
-        self._find_sliding_regions()  # 查找有效的滑动区域
-        self._preprocess_data()
+
+        # 尝试从缓存加载预处理结果
+        loaded_from_cache = self._try_load_from_cache()
+
+        if loaded_from_cache:
+            print(f"[{self.mode.upper()}] 从缓存加载预处理数据成功，跳过滑窗搜索/气候态/标准化")
+            # 关闭 NetCDF，已不再需要
+            if hasattr(self, 'dataset') and self.dataset is not None:
+                self.dataset.close()
+                self.dataset = None
+        else:
+            self._find_sliding_regions()  # 查找有效的滑动区域
+            self._preprocess_data()
+            # 预处理完成后关闭 NetCDF
+            if hasattr(self, 'dataset') and self.dataset is not None:
+                self.dataset.close()
+                self.dataset = None
+            self._save_cache()
+
         self._split_data()
         self._create_sequences()
         self.input_channel_slices = {}
@@ -114,6 +137,214 @@ class OceanDataset(Dataset):
         
         print(f"时间序列长度: {len(self.times)}")
         print(f"空间维度: 经度{len(self.lons)} x 纬度{len(self.lats)} x 深度{len(self.levels)}")
+
+    # ========== 预处理缓存持久化 ==========
+
+    _CACHE_CONFIG_KEYS = frozenset({
+        'lon_range', 'lat_range', 'depth_range',
+        'sliding_enabled', 'ocean_threshold',
+        'input_variables', 'target_variables',
+        'anomaly_variables', 'climatology_period',
+        'include_climatology_features', 'climatology_feature_variables',
+        'enable_climatology_anomaly',
+        'enable_positional_encoding', 'positional_encoding_frequencies',
+        'depth_encoding_frequencies',
+        'enable_time_encoding', 'time_encoding_frequencies',
+        'time_encoding_period', 'include_year_trend',
+    })
+
+    def _compute_cache_key(self) -> str:
+        """从 data_path mtime + 相关配置生成缓存 key。"""
+        data_mtime = os.path.getmtime(self.data_path)
+        relevant = {}
+        for k in self._CACHE_CONFIG_KEYS:
+            relevant[k] = self.config.get(k)
+        relevant['stride_lon'] = self.stride_lon
+        relevant['stride_lat'] = self.stride_lat
+        relevant['train_ratio'] = self.train_ratio
+        relevant['val_ratio'] = self.val_ratio
+        raw = json.dumps(relevant, sort_keys=True, default=str)
+        h = hashlib.sha256((raw + str(data_mtime)).encode())
+        return h.hexdigest()[:16]
+
+    def _cache_dir(self) -> str:
+        """缓存目录 = base_dir / cache_key / mode。"""
+        base = str(self.config.get('cache_preprocessed_dir', '.cache/preprocessed'))
+        key = self._compute_cache_key()
+        return os.path.join(base, key, self.mode)
+
+    def _save_cache(self):
+        """将预处理结果（scalers、normalized_data、climatology 等）保存到磁盘。"""
+        cache_enabled = self.config.get('cache_preprocessed', True)
+        if not cache_enabled or not self.all_regions_data:
+            return
+        cache_dir = self._cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        print(f"[CACHE] 保存预处理缓存到 {cache_dir} ...")
+
+        # 1. scalers（pickle 序列化）
+        with open(os.path.join(cache_dir, 'scalers.pkl'), 'wb') as f:
+            pickle.dump(self.scalers, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # 2. time_period_indices
+        np.save(os.path.join(cache_dir, 'time_period_indices.npy'), self.time_period_indices)
+
+        # 3. 元信息（滑动区域、变量列表等）
+        metadata = {
+            'sliding_regions': [
+                {
+                    'lon_range': r['lon_range'],
+                    'lat_range': r['lat_range'],
+                    'region_type': r.get('region_type', 'sliding'),
+                }
+                for r in self.all_regions_data
+            ],
+            'available_variables': self.available_variables,
+            'lons': self.lons.tolist(),
+            'lats': self.lats.tolist(),
+            'levels': self.levels.tolist(),
+            'times': [str(t) for t in self.times],
+        }
+        with open(os.path.join(cache_dir, 'metadata.json'), 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+
+        # 4. 逐个区域保存数组
+        for idx, region in enumerate(self.all_regions_data):
+            # normalized_data
+            norm_dict = {}
+            for var_name, arr in region.get('normalized_data', {}).items():
+                norm_dict[f'norm_{var_name}'] = arr
+            # coords
+            for coord_name in ('lons', 'lats', 'levels', 'times'):
+                val = region.get('coords', {}).get(coord_name)
+                if val is not None:
+                    norm_dict[f'coord_{coord_name}'] = np.asarray(val)
+            if norm_dict:
+                np.savez_compressed(
+                    os.path.join(cache_dir, f'region_{idx}.npz'),
+                    **norm_dict,
+                )
+
+            # climatology（若启用 anomaly）
+            clim_dict = {}
+            for var_name, arr in region.get('climatology', {}).items():
+                clim_dict[f'clim_{var_name}'] = arr
+            if clim_dict:
+                np.savez_compressed(
+                    os.path.join(cache_dir, f'region_{idx}_clim.npz'),
+                    **clim_dict,
+                )
+
+            # anomaly_data（若启用 anomaly）
+            anom_dict = {}
+            for var_name, arr in region.get('anomaly_data', {}).items():
+                anom_dict[f'anom_{var_name}'] = arr
+            if anom_dict:
+                np.savez_compressed(
+                    os.path.join(cache_dir, f'region_{idx}_anom.npz'),
+                    **anom_dict,
+                )
+
+        print(f"[CACHE] 缓存保存完成，共 {len(self.all_regions_data)} 个区域")
+
+    def _try_load_from_cache(self) -> bool:
+        """尝试从缓存加载预处理结果，成功返回 True。"""
+        cache_enabled = self.config.get('cache_preprocessed', True)
+        if not cache_enabled:
+            return False
+        cache_dir = self._cache_dir()
+        meta_path = os.path.join(cache_dir, 'metadata.json')
+        scalers_path = os.path.join(cache_dir, 'scalers.pkl')
+        if not os.path.isfile(meta_path) or not os.path.isfile(scalers_path):
+            return False
+
+        try:
+            # 1. scalers
+            with open(scalers_path, 'rb') as f:
+                self.scalers = pickle.load(f)
+
+            # 2. time_period_indices
+            tpi_path = os.path.join(cache_dir, 'time_period_indices.npy')
+            if os.path.isfile(tpi_path):
+                self.time_period_indices = np.load(tpi_path)
+            else:
+                # 降级：用已有 times 重新计算
+                self.time_period_indices = self._extract_period_indices(
+                    self.times, self.climatology_period
+                )
+
+            # 3. 元信息
+            with open(meta_path, 'r') as f:
+                metadata = json.load(f)
+
+            # 4. 重建 all_regions_data
+            self.all_regions_data = []
+            sliding_list = metadata.get('sliding_regions', [])
+            for idx, region_meta in enumerate(sliding_list):
+                region = {
+                    'lon_range': region_meta['lon_range'],
+                    'lat_range': region_meta['lat_range'],
+                    'region_type': region_meta.get('region_type', 'sliding'),
+                }
+
+                # 加载 normalized_data
+                norm_path = os.path.join(cache_dir, f'region_{idx}.npz')
+                if os.path.isfile(norm_path):
+                    loaded = np.load(norm_path, allow_pickle=True)
+                    norm_data = {}
+                    coords = {}
+                    for key in loaded.files:
+                        if key.startswith('norm_'):
+                            var_name = key[5:]
+                            norm_data[var_name] = loaded[key]
+                        elif key.startswith('coord_'):
+                            coord_name = key[6:]
+                            arr = loaded[key]
+                            if arr.dtype.kind == 'S' or arr.dtype.kind == 'U':
+                                arr = arr.astype(str)
+                            coords[coord_name] = arr
+                    region['normalized_data'] = norm_data
+                    region['coords'] = coords
+
+                    # 加载 climatology
+                    clim_path = os.path.join(cache_dir, f'region_{idx}_clim.npz')
+                    if os.path.isfile(clim_path):
+                        clim_loaded = np.load(clim_path, allow_pickle=True)
+                        clim_data = {}
+                        for key in clim_loaded.files:
+                            if key.startswith('clim_'):
+                                clim_data[key[5:]] = clim_loaded[key]
+                        region['climatology'] = clim_data
+
+                    # 加载 anomaly_data
+                    anom_path = os.path.join(cache_dir, f'region_{idx}_anom.npz')
+                    if os.path.isfile(anom_path):
+                        anom_loaded = np.load(anom_path, allow_pickle=True)
+                        anom_data = {}
+                        for key in anom_loaded.files:
+                            if key.startswith('anom_'):
+                                anom_data[key[5:]] = anom_loaded[key]
+                        region['anomaly_data'] = anom_data
+
+                    # 辅助字段，后续惰性填充
+                    region['data'] = {}
+                    if 'climatology' not in region:
+                        region['climatology'] = {}
+                    if 'anomaly_data' not in region:
+                        region['anomaly_data'] = {}
+
+                self.all_regions_data.append(region)
+
+            if not self.all_regions_data:
+                return False
+
+            print(f"[CACHE] 从 {cache_dir} 加载了 {len(self.all_regions_data)} 个区域")
+            return True
+
+        except Exception as e:
+            print(f"[CACHE] 缓存加载失败 ({e})，将重新预处理")
+            return False
         
     def _resolve_stride(self, config: dict):
         """根据模式选择对应的经纬度步长，支持推理阶段覆盖"""
@@ -843,7 +1074,7 @@ class OceanDataset(Dataset):
         """
         return len(self.sequences)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         获取单个样本
         
@@ -944,6 +1175,8 @@ class OceanDataset(Dataset):
         input_tensor = torch.FloatTensor(input_seq).permute(0, 3, 1, 2)
         target_tensor = torch.FloatTensor(target_seq).permute(0, 3, 1, 2)
 
+        if self.return_sample_index:
+            return input_tensor, target_tensor, idx
         return input_tensor, target_tensor
 
     @staticmethod
@@ -1040,6 +1273,150 @@ class OceanDataset(Dataset):
             restored[:, :, ch_slice, :, :] = var_block
 
         return restored[0] if squeeze_sample else restored
+
+    def transform_targets_to_model_space(
+        self,
+        data: np.ndarray,
+        sample_indices: Optional[List[int]] = None
+    ) -> np.ndarray:
+        """将物理量目标转换为当前模型训练空间。"""
+        array = np.asarray(data)
+        squeeze_sample = False
+        if array.ndim == 4:
+            array = array[np.newaxis, ...]
+            squeeze_sample = True
+        if array.ndim != 5:
+            raise ValueError(f"目标标准化期望 4D/5D 数组，收到: {array.shape}")
+
+        transformed = array.astype(np.float64, copy=True)
+        sample_count, pred_steps, total_channels = transformed.shape[:3]
+
+        if sample_indices is None:
+            sample_indices = list(range(sample_count))
+        else:
+            sample_indices = list(sample_indices)
+
+        for var_idx, var_name in enumerate(self.target_variables):
+            ch_slice = self._resolve_target_slice(var_name, var_idx, total_channels)
+            if ch_slice.stop <= ch_slice.start:
+                continue
+
+            var_block = transformed[:, :, ch_slice, :, :]
+            if self._is_anomaly_variable(var_name):
+                for out_idx, sample_idx in enumerate(sample_indices[:sample_count]):
+                    if sample_idx >= len(self.sequences):
+                        continue
+                    start_idx, region_idx = self.sequences[int(sample_idx)]
+                    target_start = start_idx + self.sequence_length
+                    region = self.all_regions_data[region_idx]
+                    clim = self._target_climatology_channels(
+                        region,
+                        var_name,
+                        target_start,
+                        pred_steps
+                    )
+                    if clim is not None and clim.shape == var_block[out_idx].shape:
+                        var_block[out_idx] = var_block[out_idx] - clim
+
+            scaler = self.scalers.get(var_name)
+            if scaler is not None:
+                original_shape = var_block.shape
+                var_block = scaler.transform(var_block.reshape(-1, 1)).reshape(original_shape)
+
+            transformed[:, :, ch_slice, :, :] = var_block
+
+        return transformed[0] if squeeze_sample else transformed
+
+    def build_reference_forecasts(
+        self,
+        sample_indices: Optional[List[int]] = None
+    ) -> Dict[str, Dict[str, np.ndarray]]:
+        """
+        构造 Climatology / Persistence / Anomaly Persistence baseline。
+
+        Returns:
+            {
+              'physical': {name: (N, T, C, H, W)},
+              'normalized': {name: (N, T, C, H, W)}
+            }
+        """
+        if sample_indices is None:
+            sample_indices = list(range(len(self.sequences)))
+        else:
+            sample_indices = list(sample_indices)
+
+        if len(sample_indices) == 0:
+            empty = np.empty((0, self.prediction_length, 0, 0, 0), dtype=np.float32)
+            return {'physical': {}, 'normalized': {}}
+
+        if not self.target_channel_slices and len(self.sequences) > 0:
+            _ = self[0]
+
+        physical_refs = {
+            'climatology': [],
+            'persistence': [],
+            'anomaly_persistence': [],
+        }
+
+        for sample_idx in sample_indices:
+            start_idx, region_idx = self.sequences[int(sample_idx)]
+            target_start = start_idx + self.sequence_length
+            last_hist_idx = target_start - 1
+            region = self.all_regions_data[region_idx]
+
+            clim_parts = []
+            persistence_parts = []
+            anomaly_persistence_parts = []
+
+            for var_name in self.target_variables:
+                raw_data = region['data'][var_name]
+                future_clim = self._target_climatology_channels(
+                    region,
+                    var_name,
+                    target_start,
+                    self.prediction_length
+                )
+                if future_clim is None:
+                    train_end_idx = int(len(self.times) * self.train_ratio)
+                    fallback = np.nanmean(raw_data[:train_end_idx], axis=0).astype(np.float32)
+                    fallback = np.nan_to_num(fallback, nan=0.0)
+                    future_clim = np.repeat(
+                        self._series_to_channel_first(fallback[np.newaxis, ...]),
+                        self.prediction_length,
+                        axis=0
+                    )
+
+                last_raw = self._series_to_channel_first(raw_data[last_hist_idx:last_hist_idx + 1])[0]
+                persistence = np.repeat(last_raw[np.newaxis, ...], self.prediction_length, axis=0)
+
+                hist_clim = self._target_climatology_channels(
+                    region,
+                    var_name,
+                    last_hist_idx,
+                    1
+                )
+                if hist_clim is None:
+                    hist_clim = future_clim[:1]
+                last_anomaly = last_raw - hist_clim[0]
+                anomaly_persistence = future_clim + last_anomaly[np.newaxis, ...]
+
+                clim_parts.append(future_clim)
+                persistence_parts.append(persistence)
+                anomaly_persistence_parts.append(anomaly_persistence)
+
+            physical_refs['climatology'].append(np.concatenate(clim_parts, axis=1))
+            physical_refs['persistence'].append(np.concatenate(persistence_parts, axis=1))
+            physical_refs['anomaly_persistence'].append(np.concatenate(anomaly_persistence_parts, axis=1))
+
+        physical = {
+            name: np.stack(values).astype(np.float32)
+            for name, values in physical_refs.items()
+        }
+        normalized = {
+            name: self.transform_targets_to_model_space(values, sample_indices=sample_indices).astype(np.float32)
+            for name, values in physical.items()
+        }
+        return {'physical': physical, 'normalized': normalized}
     
     def get_scaler(self, variable: str) -> Optional[StandardScaler]:
         """
@@ -1057,6 +1434,54 @@ class OceanDataset(Dataset):
             data_inversed = self.scalers[variable].inverse_transform(data_2d)
             return data_inversed.reshape(original_shape)
         return data
+
+
+class TimeGroupedBatchSampler(Sampler[List[int]]):
+    """
+    将同一输入起点时间的不同空间窗口放入同一批次。
+
+    Global Token Bank 依赖 batch 内样本代表同一个历史时间段，
+    否则跨窗口 attention 会混入不同时间的状态。
+    """
+
+    def __init__(
+        self,
+        dataset: OceanDataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+        grouped: Dict[int, List[int]] = {}
+        for sample_idx, (start_idx, _) in enumerate(dataset.sequences):
+            grouped.setdefault(int(start_idx), []).append(sample_idx)
+        self.groups = list(grouped.values())
+
+    def __iter__(self):
+        groups = [list(group) for group in self.groups]
+        if self.shuffle:
+            random.shuffle(groups)
+
+        for group in groups:
+            if self.shuffle:
+                random.shuffle(group)
+            for offset in range(0, len(group), self.batch_size):
+                batch = group[offset:offset + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    yield batch
+
+    def __len__(self) -> int:
+        total = 0
+        for group in self.groups:
+            if self.drop_last:
+                total += len(group) // self.batch_size
+            else:
+                total += (len(group) + self.batch_size - 1) // self.batch_size
+        return total
 
 
 def create_data_loaders(
@@ -1123,36 +1548,68 @@ def create_data_loaders(
     # 仅在多进程时启用预取与持久化，以避免 PyTorch 对 num_workers=0 的限制
     use_prefetch = prefetch_factor if num_workers > 0 else None
     use_persistent = persistent_workers and num_workers > 0
+    group_batches = bool(config.get('group_batches_by_time', False))
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=use_prefetch,
-        persistent_workers=use_persistent,
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=use_prefetch,
-        persistent_workers=use_persistent,
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=use_prefetch,
-        persistent_workers=use_persistent,
-    )
+    if group_batches:
+        print("启用同时间窗口 batch sampler (Global Token Bank)")
+        train_dataset.return_sample_index = True
+        val_dataset.return_sample_index = True
+        test_dataset.return_sample_index = True
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=TimeGroupedBatchSampler(train_dataset, batch_size, shuffle=True),
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=use_prefetch,
+            persistent_workers=use_persistent,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=TimeGroupedBatchSampler(val_dataset, batch_size, shuffle=False),
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=use_prefetch,
+            persistent_workers=use_persistent,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_sampler=TimeGroupedBatchSampler(test_dataset, batch_size, shuffle=False),
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=use_prefetch,
+            persistent_workers=use_persistent,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=use_prefetch,
+            persistent_workers=use_persistent,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=use_prefetch,
+            persistent_workers=use_persistent,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=use_prefetch,
+            persistent_workers=use_persistent,
+        )
     
     print(f"数据加载器创建完成:")
     print(f"训练集批次数: {len(train_loader)}")

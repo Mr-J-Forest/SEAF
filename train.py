@@ -24,6 +24,7 @@ from config import DEFAULT_CONFIG, save_config, validate_config, update_config
 from convlstm_model import create_ocean_model
 from data_loader import create_data_loaders
 from font_config import setup_chinese_fonts
+from metrics_utils import compute_metric_report
 
 # 初始化中文字体
 setup_chinese_fonts()
@@ -683,11 +684,13 @@ class OceanModelTrainer:
         
         predictions = []
         targets_list = []
+        sample_indices = []
         
         with torch.no_grad():
             for batch in tqdm(self.test_loader, desc="测试集评估"):
                 if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    inputs, targets, _ = batch
+                    inputs, targets, batch_indices = batch
+                    sample_indices.extend([int(idx) for idx in batch_indices])
                 else:
                     inputs, targets = batch
 
@@ -737,6 +740,10 @@ class OceanModelTrainer:
         # 标准化空间指标保留为 normalized_*，主指标优先使用反标准化后的物理单位。
         normalized_mae = np.mean(np.abs(predictions_f64 - targets_f64))
         normalized_rmse = np.sqrt(np.mean((predictions_f64 - targets_f64) ** 2))
+        normalized_r2 = None
+        normalized_ss_tot = np.sum((targets_f64 - np.mean(targets_f64)) ** 2)
+        if normalized_ss_tot > 0:
+            normalized_r2 = 1 - np.sum((predictions_f64 - targets_f64) ** 2) / normalized_ss_tot
 
         eval_dataset = getattr(self.test_loader, 'dataset', None)
         scalers = getattr(eval_dataset, 'scalers', {}) if eval_dataset is not None else {}
@@ -748,11 +755,19 @@ class OceanModelTrainer:
         physical_predictions_f64 = predictions_f64.copy()
         physical_targets_f64 = targets_f64.copy()
         physical_units_available = False
+        if len(sample_indices) != predictions_f64.shape[0]:
+            sample_indices = list(range(predictions_f64.shape[0]))
 
         if eval_dataset is not None and hasattr(eval_dataset, 'inverse_transform_targets'):
             try:
-                physical_predictions_f64 = eval_dataset.inverse_transform_targets(predictions_f64).astype(np.float64)
-                physical_targets_f64 = eval_dataset.inverse_transform_targets(targets_f64).astype(np.float64)
+                physical_predictions_f64 = eval_dataset.inverse_transform_targets(
+                    predictions_f64,
+                    sample_indices=sample_indices,
+                ).astype(np.float64)
+                physical_targets_f64 = eval_dataset.inverse_transform_targets(
+                    targets_f64,
+                    sample_indices=sample_indices,
+                ).astype(np.float64)
                 physical_units_available = True
             except Exception as exc:
                 print(f"警告: 目标物理量恢复失败，回退到普通反标准化: {exc}")
@@ -787,6 +802,28 @@ class OceanModelTrainer:
         metric_predictions_f64 = physical_predictions_f64 if physical_units_available else predictions_f64
         metric_targets_f64 = physical_targets_f64 if physical_units_available else targets_f64
 
+        baseline_refs = {'physical': {}, 'normalized': {}}
+        if eval_dataset is not None and hasattr(eval_dataset, 'build_reference_forecasts'):
+            try:
+                baseline_refs = eval_dataset.build_reference_forecasts(sample_indices=sample_indices)
+            except Exception as exc:
+                print(f"警告: baseline 指标构造失败: {exc}")
+
+        physical_report = compute_metric_report(
+            metric_predictions_f64,
+            metric_targets_f64,
+            self.target_variables,
+            channel_slices=channel_slices,
+            baselines=baseline_refs.get('physical') if physical_units_available else None,
+        )
+        normalized_report = compute_metric_report(
+            predictions_f64,
+            targets_f64,
+            self.target_variables,
+            channel_slices=channel_slices,
+            baselines=baseline_refs.get('normalized'),
+        )
+
         # 计算整体MAE和RMSE
         mae = np.mean(np.abs(metric_predictions_f64 - metric_targets_f64))
         rmse = np.sqrt(np.mean((metric_predictions_f64 - metric_targets_f64) ** 2))
@@ -814,8 +851,19 @@ class OceanModelTrainer:
             'physical_rmse': float(rmse) if physical_units_available else None,
             'normalized_mae': float(normalized_mae),
             'normalized_rmse': float(normalized_rmse),
+            'normalized_r2': float(normalized_r2) if normalized_r2 is not None and not np.isnan(normalized_r2) else None,
             'correlation': float(correlation),
             'r2': float(r2) if not np.isnan(r2) else None,
+            'physical_report': physical_report if physical_units_available else None,
+            'normalized_report': normalized_report,
+            'baseline_reports': {
+                'physical': physical_report.get('baselines', {}) if physical_units_available else {},
+                'normalized': normalized_report.get('baselines', {}),
+            },
+            'baseline_comparison': {
+                'physical': physical_report.get('comparison', {}) if physical_units_available else {},
+                'normalized': normalized_report.get('comparison', {}),
+            },
             # uppercase aliases for ablation script compatibility
             'MAE': float(mae),
             'RMSE': float(rmse),
@@ -877,7 +925,8 @@ class OceanModelTrainer:
             print(f"  RMSE: {rmse:.6f} ({results['metric_units']})")
         else:
             print(f"  RMSE: nan")
-        print(f"  Normalized MAE/RMSE: {normalized_mae:.6f} / {normalized_rmse:.6f}")
+        normalized_r2_text = f"{normalized_r2:.6f}" if normalized_r2 is not None and not np.isnan(normalized_r2) else "nan"
+        print(f"  Normalized MAE/RMSE/R^2: {normalized_mae:.6f} / {normalized_rmse:.6f} / {normalized_r2_text}")
         if not np.isnan(correlation):
             print(f"  相关系数: {correlation:.6f}")
         else:
@@ -890,6 +939,17 @@ class OceanModelTrainer:
         # 打印分变量结果
         for var_name in self.target_variables:
             print(f"  [{var_name}] MAE: {results[f'mae_{var_name}']:.6f} | RMSE: {results[f'rmse_{var_name}']:.6f} | R^2: {results[f'r2_{var_name}'] if results[f'r2_{var_name}'] is not None else 'nan'}")
+
+        print("  Baseline 对比 (RMSE improvement %, 越高越好):")
+        for space_name, comparison in results['baseline_comparison'].items():
+            if not comparison:
+                continue
+            print(f"    [{space_name}]")
+            for key, value in comparison.items():
+                if value is None:
+                    print(f"      {key}: nan")
+                else:
+                    print(f"      {key}: {value:.2f}%")
         
         # 保存评估结果
         with open(os.path.join(self.result_dir, 'evaluation_results.json'), 'w') as f:
@@ -902,20 +962,35 @@ def main():
     """
     主函数
     """
+    import argparse
+    parser = argparse.ArgumentParser(description="海洋数据 ConvLSTM 训练脚本")
+    parser.add_argument('--note', type=str, default='',
+                        help='本次训练备注（可选，追加到结果目录名 + 保存到 training_note.txt）')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='覆盖配置中的训练轮数')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='覆盖配置中的学习率')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='覆盖配置中的批次大小')
+    args = parser.parse_args()
+
     # 设置中文字体
     setup_chinese_fonts()
-    
+
     # 使用统一配置文件
     config = DEFAULT_CONFIG.copy()
-    
-    # 可以在这里覆盖特定的参数
-    # config['epochs'] = 200           # 覆盖默认的epoch数
-    # config['learning_rate'] = 1e-3   # 覆盖默认的学习率
-    # config['batch_size'] = 16        # 覆盖默认的batch_size
-    
+
+    # 命令行参数覆盖
+    if args.epochs is not None:
+        config['epochs'] = args.epochs
+    if args.lr is not None:
+        config['learning_rate'] = args.lr
+    if args.batch_size is not None:
+        config['batch_size'] = args.batch_size
+
     # 验证配置
     validate_config(config)
-    
+
     print("海洋数据ConvLSTM模型训练")
     print("=" * 50)
     print("使用统一配置文件:")
@@ -936,13 +1011,8 @@ def main():
     print(f"  [3D] 三维结构分支: {'关闭(消融)' if config.get('ablation_disable_3d', False) else '开启'}")
     print(f"  [Ensemble] 门控集成: {'关闭(消融)' if config.get('ablation_disable_ensemble', False) else '开启'}")
     print("=" * 50)
-    
-    # 获取本次训练备注
-    try:
-        training_note = input("请输入本次训练的备注（可留空直接回车）: ").strip()
-    except EOFError:
-        training_note = ""
 
+    training_note = args.note.strip()
     if training_note:
         print(f"本次训练备注: {training_note}")
         config['training_note'] = training_note
