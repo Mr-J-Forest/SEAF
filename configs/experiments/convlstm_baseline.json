@@ -1,0 +1,5 @@
+{
+  "extends": "formal_base.json",
+  "model_type": "convlstm",
+  "enable_global_token_bank": false
+}

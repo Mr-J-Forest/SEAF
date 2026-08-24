@@ -5,27 +5,37 @@ TSC-Fusion 海洋预测模型主运行脚本
 
 import argparse
 import os
+import subprocess
 import sys
+from pathlib import Path
 from typing import Optional
 
 
 def train_model(config_path: Optional[str] = None):
     try:
-        from train import main as train_main
         print("开始训练模型...")
-        train_main()
+        command = [sys.executable, str(Path(__file__).resolve().parent / 'train.py')]
+        if config_path:
+            command.extend(['--config', config_path])
+        completed = subprocess.run(command, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError(f'train.py exited with code {completed.returncode}')
     except Exception as e:
         print(f"训练失败: {e}")
         return False
     return True
 
 
-def test_data_loading():
+def test_data_loading(config_path: Optional[str] = None):
     try:
         from data_loader import get_data_info, create_data_loaders
-        from config import DEFAULT_CONFIG
+        from config import DEFAULT_CONFIG, load_config, merge_configs, validate_config
 
-        data_path = DEFAULT_CONFIG.get('data_path', 'Data/FullData_preprocessed.nc')
+        config = DEFAULT_CONFIG.copy()
+        if config_path:
+            config = merge_configs(load_config(config_path), config)
+        validate_config(config)
+        data_path = config.get('data_path', 'Data/FullData_preprocessed.nc')
 
         if not os.path.exists(data_path):
             print(f"数据文件不存在: {data_path}")
@@ -39,9 +49,8 @@ def test_data_loading():
             print(f"  {key}: {value}")
 
         print("\n2. 创建数据加载器...")
-        config = DEFAULT_CONFIG.copy()
         train_loader, val_loader, test_loader = create_data_loaders(
-            data_path, config, batch_size=2, num_workers=0
+            data_path, config, batch_size=config['batch_size'], num_workers=0
         )
 
         print("\n3. 测试数据批次...")
@@ -54,6 +63,10 @@ def test_data_loading():
                 break
 
         print("数据加载测试成功！")
+        for loader in (train_loader, val_loader, test_loader):
+            source = getattr(getattr(loader, 'dataset', None), 'dataset', None)
+            if source is not None:
+                source.close()
         return True
 
     except Exception as e:
@@ -63,16 +76,19 @@ def test_data_loading():
         return False
 
 
-def test_model():
+def test_model(config_path: Optional[str] = None):
     try:
         from convlstm_model import create_ocean_model
         from data_loader import OceanDataset
-        from config import DEFAULT_CONFIG
+        from config import DEFAULT_CONFIG, load_config, merge_configs, validate_config
         import torch
         from torch.utils.data import DataLoader
 
         print("测试模型结构...")
         config = DEFAULT_CONFIG.copy()
+        if config_path:
+            config = merge_configs(load_config(config_path), config)
+        validate_config(config)
 
         data_path = config.get('data_path', 'Data/FullData_preprocessed.nc')
         if not os.path.exists(data_path):
@@ -91,6 +107,14 @@ def test_model():
 
         config['actual_input_channels'] = actual_input_channels
         config['actual_output_channels'] = actual_output_channels
+        config['input_channel_slices'] = {
+            name: [value.start, value.stop]
+            for name, value in train_dataset.input_channel_slices.items()
+        }
+        config['target_channel_slices'] = {
+            name: [value.start, value.stop]
+            for name, value in train_dataset.target_channel_slices.items()
+        }
 
         model = create_ocean_model(config)
         batch_size = 2
@@ -105,6 +129,7 @@ def test_model():
         print(f"模型输出形状: {output.shape}")
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         print("模型结构测试成功！")
+        train_dataset.dataset.close()
         return True
 
     except Exception as e:
@@ -123,7 +148,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("TSC-Fusion 海洋预测模型 - 温度盐度反演")
+    print("TSC-Fusion 海洋预测模型 - 温度盐度多步预报")
     print("=" * 60)
 
     if args.mode == 'train':
@@ -131,10 +156,10 @@ def main():
         success = train_model(args.config)
     elif args.mode == 'test_data':
         print("模式: 测试数据加载")
-        success = test_data_loading()
+        success = test_data_loading(args.config)
     elif args.mode == 'test_model':
         print("模式: 测试模型结构")
-        success = test_model()
+        success = test_model(args.config)
     else:
         print(f"未知模式: {args.mode}")
         success = False

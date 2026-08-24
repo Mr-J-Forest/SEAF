@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Generate prediction visualization figures for GRSL paper.
-   Requires: conda common environment with torch, numpy, gsw, matplotlib.
-   Usage: /c/Users/ysx/anaconda3/envs/common/python.exe gen_fig_visualization.py
+"""Legacy figure draft; not an admissible source for current paper evidence.
+
+The script hard-codes obsolete result IDs and external-model labels and uses a
+superseded data/metric protocol.  It is intentionally gated so it cannot be
+mistaken for the provenance-aware figure pipeline.
 """
-import torch, numpy as np, json, os, sys, gsw
+import torch, numpy as np, json, os, sys
 from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -100,6 +102,11 @@ def rmse_depth_all(gt, pred, lead_idx):
 
 
 def main():
+    if os.environ.get('TSC_ALLOW_LEGACY_FIGURES') != '1':
+        raise RuntimeError(
+            '这是旧版占位绘图脚本，不能用于论文证据。若只为检查历史图形，'
+            '请显式设置 TSC_ALLOW_LEGACY_FIGURES=1。'
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -108,7 +115,7 @@ def main():
     cfg.update({
         "return_additional_info": False, "enable_arima_xgboost": False,
         "enable_positional_encoding": True, "positional_encoding_frequencies": 8,
-        "depth_encoding_frequencies": 4, "enable_time_encoding": True,
+        "enable_time_encoding": True,
         "time_encoding_frequencies": 4, "include_year_trend": True,
         "target_variables": ["TEMP", "SALT", "PTEMP", "PDEN", "SPICE"],
     })

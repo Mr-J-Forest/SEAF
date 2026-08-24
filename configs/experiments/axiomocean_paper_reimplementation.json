@@ -1,0 +1,10 @@
+{
+  "extends": "paper_reimplementation_base.json",
+  "model_type": "axiomocean_paper",
+  "baseline_provenance": {
+    "kind": "paper_reimplementation",
+    "method_name": "AxiomOcean",
+    "official_code": false,
+    "implementation": "local_paper_level_proxy"
+  }
+}

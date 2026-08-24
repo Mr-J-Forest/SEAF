@@ -1,0 +1,5 @@
+{
+  "extends": "formal_base.json",
+  "ablation_disable_tsc": true,
+  "ablation_disable_3d": true
+}

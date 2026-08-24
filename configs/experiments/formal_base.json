@@ -1,0 +1,23 @@
+{
+  "epochs": 80,
+  "batch_size": 151,
+  "expected_canonical_windows_per_origin": 151,
+  "learning_rate": 0.0008,
+  "num_workers": 0,
+  "persistent_workers": false,
+  "prefetch_factor": 2,
+  "compile_model": false,
+  "allow_compile_fallback": false,
+  "mixed_precision": true,
+  "group_batches_by_time": true,
+  "global_token_bank_scope": "time_group",
+  "scheduler_patience": 8,
+  "early_stopping_patience": 25,
+  "min_delta": 0.000001,
+  "strict_resume_provenance": true,
+  "post_training_evaluation": "validation",
+  "target_loss_weights": {
+    "TEMP": 0.5,
+    "SALT": 0.5
+  }
+}

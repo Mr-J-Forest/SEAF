@@ -1,0 +1,4 @@
+{
+  "extends": "formal_base.json",
+  "use_gradient_loss": false
+}

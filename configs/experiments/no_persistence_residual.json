@@ -1,0 +1,4 @@
+{
+  "extends": "formal_base.json",
+  "enable_persistence_residual": false
+}

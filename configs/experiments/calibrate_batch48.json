@@ -1,0 +1,9 @@
+{
+  "epochs": 1,
+  "batch_size": 48,
+  "num_workers": 0,
+  "compile_model": false,
+  "global_token_bank_scope": "batch",
+  "mixed_precision": true,
+  "cache_preprocessed": true
+}

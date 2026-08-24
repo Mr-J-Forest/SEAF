@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ConvLSTM海洋预测脚本 - 统一配置版本
+TSC-Fusion 海洋预测脚本 - 统一配置版本
 自动匹配模型结构和权重，生成可视化预测结果
 使用统一配置文件确保与训练脚本参数一致
 """
@@ -8,22 +8,21 @@ ConvLSTM海洋预测脚本 - 统一配置版本
 import argparse
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
-import xarray as xr
 import os
 import json
+import pickle
 from datetime import datetime
 from typing import Tuple, Dict, List, Optional, Sequence
-import warnings
-warnings.filterwarnings('ignore')
 
 # 导入统一配置
 from config import DEFAULT_CONFIG, load_config, merge_configs, save_config
 from convlstm_model import create_ocean_model
-from data_loader import OceanDataset
+from data_loader import OceanDataset, TimeGroupedBatchSampler
 from font_config import setup_chinese_fonts
-from metrics_utils import compute_metric_report
+from metrics_utils import compute_metric_report, resolve_variable_slices
 
 # 初始化中文字体
 setup_chinese_fonts()
@@ -63,35 +62,63 @@ def generate_cosine_weights(height: int, width: int, taper_ratio: float = 0.25,
     return np.outer(h_weights, w_weights).astype(np.float32)
 
 
-def build_validity_mask(data_2d: np.ndarray) -> np.ndarray:
-    """
-    根据数据构建有效性 mask：NaN → weight=0，有效 → weight=1。
+def finalize_weighted_blend(blended_pred, blended_target, weight_sum):
+    """归一化 overlap-tile 累积值，并把未覆盖格点显式标记为 NaN。"""
+    coverage_mask = np.asarray(weight_sum) > 0
+    pred = np.full_like(blended_pred, np.nan, dtype=np.float64)
+    target = np.full_like(blended_target, np.nan, dtype=np.float64)
+    if np.any(coverage_mask):
+        denom = weight_sum[coverage_mask]
+        pred[:, coverage_mask] = blended_pred[:, coverage_mask] / denom
+        target[:, coverage_mask] = blended_target[:, coverage_mask] / denom
+    return pred, target, coverage_mask
 
-    用于融合时将陆地/缺失区域排除在加权平均之外。
 
-    Args:
-        data_2d: (H, W) 二维数据数组
+def interleaved_batches(indices, batch_size):
+    """把空间有序窗口交错分配到 batch，增加每批的远场覆盖。"""
+    indices = list(indices)
+    batch_size = max(1, int(batch_size))
+    if not indices:
+        return []
+    batch_count = int(np.ceil(len(indices) / batch_size))
+    return [indices[offset::batch_count] for offset in range(batch_count)]
 
-    Returns:
-        (H, W) float32 mask 数组
-    """
-    mask = (~np.isnan(data_2d)).astype(np.float32)
-    return mask
+
+def balanced_group_sample_positions(group_sizes, total_samples):
+    """Allocate retained examples across complete GTB groups and their space."""
+    sizes = [max(0, int(value)) for value in group_sizes]
+    remaining = min(max(0, int(total_samples)), sum(sizes))
+    output = []
+    group_count = len(sizes)
+    for group_idx, size in enumerate(sizes):
+        groups_left = group_count - group_idx
+        quota = min(size, int(np.ceil(remaining / groups_left))) if groups_left else 0
+        if quota <= 0:
+            positions = []
+        elif quota == 1 and group_count > 1:
+            positions = [int(round(group_idx * (size - 1) / (group_count - 1)))]
+        else:
+            positions = np.linspace(0, size - 1, num=quota, dtype=int).tolist()
+        output.append(positions)
+        remaining -= len(positions)
+    return output
 
 
 class SmartOceanPredictor:
     """智能海洋预测器 - 使用统一配置并按编号加载模型"""
     
     def __init__(self,
-                 model_index: int,
+                 model_index: Optional[int] = None,
                  config: Optional[Dict] = None,
                  output_dir: Optional[str] = None,
-                 selected_variables: Optional[Sequence[str]] = None):
+                 selected_variables: Optional[Sequence[str]] = None,
+                 model_dir: Optional[str] = None):
         """
         初始化预测器
         
         Args:
             model_index: 结果目录编号（outputs/results/<index>_*）
+            model_dir: 确定性的结果目录（与 model_index 二选一）
             config: 配置字典，如果为None则使用默认配置
             output_dir: 输出目录，默认自动生成
         """
@@ -102,22 +129,29 @@ class SmartOceanPredictor:
             self.config = config
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if (model_index is None) == (model_dir is None):
+            raise ValueError("model_index 与 model_dir 必须且只能提供一个")
         self.model_index = model_index
+        self.model_label = str(model_index) if model_index is not None else os.path.basename(os.path.abspath(model_dir))
         
         # 创建输出目录
         if output_dir is None:
             timestamp = datetime.now().strftime(self.config['timestamp_format'])
             self.output_dir = os.path.join(
                 self.config['predictions_dir'],
-                f"predictions_model{model_index}_{timestamp}"
+                f"predictions_model{self.model_label}_{timestamp}"
             )
         else:
             self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-        self.model_dir, self.model_path = self._resolve_model_by_index(model_index)
+        if model_dir is not None:
+            self.model_dir, self.model_path = self._resolve_model_directory(model_dir)
+        else:
+            self.model_dir, self.model_path = self._resolve_model_by_index(model_index)
         print(f"使用模型目录: {self.model_dir}")
         print(f"使用权重: {self.model_path}")
+        self.preprocessing_scalers = self._load_preprocessing_scalers()
         
         # 加载模型
         self._load_model()
@@ -156,7 +190,12 @@ class SmartOceanPredictor:
         candidates = [d for d in dirs if int(d.split('_')[0]) == model_index]
         if not candidates:
             raise ValueError(f"未找到编号 {model_index} 的模型目录")
-        result_dir = os.path.join(base_dir, candidates[0])
+        return self._resolve_model_directory(os.path.join(base_dir, candidates[0]))
+
+    def _resolve_model_directory(self, model_dir: str) -> Tuple[str, str]:
+        result_dir = os.path.abspath(model_dir)
+        if not os.path.isdir(result_dir):
+            raise FileNotFoundError(f"模型目录不存在: {result_dir}")
         config_path = os.path.join(result_dir, self.config['config_filename'])
         model_path = os.path.join(result_dir, self.config['model_filename'])
         if not os.path.exists(config_path):
@@ -194,6 +233,18 @@ class SmartOceanPredictor:
         self.model.eval()
         print("模型加载成功!")
 
+    def _load_preprocessing_scalers(self):
+        """加载训练时保存的 scaler，确保预测与训练处于同一模型空间。"""
+        filename = self.config.get('scalers_filename', 'scalers.pkl')
+        path = os.path.join(self.model_dir, filename)
+        if not os.path.isfile(path):
+            print("警告: 旧模型未保存训练 scaler，将从 train 数据管线重建")
+            return None
+        with open(path, 'rb') as f:
+            scalers = pickle.load(f)
+        print(f"加载训练期标准化器: {path}")
+        return scalers
+
     def _extract_variable_channels(self, tensor: torch.Tensor, variables: Sequence[str]) -> torch.Tensor:
         """根据选定变量提取通道"""
         if not variables or not self.target_channel_slices:
@@ -223,13 +274,23 @@ class SmartOceanPredictor:
         print(f"开始预测 {num_samples} 个样本...")
         
         # 创建测试数据集（包含所有100%海洋窗口）
-        test_dataset = OceanDataset(self.config['data_path'], self.config, mode='test')
+        scalers = self.preprocessing_scalers
+        if scalers is None:
+            ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
+            scalers = ref_dataset.scalers
+            if getattr(ref_dataset, 'dataset', None) is not None:
+                ref_dataset.dataset.close()
+        test_dataset = OceanDataset(
+            self.config['data_path'], self.config, mode='test', scalers=scalers
+        )
         dataset_slices = getattr(test_dataset, 'target_channel_slices', {}) or {}
         if dataset_slices:
             self.target_channel_slices = dataset_slices
         
         if len(test_dataset) == 0:
             print("测试集为空，无法进行预测")
+            if getattr(test_dataset, 'dataset', None) is not None:
+                test_dataset.dataset.close()
             return
         
         # 限制样本数量
@@ -243,36 +304,61 @@ class SmartOceanPredictor:
         print(f"数据集大小: {len(test_dataset)}")
         print(f"实际预测样本数: {num_samples}")
 
+        test_dataset.return_sample_index = True
+        inference_batch_size = max(2, int(self.config.get('batch_size', 4)))
+        grouped_sampler = TimeGroupedBatchSampler(
+            test_dataset, inference_batch_size, shuffle=False
+        )
+        if (
+            getattr(self.model, 'global_token_bank', None) is not None
+            and self.config.get('global_token_bank_scope') == 'time_group'
+            and grouped_sampler.max_group_size > inference_batch_size
+        ):
+            raise ValueError(
+                '预测时 time-group Global Token Bank 必须完整看到同一起报时次的空间窗；'
+                f'batch_size={inference_batch_size}, group_size={grouped_sampler.max_group_size}'
+            )
+        all_batches = list(grouped_sampler)
+        # Every selected group stays complete for GTB. Retained examples are
+        # then balanced across temporal origins and spatial window order.
+        needed_batches = min(len(all_batches), num_samples)
+        selected_positions = np.linspace(
+            0, len(all_batches) - 1, num=needed_batches, dtype=int
+        ) if needed_batches else np.array([], dtype=int)
+        selected_batches = [all_batches[int(pos)] for pos in selected_positions]
+        retained_positions = balanced_group_sample_positions(
+            [len(batch) for batch in selected_batches], num_samples
+        )
+        loader = DataLoader(
+            test_dataset,
+            batch_sampler=selected_batches,
+            num_workers=0,
+            pin_memory=bool(self.config.get('pin_memory', True)),
+        )
         with torch.no_grad():
-            for i in range(num_samples):
-                sample = test_dataset[i]
-                if isinstance(sample, (list, tuple)) and len(sample) == 3:
-                    inputs, target, _ = sample
-                else:
-                    inputs, target = sample
-                inputs = inputs.unsqueeze(0).to(self.device)  # 添加batch维度
-
-                # 模型预测
-                output = self.model(inputs)
-
-                # 检查输出是否有效
-                if torch.isnan(output).any() or torch.isinf(output).any():
-                    print(f"警告: 样本 {i} 的预测结果包含NaN或Inf，跳过")
-                    continue
-
-                output_cpu = output.cpu()
-
-                # 转换回CPU并保存
-                predictions.append(output_cpu.squeeze(0))
-                targets.append(target)
-                inputs_list.append(inputs.cpu().squeeze(0))
-                sample_indices.append(i)
-                
-                if (i + 1) % 5 == 0:
-                    print(f"已完成 {i + 1}/{num_samples} 个样本的预测")
+            for group_idx, (batch_inputs, batch_targets, batch_indices) in enumerate(loader):
+                remaining = num_samples - len(predictions)
+                if remaining <= 0:
+                    break
+                # Keep the complete time group in the forward pass. Truncating
+                # before a GTB forward silently changes every retained sample.
+                outputs = self.model(batch_inputs.to(self.device, non_blocking=True)).cpu()
+                for local_idx in retained_positions[group_idx]:
+                    sample_idx = int(batch_indices[local_idx])
+                    output = outputs[local_idx]
+                    if not torch.isfinite(output).all():
+                        print(f"警告: 样本 {sample_idx} 的预测结果包含NaN或Inf，跳过")
+                        continue
+                    predictions.append(output)
+                    targets.append(batch_targets[local_idx])
+                    inputs_list.append(batch_inputs[local_idx])
+                    sample_indices.append(sample_idx)
+                print(f"已完成 {len(predictions)}/{num_samples} 个样本的预测")
         
         if len(predictions) == 0:
             print("所有预测结果都包含异常值，无法生成有效预测")
+            if getattr(test_dataset, 'dataset', None) is not None:
+                test_dataset.dataset.close()
             return
         
         print(f"成功预测 {len(predictions)} 个样本")
@@ -296,8 +382,22 @@ class SmartOceanPredictor:
         )
         
         # 保存和可视化结果
-        self._save_results(predictions_original, targets_original, inputs_list, test_dataset)
-        self._visualize_results(predictions_original, targets_original, inputs_list, metrics, test_dataset)
+        self._save_results(
+            predictions_original,
+            targets_original,
+            inputs_list,
+            test_dataset,
+            sample_indices,
+        )
+        self._visualize_results(
+            predictions_original,
+            targets_original,
+            metrics,
+            test_dataset,
+            sample_indices,
+        )
+        if getattr(test_dataset, 'dataset', None) is not None:
+            test_dataset.dataset.close()
         
         print(f"预测完成！结果保存在: {self.output_dir}")
 
@@ -328,297 +428,6 @@ class SmartOceanPredictor:
             pred_step=pred_step,
         )
 
-        taper_ratio = self.config.get('taper_ratio', 0.25)
-        min_weight = self.config.get('min_blend_weight', 1e-3)
-        stride_lon = self.config.get('inference_stride_lon', 4.0)
-        stride_lat = self.config.get('inference_stride_lat', 4.0)
-        seq_len = self.config['sequence_length']
-
-        # 1. 获取 scalers（用 train 模式快速获取）
-        print("获取标准化参数...")
-        ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
-        scalers = ref_dataset.scalers
-        input_vars = self.config['input_variables']
-        target_vars = self.config['target_variables']
-        available_vars = ref_dataset.available_variables
-        ref_dataset.dataset.close()
-
-        # 2. 打开数据
-        ds = xr.open_dataset(self.config['data_path'])
-        ds = ds.sel(LEVEL=slice(self.config['depth_range'][0], self.config['depth_range'][1]))
-
-        all_lons = ds.LONGITUDE.values.astype(np.float64)
-        all_lats = ds.LATITUDE.values.astype(np.float64)
-        times = ds.TIME.values
-
-        # 验证输入变量
-        valid_input_vars = [v for v in input_vars if v in available_vars and v in ds.data_vars]
-
-        # 3. 确定目标范围
-        if target_lon_range is None:
-            target_lon_range = [float(all_lons.min()), float(all_lons.max())]
-        if target_lat_range is None:
-            target_lat_range = [float(all_lats.min()), float(all_lats.max())]
-
-        # 窗口尺寸（度）
-        win_lon = self.config['lon_range'][1] - self.config['lon_range'][0]
-        win_lat = self.config['lat_range'][1] - self.config['lat_range'][0]
-
-        # 4. 确定时间索引
-        total_t = len(times)
-        train_end = int(total_t * self.config.get('train_ratio', 0.6))
-        val_end = int(total_t * (self.config.get('train_ratio', 0.6) + self.config.get('val_ratio', 0.2)))
-        test_start = val_end
-
-        if base_time_index is None:
-            base_time_index = min(test_start + seq_len, total_t - self.config['prediction_length'] - 1)
-        base_time_index = max(test_start + seq_len - 1, min(base_time_index, total_t - self.config['prediction_length'] - 1))
-
-        print(f"全图推理: 输入序列结束于时间索引 {base_time_index}")
-        print(f"  目标范围: 经度 [{target_lon_range[0]:.1f}, {target_lon_range[1]:.1f}], "
-              f"纬度 [{target_lat_range[0]:.1f}, {target_lat_range[1]:.1f}]")
-        print(f"  推理步长: 经度={stride_lon}°, 纬度={stride_lat}°")
-        print(f"  余弦衰减: taper_ratio={taper_ratio}, min_weight={min_weight}")
-
-        # 5. 生成窗口位置网格
-        lon_starts = np.arange(target_lon_range[0], target_lon_range[1] - win_lon + stride_lon * 0.5, stride_lon)
-        lat_starts = np.arange(target_lat_range[0], target_lat_range[1] - win_lat + stride_lat * 0.5, stride_lat)
-
-        if len(lon_starts) == 0:
-            lon_starts = np.array([target_lon_range[0]])
-        if len(lat_starts) == 0:
-            lat_starts = np.array([target_lat_range[0]])
-
-        print(f"  窗口网格: {len(lon_starts)} (经度) × {len(lat_starts)} (纬度) = {len(lon_starts) * len(lat_starts)} 个窗口")
-
-        # 6. 确定全图格点范围
-        lon_res = float(all_lons[1] - all_lons[0]) if len(all_lons) > 1 else 1.0
-        lat_res = float(all_lats[1] - all_lats[0]) if len(all_lats) > 1 else 1.0
-
-        full_lon_start_idx = max(0, int(np.searchsorted(all_lons, target_lon_range[0])))
-        full_lon_end_idx = min(len(all_lons), int(np.searchsorted(all_lons, target_lon_range[1])) + 1)
-        full_lat_start_idx = max(0, int(np.searchsorted(all_lats, target_lat_range[0])))
-        full_lat_end_idx = min(len(all_lats), int(np.searchsorted(all_lats, target_lat_range[1])) + 1)
-
-        full_h = full_lat_end_idx - full_lat_start_idx
-        full_w = full_lon_end_idx - full_lon_start_idx
-        full_lons = all_lons[full_lon_start_idx:full_lon_end_idx]
-        full_lats = all_lats[full_lat_start_idx:full_lat_end_idx]
-
-        # 窗口格点数（从第一个窗口推算）
-        first_win_lon_end = target_lon_range[0] + win_lon
-        first_win_lat_end = target_lat_range[0] + win_lat
-        win_w = int(np.searchsorted(all_lons, first_win_lon_end) - np.searchsorted(all_lons, target_lon_range[0]))
-        win_h = int(np.searchsorted(all_lats, first_win_lat_end) - np.searchsorted(all_lats, target_lat_range[0]))
-
-        # 输出通道数（从模型配置获取）
-        # 用第一个预测样本的形状推断
-        num_target_vars = len(target_vars)
-
-        # 7. 余弦权重模板
-        cos_weights = generate_cosine_weights(win_h, win_w, taper_ratio, min_weight)  # (win_h, win_w)
-
-        # 8. 累积器
-        # 输出通道数 = 深度层数 × 目标变量数，用第一个窗口的实际输出确定
-        total_out_channels = None
-        blended_pred = None
-        blended_target = None
-        weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
-
-        # 9. 逐窗口预测并融合
-        self.model.eval()
-        valid_windows = 0
-
-        with torch.no_grad():
-            for lat_start in lat_starts:
-                for lon_start in lon_starts:
-                    lon_end = lon_start + win_lon
-                    lat_end = lat_start + win_lat
-
-                    # 切片数据
-                    try:
-                        win_ds = ds.sel(
-                            LONGITUDE=slice(lon_start, lon_end),
-                            LATITUDE=slice(lat_start, lat_end)
-                        )
-                    except Exception:
-                        continue
-
-                    # 检查数据有效性
-                    if 'TEMP' not in win_ds.data_vars:
-                        continue
-                    temp_check = win_ds.TEMP.isel(TIME=0, LEVEL=0).values
-                    if temp_check.size == 0 or np.all(np.isnan(temp_check)):
-                        continue
-
-                    # 提取输入序列
-                    input_seq_data = {}
-                    for var in valid_input_vars:
-                        if var in win_ds.data_vars:
-                            data = win_ds[var].values
-                            input_seq_data[var] = data[base_time_index - seq_len + 1:base_time_index + 1]
-
-                    # 提取目标序列
-                    target_seq_data = {}
-                    for var in target_vars:
-                        if var in win_ds.data_vars:
-                            data = win_ds[var].values
-                            t_start = base_time_index + 1
-                            t_end = t_start + self.config['prediction_length']
-                            target_seq_data[var] = data[t_start:t_end]
-
-                    if not input_seq_data:
-                        continue
-
-                    # 填充缺失值 + 标准化
-                    for var in input_seq_data:
-                        if np.isnan(input_seq_data[var]).any():
-                            input_seq_data[var] = self._fill_nan(input_seq_data[var])
-                    for var in target_seq_data:
-                        if np.isnan(target_seq_data[var]).any():
-                            target_seq_data[var] = self._fill_nan(target_seq_data[var])
-
-                    # 构建输入张量 (seq_len, lat, lon, channels)
-                    input_arrays = []
-                    for var in valid_input_vars:
-                        if var in input_seq_data:
-                            v = input_seq_data[var]
-                            if v.ndim == 4:  # (seq, level, lat, lon) → (seq, lat, lon, level)
-                                v = v.transpose(0, 2, 3, 1)
-                            elif v.ndim == 3:
-                                v = v[:, :, :, np.newaxis]
-                            else:
-                                continue
-                            # 标准化
-                            if var in scalers:
-                                orig_shape = v.shape
-                                v_2d = v.reshape(-1, 1)
-                                v_2d = scalers[var].transform(v_2d)
-                                v = v_2d.reshape(orig_shape)
-                            input_arrays.append(v.astype(np.float32))
-
-                    if not input_arrays:
-                        continue
-
-                    input_tensor = torch.from_numpy(
-                        np.concatenate(input_arrays, axis=-1)
-                    ).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)  # (1, seq, C, H, W)
-
-                    # 构建目标张量
-                    target_arrays = []
-                    for var in target_vars:
-                        if var in target_seq_data:
-                            v = target_seq_data[var]
-                            if v.ndim == 4:
-                                v = v.transpose(0, 2, 3, 1)
-                            elif v.ndim == 3:
-                                v = v[:, :, :, np.newaxis]
-                            else:
-                                continue
-                            if var in scalers:
-                                orig_shape = v.shape
-                                v_2d = v.reshape(-1, 1)
-                                v_2d = scalers[var].transform(v_2d)
-                                v = v_2d.reshape(orig_shape)
-                            target_arrays.append(v.astype(np.float32))
-
-                    target_tensor = None
-                    if target_arrays:
-                        target_tensor = torch.from_numpy(
-                            np.concatenate(target_arrays, axis=-1)
-                        ).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)
-
-                    # 模型预测
-                    output = self.model(input_tensor)  # (1, pred_len, C, H, W)
-                    pred = output[0, pred_step].cpu().numpy()  # (C, H, W)
-                    target = target_tensor[0, pred_step].cpu().numpy() if target_tensor is not None else None
-
-                    if total_out_channels is None:
-                        total_out_channels = pred.shape[0]
-                        blended_pred = np.zeros((total_out_channels, full_h, full_w), dtype=np.float64)
-                        blended_target = np.zeros((total_out_channels, full_h, full_w), dtype=np.float64)
-
-                    # 反标准化
-                    for var_idx, var_name in enumerate(target_vars):
-                        if var_name in scalers:
-                            ch_slice = self.target_channel_slices.get(var_name)
-                            if ch_slice is not None:
-                                ch_start, ch_stop = ch_slice.start, ch_slice.stop
-                                if ch_start is not None and ch_stop is not None:
-                                    var_pred = pred[ch_start:ch_stop]
-                                    var_shape = var_pred.shape
-                                    var_2d = var_pred.reshape(-1, 1)
-                                    var_2d = scalers[var_name].inverse_transform(var_2d)
-                                    pred[ch_start:ch_stop] = var_2d.reshape(var_shape)
-                                    if target is not None:
-                                        var_target = target[ch_start:ch_stop]
-                                        var_2d_t = var_target.reshape(-1, 1)
-                                        var_2d_t = scalers[var_name].inverse_transform(var_2d_t)
-                                        target[ch_start:ch_stop] = var_2d_t.reshape(var_shape)
-
-                    # 确定在全图中的位置
-                    lon_idx_start = int(np.searchsorted(all_lons, lon_start)) - full_lon_start_idx
-                    lat_idx_start = int(np.searchsorted(all_lats, lat_start)) - full_lat_start_idx
-                    lon_idx_end = lon_idx_start + win_w
-                    lat_idx_end = lat_idx_start + win_h
-
-                    # Clip to full map bounds
-                    p_h_start = 0
-                    p_w_start = 0
-                    p_h_end = win_h
-                    p_w_end = win_w
-
-                    if lat_idx_start < 0:
-                        p_h_start = -lat_idx_start
-                        lat_idx_start = 0
-                    if lon_idx_start < 0:
-                        p_w_start = -lon_idx_start
-                        lon_idx_start = 0
-                    if lat_idx_end > full_h:
-                        p_h_end = win_h - (lat_idx_end - full_h)
-                        lat_idx_end = full_h
-                    if lon_idx_end > full_w:
-                        p_w_end = win_w - (lon_idx_end - full_w)
-                        lon_idx_end = full_w
-
-                    if lat_idx_end <= lat_idx_start or lon_idx_end <= lon_idx_start:
-                        continue
-
-                    # 应用余弦权重并累积
-                    weights_slice = cos_weights[p_h_start:p_h_end, p_w_start:p_w_end]  # (h_slice, w_slice)
-                    weights_3d = weights_slice[np.newaxis, :, :]  # (1, h, w)
-
-                    pred_slice = pred[:, p_h_start:p_h_end, p_w_start:p_w_end]  # (C, h, w)
-
-                    blended_pred[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += pred_slice * weights_3d
-                    if target is not None:
-                        target_slice = target[:, p_h_start:p_h_end, p_w_start:p_w_end]
-                        blended_target[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += target_slice * weights_3d
-
-                    weight_sum[lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += weights_slice
-                    valid_windows += 1
-
-        ds.close()
-
-        if valid_windows == 0:
-            raise RuntimeError("没有有效窗口可用于全图推理")
-
-        # 10. 归一化
-        weight_sum_3d = np.maximum(weight_sum, min_weight)[np.newaxis, :, :]
-        blended_pred /= weight_sum_3d
-        blended_target /= weight_sum_3d
-
-        print(f"全图推理完成: {valid_windows} 个有效窗口融合")
-        print(f"  输出尺寸: {blended_pred.shape}")
-
-        return {
-            'blended_pred': blended_pred.astype(np.float32),
-            'blended_target': blended_target.astype(np.float32),
-            'weight_sum': weight_sum.astype(np.float32),
-            'lons': full_lons,
-            'lats': full_lats
-        }
-
     def _predict_full_map_with_dataset(self, target_lon_range=None, target_lat_range=None,
                                        base_time_index=None, pred_step: int = 0):
         """使用 OceanDataset 生成密集窗口，确保训练和全图推理的输入通道一致。"""
@@ -630,8 +439,11 @@ class SmartOceanPredictor:
         pred_len = self.config['prediction_length']
 
         print("获取训练期标准化参数...")
-        ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
-        scalers = ref_dataset.scalers
+        ref_dataset = None
+        scalers = self.preprocessing_scalers
+        if scalers is None:
+            ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
+            scalers = ref_dataset.scalers
 
         print("构建密集推理窗口数据集...")
         dense_dataset = OceanDataset(
@@ -642,6 +454,7 @@ class SmartOceanPredictor:
             override_stride_lon=stride_lon,
             override_stride_lat=stride_lat,
         )
+        bank_dataset = None
 
         try:
             all_lons = dense_dataset.lons.astype(np.float64)
@@ -660,8 +473,11 @@ class SmartOceanPredictor:
             test_start = val_end
 
             if base_time_index is None:
-                base_time_index = min(test_start + seq_len, total_t - pred_len - 1)
-            base_time_index = max(test_start + seq_len - 1, min(base_time_index, total_t - pred_len - 1))
+                base_time_index = test_start - 1
+            base_time_index = max(
+                max(seq_len - 1, test_start - 1),
+                min(base_time_index, total_t - pred_len - 1),
+            )
             sequence_start = base_time_index - seq_len + 1
             pred_step = max(0, min(int(pred_step), pred_len - 1))
 
@@ -678,6 +494,13 @@ class SmartOceanPredictor:
             full_lats = all_lats[full_lat_start_idx:full_lat_end_idx]
             full_h = len(full_lats)
             full_w = len(full_lons)
+            surface_temp = np.asarray(
+                dense_dataset.dataset['TEMP'].isel(TIME=0, LEVEL=0).values
+            )
+            ocean_domain_mask = np.isfinite(surface_temp)[
+                full_lat_start_idx:full_lat_end_idx,
+                full_lon_start_idx:full_lon_end_idx,
+            ]
 
             candidate_indices = []
             for sample_idx, (start_idx, region_idx) in enumerate(dense_dataset.sequences):
@@ -705,12 +528,73 @@ class SmartOceanPredictor:
             blended_target = None
             weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
             valid_windows = 0
-            inference_batch_size = max(1, int(self.config.get('batch_size', 8)))
+            inference_batch_size = max(
+                1,
+                int(self.config.get(
+                    'inference_micro_batch_size',
+                    self.config.get('batch_size', 8),
+                )),
+            )
+            inference_batches = interleaved_batches(candidate_indices, inference_batch_size)
 
             self.model.eval()
             with torch.no_grad():
-                for offset in range(0, len(candidate_indices), inference_batch_size):
-                    batch_indices = candidate_indices[offset:offset + inference_batch_size]
+                global_bank_tokens = None
+                bank_stride_lon = None
+                bank_stride_lat = None
+                global_bank_indices = []
+                if (
+                    getattr(self.model, 'global_token_bank', None) is not None
+                    and hasattr(self.model, 'build_global_token_bank')
+                ):
+                    # The bank is a model input, not a rendering detail. Always
+                    # construct it on the canonical training grid so changing a
+                    # crop or overlap-tile stride cannot change the prediction.
+                    bank_stride_lon = float(self.config.get('train_stride_lon', 8.0))
+                    bank_stride_lat = float(self.config.get('train_stride_lat', 8.0))
+                    if (
+                        np.isclose(stride_lon, bank_stride_lon)
+                        and np.isclose(stride_lat, bank_stride_lat)
+                    ):
+                        bank_dataset = dense_dataset
+                    else:
+                        print(
+                            '  构建 canonical Global Token Bank 数据集: '
+                            f'经度步长={bank_stride_lon}°, 纬度步长={bank_stride_lat}°'
+                        )
+                        bank_dataset = OceanDataset(
+                            self.config['data_path'],
+                            self.config,
+                            mode='test',
+                            scalers=scalers,
+                            override_stride_lon=bank_stride_lon,
+                            override_stride_lat=bank_stride_lat,
+                        )
+                    global_bank_indices = [
+                        sample_idx
+                        for sample_idx, (start_idx, _) in enumerate(bank_dataset.sequences)
+                        if start_idx == sequence_start
+                    ]
+                    if not global_bank_indices:
+                        raise RuntimeError(
+                            'canonical Global Token Bank 没有匹配当前起报时次的窗口'
+                        )
+                    print(
+                        '  构建 canonical Global Token Bank '
+                        f'({len(global_bank_indices)} global windows, micro-batch={inference_batch_size})'
+                    )
+                    bank_parts = []
+                    for batch_indices in interleaved_batches(
+                        global_bank_indices, inference_batch_size
+                    ):
+                        bank_inputs = [bank_dataset[index][0] for index in batch_indices]
+                        bank_tensor = torch.stack(bank_inputs, dim=0).to(self.device)
+                        bank_parts.append(
+                            self.model.build_global_token_bank(bank_tensor).detach().cpu()
+                        )
+                    global_bank_tokens = torch.cat(bank_parts, dim=0).to(self.device)
+
+                for batch_idx, batch_indices in enumerate(inference_batches):
                     batch_inputs = []
                     batch_targets = []
                     for sample_idx in batch_indices:
@@ -719,9 +603,15 @@ class SmartOceanPredictor:
                         batch_targets.append(target_tensor)
 
                     inputs_tensor = torch.stack(batch_inputs, dim=0).to(self.device)
-                    outputs = self.model(inputs_tensor)
+                    if global_bank_tokens is None:
+                        outputs = self.model(inputs_tensor)
+                    else:
+                        outputs = self.model(
+                            inputs_tensor,
+                            global_bank_tokens=global_bank_tokens,
+                        )
                     if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                        print(f"警告: batch {offset // inference_batch_size} 输出包含 NaN/Inf，逐窗口过滤")
+                        print(f"警告: batch {batch_idx} 输出包含 NaN/Inf，逐窗口过滤")
 
                     pred_phys_batch = dense_dataset.inverse_transform_targets(
                         outputs.cpu().numpy(),
@@ -793,24 +683,71 @@ class SmartOceanPredictor:
             if valid_windows == 0 or blended_pred is None:
                 raise RuntimeError("没有有效窗口可用于全图推理")
 
-            weight_sum_3d = np.maximum(weight_sum, min_weight)[np.newaxis, :, :]
-            blended_pred /= weight_sum_3d
-            blended_target /= weight_sum_3d
+            blended_pred, blended_target, coverage_mask = finalize_weighted_blend(
+                blended_pred, blended_target, weight_sum
+            )
+            coverage_pct = float(np.mean(coverage_mask) * 100.0)
+            ocean_points = int(ocean_domain_mask.sum())
+            covered_ocean_points = int(np.count_nonzero(coverage_mask & ocean_domain_mask))
+            ocean_coverage_fraction = (
+                covered_ocean_points / ocean_points if ocean_points else None
+            )
 
             print(f"全图推理完成: {valid_windows} 个有效窗口融合")
             print(f"  输出尺寸: {blended_pred.shape}")
+            print(f"  目标区域有效覆盖率: {coverage_pct:.2f}%（未覆盖格点为 NaN）")
+            if ocean_coverage_fraction is not None:
+                print(f"  目标区域海洋格点覆盖率: {ocean_coverage_fraction * 100:.2f}%")
 
             return {
                 'blended_pred': blended_pred.astype(np.float32),
                 'blended_target': blended_target.astype(np.float32),
                 'weight_sum': weight_sum.astype(np.float32),
+                'coverage_mask': coverage_mask,
+                'ocean_domain_mask': ocean_domain_mask,
                 'lons': full_lons,
                 'lats': full_lats,
+                'target_variables': list(self.config.get('target_variables', [])),
+                'target_channel_slices': {
+                    name: [sl.start, sl.stop]
+                    for name, sl in dense_dataset.target_channel_slices.items()
+                },
+                'levels': dense_dataset.levels.astype(np.float32),
+                'base_time_index': int(base_time_index),
+                'forecast_time_index': int(base_time_index + 1 + pred_step),
+                'prediction_step': int(pred_step),
+                'valid_windows': int(valid_windows),
+                'candidate_windows': int(len(candidate_indices)),
+                'global_bank_windows': (
+                    int(global_bank_tokens.shape[0]) if global_bank_tokens is not None else 0
+                ),
+                'global_bank_scope': (
+                    'canonical_training_grid_at_origin'
+                    if global_bank_tokens is not None else None
+                ),
+                'global_bank_stride_lon': bank_stride_lon,
+                'global_bank_stride_lat': bank_stride_lat,
+                'inference_micro_batch_size': int(inference_batch_size),
+                'coverage_fraction': coverage_pct / 100.0,
+                'ocean_coverage_fraction': ocean_coverage_fraction,
+                'covered_ocean_grid_points': covered_ocean_points,
+                'ocean_grid_points': ocean_points,
+                'window_ocean_threshold': float(dense_dataset.ocean_threshold),
+                'target_lon_range': [float(value) for value in target_lon_range],
+                'target_lat_range': [float(value) for value in target_lat_range],
+                'inference_stride_lon': float(stride_lon),
+                'inference_stride_lat': float(stride_lat),
             }
         finally:
+            if (
+                bank_dataset is not None
+                and bank_dataset is not dense_dataset
+                and getattr(bank_dataset, 'dataset', None) is not None
+            ):
+                bank_dataset.dataset.close()
             if getattr(dense_dataset, 'dataset', None) is not None:
                 dense_dataset.dataset.close()
-            if getattr(ref_dataset, 'dataset', None) is not None:
+            if ref_dataset is not None and getattr(ref_dataset, 'dataset', None) is not None:
                 ref_dataset.dataset.close()
 
     @staticmethod
@@ -845,65 +782,31 @@ class SmartOceanPredictor:
     def _denormalize_predictions(self, predictions, targets, dataset, sample_indices=None):
         """反标准化预测结果和目标数据，anomaly 模式下同时加回气候态。"""
         print("反标准化预测结果...")
-
-        if hasattr(dataset, 'inverse_transform_targets'):
-            try:
-                pred_np = torch.stack(predictions).numpy()
-                target_np = torch.stack(targets).numpy()
-                pred_original = dataset.inverse_transform_targets(
-                    pred_np,
-                    sample_indices=sample_indices,
-                )
-                target_original = dataset.inverse_transform_targets(
-                    target_np,
-                    sample_indices=sample_indices,
-                )
-                predictions_original = [torch.from_numpy(arr.astype(np.float32)) for arr in pred_original]
-                targets_original = [torch.from_numpy(arr.astype(np.float32)) for arr in target_original]
-                print("反标准化完成")
-                return predictions_original, targets_original
-            except Exception as exc:
-                print(f"警告: 目标物理量恢复失败，回退到普通反标准化: {exc}")
-
-        if not hasattr(dataset, 'scalers') or not dataset.scalers:
-            print("警告: 未找到标准化器，使用原始数据")
-            return predictions, targets
-
-        predictions_original = []
-        targets_original = []
-        
-        target_variables = self.config['target_variables']
-        channel_slices = getattr(dataset, 'target_channel_slices', {}) or self.target_channel_slices
-        
-        for i in range(len(predictions)):
-            pred = predictions[i].clone()  # (pred_len, channels, height, width)
-            target = targets[i].clone()
-            
-            # 对每个目标变量进行反标准化
-            for var_idx, var_name in enumerate(target_variables):
-                if var_name in dataset.scalers:
-                    scaler = dataset.scalers[var_name]
-                    slice_indices = channel_slices.get(var_name, slice(var_idx, var_idx + 1))
-
-                    pred_var = pred[:, slice_indices, :, :]
-                    original_shape = pred_var.shape
-                    pred_2d = pred_var.reshape(-1, 1).numpy()
-                    pred_denorm = scaler.inverse_transform(pred_2d)
-                    pred[:, slice_indices, :, :] = torch.from_numpy(pred_denorm.reshape(original_shape)).to(pred.dtype)
-
-                    target_var = target[:, slice_indices, :, :]
-                    original_shape = target_var.shape
-                    target_2d = target_var.reshape(-1, 1).numpy()
-                    target_denorm = scaler.inverse_transform(target_2d)
-                    target[:, slice_indices, :, :] = torch.from_numpy(target_denorm.reshape(original_shape)).to(target.dtype)
-            
-            predictions_original.append(pred)
-            targets_original.append(target)
-        
+        if not hasattr(dataset, 'inverse_transform_targets'):
+            raise RuntimeError('预测 dataset 不支持严格物理量恢复')
+        try:
+            pred_np = torch.stack(predictions).numpy()
+            target_np = torch.stack(targets).numpy()
+            pred_original = dataset.inverse_transform_targets(
+                pred_np,
+                sample_indices=sample_indices,
+            )
+            target_original = dataset.inverse_transform_targets(
+                target_np,
+                sample_indices=sample_indices,
+            )
+        except Exception as exc:
+            raise RuntimeError('目标物理量恢复失败；拒绝改变指标口径后继续') from exc
+        predictions_original = [
+            torch.from_numpy(arr.astype(np.float32)) for arr in pred_original
+        ]
+        targets_original = [
+            torch.from_numpy(arr.astype(np.float32)) for arr in target_original
+        ]
         print("反标准化完成")
         return predictions_original, targets_original
     
-    def _save_results(self, predictions, targets, inputs_list, dataset):
+    def _save_results(self, predictions, targets, inputs_list, dataset, sample_indices):
         """保存预测结果"""
         print("保存预测结果...")
         
@@ -917,7 +820,8 @@ class SmartOceanPredictor:
             os.path.join(self.output_dir, 'predictions.npz'),
             predictions=predictions_np,
             targets=targets_np,
-            inputs=inputs_np
+            inputs=inputs_np,
+            sample_indices=np.asarray(sample_indices, dtype=np.int64),
         )
         
         # 保存配置
@@ -925,20 +829,300 @@ class SmartOceanPredictor:
             json.dump(self.config, f, indent=4)
         
         # 保存模型路径信息
+        provenance = []
+        for sample_idx in sample_indices:
+            start_idx, region_idx = dataset.sequences[int(sample_idx)]
+            region = dataset.all_regions_data[int(region_idx)]
+            target_start = int(start_idx + dataset.sequence_length)
+            provenance.append({
+                'sample_index': int(sample_idx),
+                'region_index': int(region_idx),
+                'history_start_index': int(start_idx),
+                'history_end_index': target_start - 1,
+                'forecast_start_index': target_start,
+                'forecast_end_index': target_start + int(dataset.prediction_length) - 1,
+                'lon_range': [float(value) for value in region.get('lon_range', [])],
+                'lat_range': [float(value) for value in region.get('lat_range', [])],
+            })
+
         info = {
             'model_path': self.model_path,
             'model_index': self.model_index,
+            'model_label': self.model_label,
             'model_dir': self.model_dir,
             'data_path': self.config['data_path'],
             'num_samples': len(predictions),
-            'prediction_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            'prediction_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'prediction_units': 'physical',
+            'input_space': 'normalized model features',
+            'sample_provenance': provenance,
         }
         
         with open(os.path.join(self.output_dir, 'info.json'), 'w') as f:
             json.dump(info, f, indent=4)
     
-    def _visualize_results(self, predictions, targets, inputs_list, metrics, dataset=None):
+    @staticmethod
+    def _variable_plot_style(variable):
+        styles = {
+            'TEMP': ('Temperature', '°C', 'RdYlBu_r'),
+            'SALT': ('Salinity', 'PSU', 'viridis'),
+        }
+        return styles.get(variable, (variable, 'physical units', 'viridis'))
+
+    def _visualize_results(
+        self,
+        predictions,
+        targets,
+        metrics,
+        dataset,
+        sample_indices,
+    ):
+        """Generate schema-safe plots on each sample's real geographic window."""
+        print("生成可追溯的分变量可视化结果...")
+        if dataset is None:
+            raise ValueError('可视化需要 dataset 以恢复每个窗口的真实坐标')
+        if len(predictions) != len(targets) or len(predictions) != len(sample_indices):
+            raise ValueError('可视化的预测、目标与 sample_indices 数量不一致')
+        if not predictions:
+            return
+
+        total_channels = int(predictions[0].shape[1])
+        target_variables = list(self.config.get('target_variables', []))
+        channel_slices = resolve_variable_slices(
+            target_variables,
+            getattr(dataset, 'target_channel_slices', {}),
+            total_channels,
+        )
+        physical_by_variable = metrics.get('physical_report', {}).get('by_variable', {})
+
+        for output_idx in range(min(3, len(predictions))):
+            sample_index = int(sample_indices[output_idx])
+            if sample_index < 0 or sample_index >= len(dataset.sequences):
+                raise IndexError(f'可视化 sample_index 超出数据集范围: {sample_index}')
+            _, region_idx = dataset.sequences[sample_index]
+            region = dataset.all_regions_data[int(region_idx)]
+            coords = region.get('coords', {})
+            lons = np.asarray(coords.get('lons'))
+            lats = np.asarray(coords.get('lats'))
+            height, width = predictions[output_idx].shape[-2:]
+            if lons.shape != (width,) or lats.shape != (height,):
+                raise ValueError(
+                    f'样本 {sample_index} 坐标形状与窗口不一致: '
+                    f'lons={lons.shape}, lats={lats.shape}, grid={(height, width)}'
+                )
+
+            for variable, ch_slice in channel_slices.items():
+                display_name, unit, cmap = self._variable_plot_style(variable)
+                lead_count = min(3, int(predictions[output_idx].shape[0]))
+                fig, axes = plt.subplots(
+                    2, lead_count,
+                    figsize=(5.2 * lead_count, 8.5),
+                    squeeze=False,
+                )
+                fig.suptitle(
+                    f'{display_name} depth-mean — sample {sample_index}',
+                    fontsize=14,
+                )
+                variable_metrics = physical_by_variable.get(variable, {})
+                metric_lines = []
+                for label, key in (('RMSE', 'rmse'), ('MAE', 'mae'), ('R²', 'r2')):
+                    value = variable_metrics.get(key)
+                    metric_lines.append(
+                        f'{label}: {value:.5g}' if value is not None else f'{label}: n/a'
+                    )
+                fig.text(
+                    0.01, 0.98, '\n'.join(metric_lines),
+                    va='top', fontsize=9,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.85),
+                )
+
+                for lead_idx in range(lead_count):
+                    pred_map = predictions[output_idx][lead_idx, ch_slice].mean(dim=0).numpy()
+                    target_map = targets[output_idx][lead_idx, ch_slice].mean(dim=0).numpy()
+                    finite = np.concatenate((
+                        pred_map[np.isfinite(pred_map)],
+                        target_map[np.isfinite(target_map)],
+                    ))
+                    vmin = float(finite.min()) if finite.size else 0.0
+                    vmax = float(finite.max()) if finite.size else 1.0
+                    if vmax <= vmin:
+                        vmax = vmin + 1e-12
+                    for row, values, label in (
+                        (0, pred_map, 'Prediction'),
+                        (1, target_map, 'Target'),
+                    ):
+                        image_artist = axes[row, lead_idx].pcolormesh(
+                            lons, lats, values,
+                            shading='auto', cmap=cmap, vmin=vmin, vmax=vmax,
+                        )
+                        axes[row, lead_idx].set_title(
+                            f'{label}, lead {lead_idx + 1}'
+                        )
+                        axes[row, lead_idx].set_xlabel('Longitude')
+                        axes[row, lead_idx].set_ylabel('Latitude')
+                        plt.colorbar(
+                            image_artist,
+                            ax=axes[row, lead_idx],
+                            shrink=0.8,
+                            label=unit,
+                        )
+                plt.tight_layout()
+                safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', variable)
+                plt.savefig(
+                    os.path.join(
+                        self.output_dir,
+                        f'{safe_name}_prediction_sample_{sample_index}.png',
+                    ),
+                    dpi=150,
+                    bbox_inches='tight',
+                )
+                plt.close(fig)
+
+        self._plot_variable_lead_errors(
+            predictions, targets, dataset, channel_slices
+        )
+        self._plot_geographic_error(
+            predictions, targets, dataset, sample_indices, channel_slices
+        )
+
+    def _plot_variable_lead_errors(
+        self,
+        predictions,
+        targets,
+        dataset,
+        channel_slices,
+    ):
+        """Plot lead-wise physical errors separately for every target variable."""
+        del dataset
+        pred_stack = torch.stack(predictions)
+        target_stack = torch.stack(targets)
+        fig, axes = plt.subplots(
+            len(channel_slices), 2,
+            figsize=(13, 4.5 * len(channel_slices)),
+            squeeze=False,
+        )
+        saved = {}
+        for row, (variable, ch_slice) in enumerate(channel_slices.items()):
+            _, unit, _ = self._variable_plot_style(variable)
+            error = pred_stack[:, :, ch_slice] - target_stack[:, :, ch_slice]
+            mse = torch.mean(error ** 2, dim=(0, 2, 3, 4)).numpy()
+            mae = torch.mean(torch.abs(error), dim=(0, 2, 3, 4)).numpy()
+            leads = np.arange(1, len(mse) + 1)
+            axes[row, 0].plot(leads, mse, 'o-', linewidth=2)
+            axes[row, 0].set_title(f'{variable} MSE by lead')
+            axes[row, 0].set_ylabel(f'MSE [{unit}²]')
+            axes[row, 1].plot(leads, mae, 'o-', linewidth=2)
+            axes[row, 1].set_title(f'{variable} MAE by lead')
+            axes[row, 1].set_ylabel(f'MAE [{unit}]')
+            for axis in axes[row]:
+                axis.set_xlabel('Forecast lead')
+                axis.set_xticks(leads)
+                axis.grid(True, alpha=0.3)
+            saved[f'{variable}_mse_by_lead'] = mse
+            saved[f'{variable}_mae_by_lead'] = mae
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(self.output_dir, 'variable_error_analysis.png'),
+            dpi=150,
+            bbox_inches='tight',
+        )
+        plt.close(fig)
+        np.savez_compressed(
+            os.path.join(self.output_dir, 'variable_error_by_lead.npz'),
+            **saved,
+        )
+
+    def _plot_geographic_error(
+        self,
+        predictions,
+        targets,
+        dataset,
+        sample_indices,
+        channel_slices,
+    ):
+        """Accumulate sampled-window errors on the actual global grid."""
+        global_lons = np.asarray(dataset.lons)
+        global_lats = np.asarray(dataset.lats)
+        grid_shape = (len(global_lats), len(global_lons))
+        squared_error = {
+            variable: np.zeros(grid_shape, dtype=np.float64)
+            for variable in channel_slices
+        }
+        finite_count = {
+            variable: np.zeros(grid_shape, dtype=np.int64)
+            for variable in channel_slices
+        }
+
+        for output_idx, sample_index in enumerate(sample_indices):
+            _, region_idx = dataset.sequences[int(sample_index)]
+            coords = dataset.all_regions_data[int(region_idx)].get('coords', {})
+            window_lons = np.asarray(coords.get('lons'))
+            window_lats = np.asarray(coords.get('lats'))
+            lon_indices = np.searchsorted(global_lons, window_lons)
+            lat_indices = np.searchsorted(global_lats, window_lats)
+            if (
+                np.any(lon_indices >= len(global_lons))
+                or np.any(lat_indices >= len(global_lats))
+                or not np.allclose(global_lons[lon_indices], window_lons)
+                or not np.allclose(global_lats[lat_indices], window_lats)
+            ):
+                raise ValueError(f'样本 {sample_index} 的窗口坐标不能映射到全局网格')
+            grid_index = np.ix_(lat_indices, lon_indices)
+            for variable, ch_slice in channel_slices.items():
+                difference = (
+                    predictions[output_idx][:, ch_slice]
+                    - targets[output_idx][:, ch_slice]
+                ).numpy()
+                finite = np.isfinite(difference)
+                sample_sse = np.where(finite, difference ** 2, 0.0).sum(axis=(0, 1))
+                sample_count = finite.sum(axis=(0, 1))
+                squared_error[variable][grid_index] += sample_sse
+                finite_count[variable][grid_index] += sample_count
+
+        fig, axes = plt.subplots(
+            1, len(channel_slices),
+            figsize=(7 * len(channel_slices), 4.5),
+            squeeze=False,
+        )
+        saved = {
+            'lons': global_lons,
+            'lats': global_lats,
+            'sample_indices': np.asarray(sample_indices, dtype=np.int64),
+        }
+        for col, variable in enumerate(channel_slices):
+            rmse = np.full(grid_shape, np.nan, dtype=np.float32)
+            covered = finite_count[variable] > 0
+            rmse[covered] = np.sqrt(
+                squared_error[variable][covered] / finite_count[variable][covered]
+            )
+            _, unit, cmap = self._variable_plot_style(variable)
+            artist = axes[0, col].pcolormesh(
+                global_lons, global_lats, rmse,
+                shading='auto', cmap=cmap,
+            )
+            axes[0, col].set_title(
+                f'{variable} RMSE on sampled geographic cells'
+            )
+            axes[0, col].set_xlabel('Longitude')
+            axes[0, col].set_ylabel('Latitude')
+            plt.colorbar(artist, ax=axes[0, col], shrink=0.8, label=unit)
+            saved[f'{variable}_rmse'] = rmse
+            saved[f'{variable}_finite_count'] = finite_count[variable]
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(self.output_dir, 'sampled_geographic_error.png'),
+            dpi=150,
+            bbox_inches='tight',
+        )
+        plt.close(fig)
+        np.savez_compressed(
+            os.path.join(self.output_dir, 'sampled_geographic_metrics.npz'),
+            **saved,
+        )
+
+    def _legacy_visualize_results(self, predictions, targets, inputs_list, metrics, dataset=None):
         """可视化预测结果"""
+        raise RuntimeError('旧版等分目标通道可视化已停用，请使用 schema-safe 可视化')
         print("生成可视化结果...")
         
         # 获取经纬度坐标
@@ -1195,16 +1379,17 @@ class SmartOceanPredictor:
             plt.close()
         
         # 生成误差分析图
-        self._plot_error_analysis(predictions, targets)
+        self._legacy_plot_error_analysis(predictions, targets)
         
         # 生成温度和盐度的单独误差分析
-        self._plot_variable_error_analysis(predictions, targets)
+        self._legacy_plot_variable_error_analysis(predictions, targets)
 
         # 生成按空间区域的误差热力图
-        self._plot_regional_error(predictions, targets, dataset)
+        self._legacy_plot_regional_error(predictions, targets, dataset)
 
-    def _plot_regional_error(self, predictions, targets, dataset=None):
+    def _legacy_plot_regional_error(self, predictions, targets, dataset=None):
         """绘制空间各区域（格点）RMSE热力图，并保存矩阵数据"""
+        raise RuntimeError('旧版窗口相对坐标误差图已停用，请使用地理网格聚合')
         print("生成按空间区域的误差热力图...")
 
         pred_stack = torch.stack(predictions)  # (num_samples, pred_len, channels, height, width)
@@ -1307,8 +1492,9 @@ class SmartOceanPredictor:
 
         np.savez(os.path.join(self.output_dir, 'regional_metrics.npz'), **save_dict)
     
-    def _plot_error_analysis(self, predictions, targets):
+    def _legacy_plot_error_analysis(self, predictions, targets):
         """绘制误差分析图"""
+        raise RuntimeError('物理变量禁止生成混合单位整体误差图')
         print("生成误差分析...")
         
         pred_stack = torch.stack(predictions)  # (num_samples, pred_len, channels, height, width)
@@ -1341,8 +1527,9 @@ class SmartOceanPredictor:
                    dpi=150, bbox_inches='tight')
         plt.close()
     
-    def _plot_variable_error_analysis(self, predictions, targets):
+    def _legacy_plot_variable_error_analysis(self, predictions, targets):
         """绘制温度和盐度的单独误差分析图"""
+        raise RuntimeError('旧版等分目标通道误差图已停用，请使用显式 channel schema')
         print("生成温度和盐度误差分析...")
         
         pred_stack = torch.stack(predictions)  # (num_samples, pred_len, channels, height, width)
@@ -1462,89 +1649,101 @@ class SmartOceanPredictor:
         # 获取损失权重
         # 获取目标变量信息
         target_variables = self.config.get('target_variables', [])
-        var_count = max(1, len(target_variables))
         num_channels = pred_stack.shape[2]
-        channels_per_var = num_channels // var_count
         channel_slices = getattr(dataset, 'target_channel_slices', {}) if dataset is not None else self.target_channel_slices
         if not channel_slices:
             channel_slices = self.target_channel_slices
+        resolved_slices = resolve_variable_slices(
+            target_variables,
+            channel_slices,
+            num_channels,
+        )
 
-        baseline_refs = {'physical': {}, 'normalized': {}}
-        if dataset is not None and hasattr(dataset, 'build_reference_forecasts'):
-            try:
-                baseline_refs = dataset.build_reference_forecasts(sample_indices=sample_indices)
-            except Exception as exc:
-                print(f"警告: baseline 指标构造失败: {exc}")
+        if dataset is None or not hasattr(dataset, 'build_reference_forecasts'):
+            raise RuntimeError('预测 dataset 不支持冻结基线构造')
+        try:
+            physical_baselines = dataset.build_reference_forecasts(
+                sample_indices=sample_indices,
+                spaces=('physical',),
+            ).get('physical', {})
+        except Exception as exc:
+            raise RuntimeError('物理量冻结基线构造失败；拒绝输出不完整指标') from exc
 
         pred_np = pred_stack.numpy()
         target_np = target_stack.numpy()
+        raw_levels = getattr(dataset, 'levels', None) if dataset is not None else None
+        depth_values = (
+            [float(value) for value in np.asarray(raw_levels).reshape(-1)]
+            if raw_levels is not None else None
+        )
         physical_report = compute_metric_report(
             pred_np,
             target_np,
             target_variables,
             channel_slices=channel_slices,
-            baselines=baseline_refs.get('physical'),
+            baselines=physical_baselines,
+            metric_space='physical',
+            depth_values=depth_values,
         )
 
         normalized_report = None
         if normalized_predictions is not None and normalized_targets is not None:
             norm_pred_np = torch.stack(normalized_predictions).numpy()
             norm_target_np = torch.stack(normalized_targets).numpy()
+            try:
+                normalized_baselines = dataset.build_reference_forecasts(
+                    sample_indices=sample_indices,
+                    spaces=('normalized',),
+                ).get('normalized', {})
+            except Exception as exc:
+                raise RuntimeError(
+                    '标准化冻结基线构造失败；拒绝输出不完整指标'
+                ) from exc
             normalized_report = compute_metric_report(
                 norm_pred_np,
                 norm_target_np,
                 target_variables,
                 channel_slices=channel_slices,
-                baselines=baseline_refs.get('normalized'),
+                baselines=normalized_baselines,
+                metric_space='normalized',
+                depth_values=depth_values,
+                include_depth=False,
             )
 
-        temp_weight = self.config.get('temp_weight', 0.7)
-        salt_weight = self.config.get('salt_weight', 0.3)
-
+        # 加权损失必须在训练使用的 normalized/anomaly 空间计算。
+        loss_pred_stack = torch.stack(normalized_predictions) if normalized_predictions is not None else pred_stack
+        loss_target_stack = torch.stack(normalized_targets) if normalized_targets is not None else target_stack
+        raw_weights = self.config.get('target_loss_weights', {})
+        weight_sum = sum(float(raw_weights.get(name, 0.0)) for name in resolved_slices)
+        variable_weights = {
+            name: (
+                float(raw_weights.get(name, 0.0)) / weight_sum
+                if weight_sum > 0 else 1.0 / len(resolved_slices)
+            )
+            for name in resolved_slices
+        }
+        variable_losses = {}
         weighted_loss = 0.0
-        temp_loss = 0.0
-        salt_loss = 0.0
+        for var_name, ch_slice in resolved_slices.items():
+            var_loss = torch.mean(
+                (loss_pred_stack[:, :, ch_slice, :, :] - loss_target_stack[:, :, ch_slice, :, :]) ** 2
+            ).item()
+            variable_losses[var_name] = var_loss
+            weighted_loss += variable_weights[var_name] * var_loss
 
-        if var_count == 1:
-            # 单变量直接计算整体MSE
-            temp_loss = torch.mean((pred_stack - target_stack) ** 2).item()
-            weighted_loss = temp_loss
-        else:
-            # 双变量（保留原逻辑）
-            pred_temp = pred_stack[:, :, :channels_per_var, :, :]
-            target_temp = target_stack[:, :, :channels_per_var, :, :]
-            temp_loss = torch.mean((pred_temp - target_temp) ** 2).item()
-            weighted_loss += temp_weight * temp_loss
-
-            pred_salt = pred_stack[:, :, channels_per_var:, :, :]
-            target_salt = target_stack[:, :, channels_per_var:, :, :]
-            salt_loss = torch.mean((pred_salt - target_salt) ** 2).item()
-            weighted_loss += salt_weight * salt_loss
-        
-        # 整体指标
-        mse = torch.mean((pred_stack - target_stack) ** 2).item()
-        mae = torch.mean(torch.abs(pred_stack - target_stack)).item()
-        rmse = np.sqrt(mse)
-        
-        # 计算相关系数
-        # 转换为 float64 以确保计算精度
-        pred_flat = pred_stack.reshape(-1).numpy().astype(np.float64)
-        target_flat = target_stack.reshape(-1).numpy().astype(np.float64)
-        correlation = np.corrcoef(pred_flat, target_flat)[0, 1]
-
-        # 计算R^2
-        target_mean = target_flat.mean()
-        ss_tot = np.sum((target_flat - target_mean) ** 2)
-        ss_res = np.sum((pred_flat - target_flat) ** 2)
-        r2 = float('nan') if ss_tot == 0 else 1 - ss_res / ss_tot
+        # 跨变量整体指标只取单位一致的报告；多物理变量时使用 normalized/anomaly。
+        physical_overall = physical_report.get('overall')
+        aggregate_report = physical_report if physical_overall is not None else normalized_report
+        aggregate_metrics = (aggregate_report or {}).get('overall') or {}
         
         metrics = {
             'overall': {
-                'MSE': _to_serializable(mse),
-                'MAE': _to_serializable(mae),
-                'RMSE': _to_serializable(rmse),
-                'Correlation': _to_serializable(correlation),
-                'R2': _to_serializable(r2)
+                'MSE': _to_serializable(aggregate_metrics.get('mse')),
+                'MAE': _to_serializable(aggregate_metrics.get('mae')),
+                'RMSE': _to_serializable(aggregate_metrics.get('rmse')),
+                'Correlation': _to_serializable(aggregate_metrics.get('correlation')),
+                'R2': _to_serializable(aggregate_metrics.get('r2')),
+                'metric_space': 'physical' if physical_overall is not None else 'normalized/anomaly',
             },
             'physical_report': physical_report,
             'normalized_report': normalized_report,
@@ -1558,53 +1757,34 @@ class SmartOceanPredictor:
             },
             'num_samples': len(predictions)
         }
-            # 仅在多变量时保留加权结构
-        if var_count > 1:
-            metrics['weighted'] = {
-                'Weighted_MSE': _to_serializable(weighted_loss),
-                'Temp_MSE': _to_serializable(temp_loss),
-                'Salt_MSE': _to_serializable(salt_loss),
-                'Temp_Weight': _to_serializable(temp_weight),
-                'Salt_Weight': _to_serializable(salt_weight)
-            }
-        else:
-            metrics['weighted'] = {
-                'Weighted_MSE': _to_serializable(weighted_loss),
-                f'{target_variables[0] if target_variables else "Var"}_MSE': _to_serializable(temp_loss)
-            }
+        metrics['weighted'] = {
+            'Weighted_MSE': _to_serializable(weighted_loss),
+            'metric_space': 'normalized/anomaly' if normalized_predictions is not None else 'physical',
+            'by_variable': {
+                var_name: {
+                    'MSE': _to_serializable(variable_losses[var_name]),
+                    'weight': _to_serializable(variable_weights[var_name]),
+                }
+                for var_name in variable_losses
+            },
+        }
         
         # 分别计算温度和盐度的指标
         # 按变量分别计算指标
-        for var_idx in range(var_count):
-            start_ch = var_idx * channels_per_var
-            end_ch = (var_idx + 1) * channels_per_var
-            pred_var = pred_stack[:, :, start_ch:end_ch, :, :]
-            target_var = target_stack[:, :, start_ch:end_ch, :, :]
-
-            var_mse = torch.mean((pred_var - target_var) ** 2).item()
-            var_mae = torch.mean(torch.abs(pred_var - target_var)).item()
-            var_rmse = np.sqrt(var_mse)
-
-            pred_var_flat = pred_var.reshape(-1).numpy()
-            target_var_flat = target_var.reshape(-1).numpy()
-            var_corr = np.corrcoef(pred_var_flat, target_var_flat)[0, 1]
-            var_target_mean = target_var_flat.mean()
-            var_ss_tot = np.sum((target_var_flat - var_target_mean) ** 2)
-            var_ss_res = np.sum((pred_var_flat - target_var_flat) ** 2)
-            var_r2 = float('nan') if var_ss_tot == 0 else 1 - var_ss_res / var_ss_tot
+        for var_name_key in resolved_slices:
+            var_report = physical_report['by_variable'][var_name_key]
 
             name_map = {
                 'TEMP': 'temperature',
                 'SALT': 'salinity'
             }
-            var_name_key = target_variables[var_idx] if var_idx < len(target_variables) else f'var{var_idx}'
             metrics_key = name_map.get(var_name_key, var_name_key.lower())
             metrics[metrics_key] = {
-                'MSE': _to_serializable(var_mse),
-                'MAE': _to_serializable(var_mae),
-                'RMSE': _to_serializable(var_rmse),
-                'Correlation': _to_serializable(var_corr),
-                'R2': _to_serializable(var_r2)
+                'MSE': _to_serializable(var_report.get('mse')),
+                'MAE': _to_serializable(var_report.get('mae')),
+                'RMSE': _to_serializable(var_report.get('rmse')),
+                'Correlation': _to_serializable(var_report.get('correlation')),
+                'R2': _to_serializable(var_report.get('r2')),
             }
         
         # 保存指标
@@ -1651,16 +1831,44 @@ class SmartOceanPredictor:
                 f"R2: {norm_r2:.6f}" if norm_r2 is not None else "R2: nan",
             )
 
-        print("  Baseline 对比 (RMSE improvement %, 越高越好):")
-        for space_name, comparison in metrics['baseline_comparison'].items():
-            if not comparison:
+        primary_report = metrics.get('physical_report') or normalized_report or {}
+        macro_r2 = (
+            primary_report.get('macro_field', {})
+            .get('dimensionless_overall', {})
+            .get('r2', {})
+            .get('mean')
+        )
+        print("  去背景稳健指标:")
+        print(f"    Macro-field R2 mean: {macro_r2:.6f}" if macro_r2 is not None else "    Macro-field R2 mean: nan")
+        spatial_by_var = primary_report.get('spatial_mean_removed', {}).get('by_variable', {})
+        clim_by_var = primary_report.get('climatology_residual', {}).get('by_variable', {})
+        for var_name in target_variables:
+            spatial_r2 = spatial_by_var.get(var_name, {}).get('r2')
+            clim_metrics = clim_by_var.get(var_name, {})
+            spatial_text = f"{spatial_r2:.6f}" if spatial_r2 is not None else "nan"
+            clim_r2 = clim_metrics.get('r2')
+            clim_corr = clim_metrics.get('correlation')
+            clim_r2_text = f"{clim_r2:.6f}" if clim_r2 is not None else "nan"
+            clim_corr_text = f"{clim_corr:.6f}" if clim_corr is not None else "nan"
+            print(f"    [{var_name}] Spatial-mean-removed R2: {spatial_text}")
+            if clim_metrics:
+                print(f"    [{var_name}] Climatology-residual Corr/R2: {clim_corr_text} / {clim_r2_text}")
+
+        print("  Baseline 对比 (按变量计算，skill > 0 表示优于基线):")
+        for space_name, comparisons in metrics['baseline_comparison'].items():
+            if not comparisons:
                 continue
             print(f"    [{space_name}]")
-            for key, value in comparison.items():
-                if value is None:
-                    print(f"      {key}: nan")
-                else:
-                    print(f"      {key}: {value:.2f}%")
+            for baseline_name, comparison in comparisons.items():
+                macro_skill = comparison.get('macro', {}).get('mse_skill', {}).get('mean')
+                macro_text = f"{macro_skill:.6f}" if macro_skill is not None else "nan"
+                print(f"      {baseline_name}: macro MSE skill={macro_text}")
+                for var_name, values in comparison.get('by_variable', {}).items():
+                    skill = values.get('mse_skill')
+                    improvement = values.get('rmse_improvement_pct')
+                    skill_text = f"{skill:.6f}" if skill is not None else "nan"
+                    improvement_text = f"{improvement:.2f}%" if improvement is not None else "nan"
+                    print(f"        [{var_name}] skill={skill_text}, RMSE improvement={improvement_text}")
         
         print(f"  样本数量: {metrics['num_samples']}")
         
@@ -1670,7 +1878,9 @@ class SmartOceanPredictor:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="ConvLSTM 海洋预测脚本")
-    parser.add_argument('--model', type=int, required=True, help='选择 outputs/results 下模型编号')
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument('--model', type=int, help='选择 outputs/results 下模型编号')
+    model_group.add_argument('--model_dir', type=str, help='直接指定确定性的训练结果目录')
     parser.add_argument('--samples', type=int, default=None, help='预测样本数（覆盖配置）')
     parser.add_argument('--output_dir', type=str, default=None, help='自定义预测输出目录')
     args = parser.parse_args()
@@ -1698,7 +1908,12 @@ def main():
     
     try:
         # 创建预测器
-        predictor = SmartOceanPredictor(model_index=args.model, config=config, output_dir=args.output_dir)
+        predictor = SmartOceanPredictor(
+            model_index=args.model,
+            model_dir=args.model_dir,
+            config=config,
+            output_dir=args.output_dir,
+        )
 
         # 进行预测
         predictor.predict(num_samples=args.samples)
@@ -1709,6 +1924,7 @@ def main():
         print(f"预测过程中出现错误: {e}")
         import traceback
         traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

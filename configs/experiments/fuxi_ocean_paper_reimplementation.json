@@ -1,0 +1,10 @@
+{
+  "extends": "paper_reimplementation_base.json",
+  "model_type": "fuxi_ocean_paper",
+  "baseline_provenance": {
+    "kind": "paper_reimplementation",
+    "method_name": "FuXi Ocean",
+    "official_code": false,
+    "implementation": "local_paper_level_proxy"
+  }
+}

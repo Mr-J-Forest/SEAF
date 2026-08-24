@@ -1,0 +1,4 @@
+{
+  "extends": "formal_base.json",
+  "tsc_fusion_transformer_layers": 0
+}

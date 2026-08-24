@@ -25,14 +25,16 @@ DATA_CONFIG = {
     #    - 训练集：时间步 0 到 train_ratio*total_steps
     #    - 验证集：时间步 train_ratio*total_steps 到 (train_ratio+val_ratio)*total_steps  
     #    - 测试集：时间步 (train_ratio+val_ratio)*total_steps 到 total_steps
-    # 2. 序列要求：每个样本需要 sequence_length + prediction_length 个连续时间步
-    #    - 当前需要：24 + 6 = 30 个连续时间步
-    #    - 如果某个数据集的时间步少于30，将无法创建样本
+    # 2. 序列要求：每个样本需要 sequence_length + prediction_length 个连续时间步。
+    #    carry_history 下验证/测试可使用分界前已观测历史，但预测目标不能越界。
     # 3. 空间维度：每个时间段包含所有空间位置的数据
-    # 4. 数据增强：训练时启用滑动窗口增强，测试时只用原始区域
-    'train_ratio': 0.6,    # 训练集比例：前50%时间段
-    'val_ratio': 0.2,      # 验证集比例：中间30%时间段
+    # 4. 正式 GTB 协议：train/val/test 使用同一 canonical 空间网格
+    'train_ratio': 0.6,    # 训练集比例：前60%时间段
+    'val_ratio': 0.2,      # 验证集比例：中间20%时间段
     'test_ratio': 0.2,     # 测试集比例：最后20%时间段
+    # 验证/测试的预测目标严格位于各自分段；历史输入可承接分界前已观测数据。
+    # 这对应滚动起报，避免无意义地丢弃每个分段开头 sequence_length 个月。
+    'split_context_policy': 'carry_history',
 
     # 空间范围
     'lon_range': [130.5, 162.5],  # 经度范围
@@ -45,15 +47,17 @@ DATA_CONFIG = {
     'lon_step': 2.0,              # 经纬度滑动步长（兜底默认值，优先使用分模式步长）
 
     # 分模式滑动步长（支持经纬度分别设置）
-    # Train: 密集滑窗
+    # Train/val/test: 同一个 8° canonical 网格
     'train_stride_lon': 8.0,
     'train_stride_lat': 8.0,
-    # Val: 稀疏重叠
-    'val_stride_lon': 16.0,
-    'val_stride_lat': 10.0,
-    # Test: 稀疏重叠
-    'test_stride_lon': 16.0,
-    'test_stride_lat': 10.0,
+    # Val/Test 使用与训练相同的 canonical 网格。Global Token Bank 对
+    # token 的数量与空间采样敏感，因此正式协议不能在不同 split 改变 bank。
+    'val_stride_lon': 8.0,
+    'val_stride_lat': 8.0,
+    'test_stride_lon': 8.0,
+    'test_stride_lat': 8.0,
+    # 对当前冻结数据文件和 terminal-anchor 网格的审计结果；加载器据此检测协议漂移。
+    'expected_canonical_windows_per_origin': 151,
 
     # 推理阶段密集重叠滑窗步长（overlap-tile prediction）
     'inference_stride_lon': 4.0,
@@ -62,12 +66,14 @@ DATA_CONFIG = {
     # Overlap-tile 融合参数
     'taper_ratio': 0.25,           # 边缘余弦衰减带占窗口尺寸比例（四周各25%）
     'min_blend_weight': 1e-3,      # 融合时边缘最低权重，避免除零/空洞
+    'inference_micro_batch_size': 32,  # 两阶段全局 bank 推理的局部编码批大小
 
     # 气候态 / anomaly 建模
     'anomaly_variables': ['TEMP', 'SALT'],       # 对这些变量减去训练期月气候态后再标准化
     'climatology_period': 12,                    # 月气候态周期
     'include_climatology_features': True,        # 将目标变量气候态作为额外输入通道
     'climatology_feature_variables': ['TEMP', 'SALT'],
+    'climatology_baseline_variables': ['TEMP', 'SALT'],
 
     # 预处理持久化缓存（避免每次训练重复滑窗搜索、气候态计算、标准化拟合）
     'cache_preprocessed': True,                  # 是否启用预处理缓存
@@ -80,9 +86,11 @@ MODEL_CONFIG = {
     'hidden_dims': [64, 96, 128, 128],  # 隐藏层维度
     'kernel_size': (3, 3),              # 卷积核大小
     'num_layers': 4,                    # 层数
-    'dropout': 0.05,                     # Dropout率，温度喜欢0.1，盐度喜欢0.05 (过拟合时可适当调大)
+    'dropout': 0.05,                     # Dropout；最终值由验证集协议确定
 
-    'tsc_variables': ['TEMP', 'SALT', 'PTEMP', 'PDEN', 'SPICE'],
+    # ThermohalineMemory 只读取 TEMP/SALT 剖面；SSHA/风场仍进入其他主干分支。
+    # 不要在论文中宣称使用了未输入的派生变量。
+    'tsc_variables': ['TEMP', 'SALT'],
     'tsc_num_prototypes': 8,
     'tsc_hidden_dim': 32,
     'tsc_output_dim': 16,
@@ -98,7 +106,11 @@ MODEL_CONFIG = {
     'tsc_fusion_transformer_layers': 1,
     'tsc_fusion_transformer_ffn_dim': 256,
     'tsc_fusion_persistence_init': 0.5,
+    'enable_persistence_residual': True,
     'enable_global_token_bank': True,
+    # time_group 要求训练/验证/测试时一个 batch 覆盖同一起报时次的全部窗口。
+    # 密集全图推理使用两阶段外部 bank，可在不改变结果的前提下 micro-batch。
+    'global_token_bank_scope': 'time_group',
     'global_token_bank_heads': 4,
     'global_token_bank_ffn_dim': 128,
     'global_token_bank_dropout': 0.05,
@@ -106,12 +118,15 @@ MODEL_CONFIG = {
 
 # ========== 训练相关参数 ==========
 TRAINING_CONFIG = {
-    'epochs': 20,                 # 训练轮数（快速验证稳定性，可按需调大）
-    'learning_rate': 1.57e-4,         # 学习率 温度喜欢1.57e-4
-    'batch_size': 8,               # 批次大小（验证期减小以加快迭代）
-    'num_workers': 4,              # 数据加载进程数 (设置为0以避免验证集卡死)
-    'persistent_workers': True,    # 多进程数据加载是否持久化worker
-    'prefetch_factor': 4,          # 每个worker预取的批次数（num_workers>0时生效）
+    'epochs': 50,                 # 训练轮数
+    'learning_rate': 1.57e-4,         # 默认值；正式运行先执行分模型学习率校准
+    'batch_size': 151,             # 当前冻结数据协议每个起报时次的全部 canonical 空间窗
+    'seed': 42,                    # 默认固定随机种子；正式实验使用多个 seed 重复
+    # 一个 canonical time-group batch 很大；多 worker × 预取会复制整批张量，
+    # 在容器内存限额下没有收益且可能被外部 OOM guard 杀死。
+    'num_workers': 0,
+    'persistent_workers': False,
+    'prefetch_factor': 2,          # 仅 num_workers>0 时生效
     'pin_memory': True,            # 是否使用pin_memory
     'group_batches_by_time': True, # 将同一历史起点的不同窗口组织到同一batch，供Global Token Bank使用
     
@@ -123,25 +138,24 @@ TRAINING_CONFIG = {
     'scheduler_patience': 10,       # 学习率调度耐心值
     'scheduler_factor': 0.5,        # 学习率衰减因子
     'min_lr': 1e-6,                # 最小学习率
-    # 温度收敛后进一步压低学习率以优化盐度
-    'temp_lr_threshold': 0.05,      # 当温度损失低于该值时触发额外降学习率
-    'temp_lr_decay_factor': 0.5,    # 额外降学习率倍数
-    'temp_lr_cooldown': 1,          # 两次触发之间的最小epoch间隔
-    'temp_lr_min': 1e-6,            # 额外策略的学习率下限
-    
     # 早停
     'early_stopping_patience': 20,  # 早停耐心值
     'min_delta': 1e-6,             # 最小改善阈值
     
     # 损失函数权重
-    'temp_weight': 0.5,            # 温度损失权重
-    'salt_weight': 0.5,            # 盐度损失权重
+    'target_loss_weights': {'TEMP': 0.5, 'SALT': 0.5},  # 通用分变量损失权重
     'use_gradient_loss': True,     # 是否启用梯度分布匹配损失
     'gradient_loss_weight': 0.1,   # 梯度损失权重
+    'gradient_loss_mode': 'vector', # vector 保留梯度方向；magnitude 仅用于敏感性对照
     
     # 保存设置
     'save_best_only': True,        # 只保存最佳模型
     'save_last': True,             # 保存最后一个检查点
+    'strict_resume_provenance': True,  # 禁止跨配置或跨源码版本拼接训练轨迹
+    # none=仅训练曲线，validation=消融筛选，test=协议冻结后的最终确认。
+    # 默认只读验证集，避免手工运行 train.py 时无意中反复查看测试集。
+    # 只有冻结后的 final_test 阶段才能在实验矩阵中显式覆盖为 test。
+    'post_training_evaluation': 'validation',
 }
 
 # ========== 预测相关参数 ==========
@@ -158,8 +172,8 @@ PREDICTION_CONFIG = {
 HARDWARE_CONFIG = {
     'device': 'auto',              # 设备选择：'auto', 'cpu', 'cuda'
     'mixed_precision': True,       # 启用混合精度训练(AMP)，提升RTX 5090性能
-    'compile_model': True,         # 启用torch.compile加速
-    'cudnn_benchmark': True,       # 启用cuDNN benchmark
+    'compile_model': False,        # 实测动态形状 compile 更慢且会重复编译，正式协议使用 eager
+    'cudnn_benchmark': False,      # 固定 seed 的正式实验关闭 autotuner，减少运行间漂移
 }
 
 # ========== 输出和日志参数 ==========
@@ -175,6 +189,7 @@ OUTPUT_CONFIG = {
     'checkpoint_filename': 'latest_checkpoint.pth',
     'config_filename': 'config.json',
     'metrics_filename': 'metrics.json',
+    'scalers_filename': 'scalers.pkl',  # 与模型一起保存训练期标准化器
     'info_filename': 'info.json',
     
     # 日志设置
@@ -184,9 +199,8 @@ OUTPUT_CONFIG = {
 
 # ========== 特征编码参数 ==========
 ENCODING_CONFIG = {
-    'enable_positional_encoding': MODULE_SWITCHES['enable_positional_encoding'],  # 是否启用经纬度/深度正弦-余弦位置编码
+    'enable_positional_encoding': MODULE_SWITCHES['enable_positional_encoding'],  # 是否启用周期经纬度 Fourier 编码
     'positional_encoding_frequencies': 8, # 经纬度编码频率数量（总通道数 = 4 * 频率数）
-    'depth_encoding_frequencies': 4,      # 深度编码频率数量（总通道数 = 2 * 深度层数 * 频率数）
     'enable_time_encoding': MODULE_SWITCHES['enable_time_encoding'],        # 是否启用时间傅里叶编码
     'time_encoding_frequencies': 4,       # 时间编码频率数量（总通道数 = 2 * 频率数）
     'time_encoding_period': 12,           # 时间周期（默认12表示月份）
@@ -216,8 +230,12 @@ def validate_config(config):
     errors = []
     
     # 验证数据分割比例
-    if config['train_ratio'] + config['val_ratio'] > 1.0:
-        errors.append("训练集和验证集比例之和不能超过1.0")
+    train_ratio = float(config.get('train_ratio', 0))
+    val_ratio = float(config.get('val_ratio', 0))
+    if train_ratio <= 0 or val_ratio < 0 or train_ratio + val_ratio >= 1.0:
+        errors.append("train_ratio 必须为正、val_ratio 必须非负，且二者之和必须小于1.0")
+    if config.get('split_context_policy', 'carry_history') not in {'carry_history', 'strict_segment'}:
+        errors.append("split_context_policy 必须为 carry_history 或 strict_segment")
     
     # 验证序列长度
     if config['sequence_length'] <= 0 or config['prediction_length'] <= 0:
@@ -229,6 +247,25 @@ def validate_config(config):
         anomaly_variables = config.get('anomaly_variables', [])
         if not isinstance(anomaly_variables, (list, tuple)) or len(anomaly_variables) == 0:
             errors.append("启用 enable_climatology_anomaly 时 anomaly_variables 不能为空")
+        elif not set(anomaly_variables).issubset(set(config.get('input_variables', []))):
+            errors.append("anomaly_variables 必须是 input_variables 的子集")
+
+    if config.get('include_climatology_features', False):
+        feature_variables = config.get('climatology_feature_variables', [])
+        if not isinstance(feature_variables, (list, tuple)) or len(feature_variables) == 0:
+            errors.append("启用 include_climatology_features 时 climatology_feature_variables 不能为空")
+        elif not set(feature_variables).issubset(set(config.get('input_variables', []))):
+            errors.append("climatology_feature_variables 必须是 input_variables 的子集")
+
+    ocean_threshold = float(config.get('ocean_threshold', 1.0))
+    if not 0.0 <= ocean_threshold <= 1.0:
+        errors.append("ocean_threshold 必须位于[0, 1]")
+    for key in (
+        'train_stride_lon', 'train_stride_lat', 'val_stride_lon', 'val_stride_lat',
+        'test_stride_lon', 'test_stride_lat', 'inference_stride_lon', 'inference_stride_lat'
+    ):
+        if float(config.get(key, 0)) <= 0:
+            errors.append(f"{key} 必须为正")
     
     # 验证模型参数
     if len(config['hidden_dims']) != config['num_layers']:
@@ -241,20 +278,79 @@ def validate_config(config):
     # 验证批次大小
     if config['batch_size'] <= 0:
         errors.append("批次大小必须大于0")
+    expected_windows = config.get('expected_canonical_windows_per_origin')
+    if expected_windows is not None:
+        if isinstance(expected_windows, dict):
+            required_splits = {'train', 'validation', 'test'}
+            if set(expected_windows) != required_splits:
+                errors.append(
+                    "expected_canonical_windows_per_origin 映射必须恰好包含 "
+                    "train、validation、test"
+                )
+            elif any(int(value) <= 0 for value in expected_windows.values()):
+                errors.append("expected_canonical_windows_per_origin 的 split 值必须为正整数")
+        elif int(expected_windows) <= 0:
+            errors.append("expected_canonical_windows_per_origin 必须为正整数或 split 映射")
+    if int(config.get('epochs', 0)) <= 0:
+        errors.append("epochs 必须为正整数")
+    if int(config.get('early_stopping_patience', 0)) <= 0:
+        errors.append("early_stopping_patience 必须为正整数")
+    if float(config.get('grad_clip_norm', 0)) <= 0:
+        errors.append("grad_clip_norm 必须为正")
+    if config.get('gradient_loss_mode', 'vector') not in {'vector', 'magnitude'}:
+        errors.append("gradient_loss_mode 必须为 vector 或 magnitude")
+    if config.get('post_training_evaluation', 'validation') not in {
+        'none', 'validation', 'test'
+    }:
+        errors.append("post_training_evaluation 必须为 none、validation 或 test")
 
-    if config.get('temp_lr_threshold', 0) < 0:
-        errors.append("temp_lr_threshold 应为非负")
-    if config.get('temp_lr_decay_factor', 1) <= 0:
-        errors.append("temp_lr_decay_factor 应为正")
-    if config.get('temp_lr_cooldown', 0) < 0:
-        errors.append("temp_lr_cooldown 应为非负整数")
-    if str(config.get('model_type', '')).lower() in {
+    target_variables = list(config.get('target_variables', []))
+    target_weights = config.get('target_loss_weights', {})
+    if not target_variables:
+        errors.append("target_variables 不能为空")
+    if not isinstance(target_weights, dict):
+        errors.append("target_loss_weights 必须为字典")
+    else:
+        missing_weights = [name for name in target_variables if name not in target_weights]
+        if missing_weights:
+            errors.append(f"target_loss_weights 缺少变量: {missing_weights}")
+        elif any(float(target_weights[name]) < 0 for name in target_variables):
+            errors.append("target_loss_weights 不能为负")
+        elif sum(float(target_weights[name]) for name in target_variables) <= 0:
+            errors.append("target_loss_weights 总和必须为正")
+
+    normalized_model_type = str(config.get('model_type', '')).lower()
+    supported_model_types = {
+        'convlstm', 'cnn',
+        'tsc_fusion', 'tscglobal', 'tsc_global_axiom_ensemble',
+        'tsc-spectrum-axiom-ensemble', 'tsc_spectrum_axiom_ensemble',
+        'tianhai_paper', 'tianhai-reimpl',
+        'fuxi_ocean_paper', 'fuxi-ocean-reimpl',
+        'fuxi_ons_paper', 'fuxi-ons-reimpl',
+        'axiomocean_paper', 'axiom-ocean-reimpl',
+    }
+    if normalized_model_type not in supported_model_types:
+        errors.append(f"未知 model_type: {config.get('model_type')!r}")
+    if normalized_model_type in {
         'tsc_fusion',
         'tscglobal',
         'tsc_global_axiom_ensemble',
         'tsc-spectrum-axiom-ensemble',
         'tsc_spectrum_axiom_ensemble'
     }:
+        if not config.get('ablation_disable_tsc', False):
+            tsc_variables = list(config.get('tsc_variables', []))
+            if not tsc_variables:
+                errors.append("启用 ThermohalineMemory 时 tsc_variables 不能为空")
+            elif not set(tsc_variables).issubset(set(config.get('input_variables', []))):
+                errors.append("tsc_variables 必须是 input_variables 的子集")
+        if (
+            config.get('enable_persistence_residual', True)
+            and not set(config.get('target_variables', [])).issubset(
+                set(config.get('input_variables', []))
+            )
+        ):
+            errors.append("启用 persistence residual 时 target_variables 必须是 input_variables 的子集")
         if config.get('tsc_fusion_hidden_dim', 0) <= 0:
             errors.append("tsc_fusion_hidden_dim 必须为正")
         spectral_modes = config.get('tsc_fusion_spectral_modes', [8, 8])
@@ -270,12 +366,28 @@ def validate_config(config):
             elif hidden % heads != 0:
                 errors.append("tsc_fusion_hidden_dim 必须能被 tsc_fusion_transformer_heads 整除")
         if config.get('enable_global_token_bank', False):
+            if config.get('global_token_bank_scope', 'time_group') not in {'time_group', 'batch'}:
+                errors.append("global_token_bank_scope 必须为 time_group 或 batch")
             hidden = config.get('tsc_fusion_hidden_dim', 0)
             heads = config.get('global_token_bank_heads', 1)
             if heads <= 0:
                 errors.append("global_token_bank_heads 必须为正")
             elif hidden % heads != 0:
                 errors.append("tsc_fusion_hidden_dim 必须能被 global_token_bank_heads 整除")
+            if not config.get('group_batches_by_time', False):
+                errors.append("启用 Global Token Bank 时必须启用 group_batches_by_time")
+            if config.get('global_token_bank_scope', 'time_group') == 'time_group':
+                canonical_lon = float(config.get('train_stride_lon', 0))
+                canonical_lat = float(config.get('train_stride_lat', 0))
+                for split in ('val', 'test'):
+                    split_lon = float(config.get(f'{split}_stride_lon', 0))
+                    split_lat = float(config.get(f'{split}_stride_lat', 0))
+                    if split_lon != canonical_lon or split_lat != canonical_lat:
+                        errors.append(
+                            "time_group Global Token Bank 要求 train/val/test 使用相同的 "
+                            f"canonical 滑窗网格；{split}=({split_lon}, {split_lat})，"
+                            f"train=({canonical_lon}, {canonical_lat})"
+                        )
     
     if errors:
         raise ValueError("配置验证失败:\n" + "\n".join(f"- {error}" for error in errors))
@@ -300,10 +412,37 @@ def save_config(config, filepath):
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
 
-def load_config(filepath):
-    """从文件加载配置"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
+def load_config(filepath, _stack=None):
+    """加载 JSON 配置，并解析相对路径 ``extends`` 继承链。"""
+    path = os.path.abspath(os.fspath(filepath))
+    stack = tuple(_stack or ())
+    if path in stack:
+        cycle = " -> ".join((*stack, path))
+        raise ValueError(f"配置 extends 出现循环: {cycle}")
+
+    with open(path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"配置顶层必须是对象: {path}")
+
+    parent_refs = config.pop('extends', None)
+    if parent_refs is None:
+        return config
+    if isinstance(parent_refs, str):
+        parent_refs = [parent_refs]
+    if not isinstance(parent_refs, list) or not parent_refs or not all(
+        isinstance(item, str) and item.strip() for item in parent_refs
+    ):
+        raise ValueError(f"extends 必须是非空路径字符串或路径列表: {path}")
+
+    merged = {}
+    for parent_ref in parent_refs:
+        parent_path = parent_ref
+        if not os.path.isabs(parent_path):
+            parent_path = os.path.join(os.path.dirname(path), parent_path)
+        merged.update(load_config(parent_path, _stack=(*stack, path)))
+    merged.update(config)
+    return merged
 
 def merge_configs(file_config, default_config=None):
     """合并文件配置和默认配置"""

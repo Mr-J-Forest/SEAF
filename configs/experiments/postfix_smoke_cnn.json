@@ -1,0 +1,4 @@
+{
+  "extends": "cnn_baseline.json",
+  "epochs": 1
+}

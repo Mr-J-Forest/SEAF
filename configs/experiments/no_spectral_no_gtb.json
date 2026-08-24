@@ -1,0 +1,5 @@
+{
+  "extends": "formal_base.json",
+  "ablation_disable_spectral": true,
+  "enable_global_token_bank": false
+}

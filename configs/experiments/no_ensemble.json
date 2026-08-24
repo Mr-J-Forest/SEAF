@@ -1,0 +1,4 @@
+{
+  "extends": "formal_base.json",
+  "ablation_disable_ensemble": true
+}

@@ -1,0 +1,10 @@
+{
+  "extends": "formal_base.json",
+  "ablation_disable_tsc": true,
+  "ablation_disable_spectral": true,
+  "ablation_disable_3d": true,
+  "ablation_disable_ensemble": true,
+  "enable_global_token_bank": false,
+  "tsc_fusion_transformer_layers": 0,
+  "enable_persistence_residual": false
+}

@@ -1,0 +1,5 @@
+{
+  "extends": "formal_base.json",
+  "enable_positional_encoding": false,
+  "enable_time_encoding": false
+}

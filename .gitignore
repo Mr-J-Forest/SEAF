@@ -1,5 +1,8 @@
 # --- Python ---
 __pycache__/
+.cache/
+.audit-cache/
+audit_reports/
 *.py[cod]
 *$py.class
 *.so
@@ -22,6 +25,7 @@ env/
 *~
 .DS_Store
 Thumbs.db
+*.lnk
 
 # --- Claude config ---
 .claude/

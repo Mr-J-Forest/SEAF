@@ -1,0 +1,4 @@
+{
+  "extends": "convlstm_baseline.json",
+  "epochs": 1
+}

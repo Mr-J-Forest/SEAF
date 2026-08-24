@@ -1,8 +1,9 @@
 """
 海洋数据加载器
-处理NetCDF格式的海洋数据，用于ConvLSTM模型训练和预测
+处理 NetCDF 海洋数据，用于 TSC-Fusion 与基线模型训练和预测
 """
 
+import copy
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -12,10 +13,8 @@ import hashlib
 import json
 import os
 import random
-from typing import Tuple, List, Dict, Optional
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Tuple, List, Dict, Optional, Sequence
+from sklearn.preprocessing import StandardScaler
 
 
 class OceanDataset(Dataset):
@@ -23,7 +22,7 @@ class OceanDataset(Dataset):
     海洋数据集类
     用于加载和预处理NetCDF格式的海洋数据
     """
-    
+
     def __init__(self, data_path: str, config: dict, mode: str = 'train',
                  train_ratio: Optional[float] = None, val_ratio: Optional[float] = None,
                  scalers: Optional[Dict] = None,
@@ -31,7 +30,7 @@ class OceanDataset(Dataset):
                  override_stride_lat: Optional[float] = None):
         """
         初始化数据集
-        
+
         Args:
             data_path: NetCDF数据文件路径
             config: 配置字典
@@ -47,7 +46,7 @@ class OceanDataset(Dataset):
         self.val_ratio = config.get('val_ratio', 0.2) if val_ratio is None else val_ratio
         self.test_ratio = 1.0 - self.train_ratio - self.val_ratio
         self.provided_scalers = scalers  # 存储外部提供的scalers
-        
+
         self.input_variables = config['input_variables']
         self.target_variables = config['target_variables']
         self.sequence_length = config['sequence_length']
@@ -64,9 +63,11 @@ class OceanDataset(Dataset):
         self.lon_range = list(config.get('lon_range', [130.5, 162.5]))
         self.lat_range = list(config.get('lat_range', [6.5, 27.5]))
         self.depth_range = list(config.get('depth_range', [0.0, 5.0]))
-        
+
         # 滑动窗口参数
-        self.sliding_enabled = config.get('sliding_enabled', False) # 是否启用滑动数据增强
+        self.sliding_enabled = config.get(
+            f'{mode}_sliding_enabled', config.get('sliding_enabled', False)
+        )  # 是否启用滑动数据增强
         self.ocean_threshold = config.get('ocean_threshold', 1.0)   # 海洋面积占比阈值（1.0=仅纯海洋）
         self.lon_step = config.get('lon_step', 2.0)                # 经纬度滑动步长（兜底）
         self.sliding_regions = []        # 存储所有有效的100%海洋区域
@@ -107,24 +108,78 @@ class OceanDataset(Dataset):
         self._create_sequences()
         self.input_channel_slices = {}
         self.target_channel_slices = {}
-        
+        self._initialize_channel_schema()
+        self._validate_channel_schema()
+
+    def can_share_preprocessed_with_mode(self, mode: str) -> bool:
+        """Return whether ``mode`` has identical spatial preprocessing semantics.
+
+        Temporal splits only change which sequence origins are exposed. When
+        sliding enablement and strides are also identical, rebuilding the
+        spatial arrays for validation/test is redundant and memory intensive.
+        Regional-training experiments may intentionally use a different train
+        grid, so those cases must still construct a separate payload.
+        """
+        target_sliding = self.config.get(
+            f'{mode}_sliding_enabled', self.config.get('sliding_enabled', False)
+        )
+        target_stride_lon = self.config.get(f'{mode}_stride_lon')
+        target_stride_lat = self.config.get(f'{mode}_stride_lat')
+        if target_stride_lon is None or target_stride_lat is None:
+            target_stride_lon = self.config.get('lon_step', 2.0)
+            target_stride_lat = target_stride_lon
+        return (
+            bool(target_sliding) == bool(self.sliding_enabled)
+            and float(target_stride_lon) == float(self.stride_lon)
+            and float(target_stride_lat) == float(self.stride_lat)
+        )
+
+    def temporal_split_view(self, mode: str) -> 'OceanDataset':
+        """Create a split-specific view over immutable preprocessed arrays.
+
+        The returned dataset shares ``all_regions_data`` and fitted scalers,
+        but owns its temporal indices, sequence list, mode, and sampler flag.
+        This preserves independent-construction semantics without keeping three
+        multi-gigabyte copies in memory.
+        """
+        if mode not in {'train', 'val', 'test'}:
+            raise ValueError(f'未知数据集模式: {mode!r}')
+        if not self.can_share_preprocessed_with_mode(mode):
+            raise ValueError(
+                f'{self.mode!r} 与 {mode!r} 的滑窗预处理语义不同，不能共享数组'
+            )
+
+        view = copy.copy(self)
+        view.mode = mode
+        view.sliding_enabled = self.config.get(
+            f'{mode}_sliding_enabled', self.config.get('sliding_enabled', False)
+        )
+        view.override_stride_lon = None
+        view.override_stride_lat = None
+        view.return_sample_index = False
+        view.provided_scalers = self.scalers
+        view._resolve_stride(self.config)
+        view._split_data()
+        view._create_sequences()
+        return view
+
     def _load_data(self):
         """
         加载NetCDF数据
         """
         print(f"正在加载数据文件: {self.data_path}")
-        
+
         # 使用xarray加载NetCDF文件
         self.dataset = xr.open_dataset(self.data_path)
-        
+
         # 仅按深度切片，保留完整经纬度范围供2D滑动窗口使用
         self.dataset = self.dataset.sel(
             LEVEL=slice(self.depth_range[0], self.depth_range[1])
         )
-        
+
         print(f"数据形状: {dict(self.dataset.dims)}")
         print(f"可用变量: {list(self.dataset.data_vars)}")
-        
+
         # 获取坐标信息
         self.lons = self.dataset.LONGITUDE.values
         self.lats = self.dataset.LATITUDE.values
@@ -134,44 +189,81 @@ class OceanDataset(Dataset):
 
         lat_size = len(self.lats)
         lon_size = len(self.lons)
-        
+
         print(f"时间序列长度: {len(self.times)}")
         print(f"空间维度: 经度{len(self.lons)} x 纬度{len(self.lats)} x 深度{len(self.levels)}")
 
     # ========== 预处理缓存持久化 ==========
 
+    # v5 introduced terminal anchors; v6 also shares mode-independent payloads
+    # across validation/test when every preprocessing semantic is identical.
+    _CACHE_FORMAT_VERSION = 6
+    _WINDOW_GRID_POLICY = 'regular_plus_terminal_anchor_v1'
     _CACHE_CONFIG_KEYS = frozenset({
         'lon_range', 'lat_range', 'depth_range',
-        'sliding_enabled', 'ocean_threshold',
-        'input_variables', 'target_variables',
+        'ocean_threshold',
+        'input_variables',
         'anomaly_variables', 'climatology_period',
         'include_climatology_features', 'climatology_feature_variables',
+        'climatology_baseline_variables',
         'enable_climatology_anomaly',
-        'enable_positional_encoding', 'positional_encoding_frequencies',
-        'depth_encoding_frequencies',
-        'enable_time_encoding', 'time_encoding_frequencies',
-        'time_encoding_period', 'include_year_trend',
     })
 
     def _compute_cache_key(self) -> str:
-        """从 data_path mtime + 相关配置生成缓存 key。"""
-        data_mtime = os.path.getmtime(self.data_path)
+        """从数据文件身份和所有预处理语义生成缓存 key。"""
+        data_stat = os.stat(self.data_path)
         relevant = {}
         for k in self._CACHE_CONFIG_KEYS:
             relevant[k] = self.config.get(k)
+        relevant['cache_format_version'] = self._CACHE_FORMAT_VERSION
+        relevant['window_grid_policy'] = self._WINDOW_GRID_POLICY
+        relevant['data_identity'] = {
+            'path': os.path.realpath(self.data_path),
+            'size': int(data_stat.st_size),
+            'mtime_ns': int(data_stat.st_mtime_ns),
+        }
+        # target_variables 本身不必拆分缓存，但缓存必须覆盖所有可能被读取的
+        # 物理变量。以变量并集作为身份，既允许 TEMP/SALT 单任务共享联合缓存，
+        # 又不会让一个缺少目标变量的缓存被错误复用。
+        required_variables = set(self.config.get('input_variables', []))
+        required_variables.update(self.config.get('target_variables', []))
+        required_variables.update(self.config.get('anomaly_variables', []))
+        required_variables.update(self.config.get('climatology_feature_variables', []))
+        required_variables.update(self.config.get('climatology_baseline_variables', []))
+        relevant['required_physical_variables'] = sorted(required_variables)
+        relevant['sliding_enabled'] = self.sliding_enabled
         relevant['stride_lon'] = self.stride_lon
         relevant['stride_lat'] = self.stride_lat
         relevant['train_ratio'] = self.train_ratio
         relevant['val_ratio'] = self.val_ratio
+        scaler_fingerprint = self._scalers_fingerprint(self.provided_scalers)
+        if scaler_fingerprint is not None:
+            relevant['provided_scalers'] = scaler_fingerprint
         raw = json.dumps(relevant, sort_keys=True, default=str)
-        h = hashlib.sha256((raw + str(data_mtime)).encode())
+        h = hashlib.sha256(raw.encode('utf-8'))
         return h.hexdigest()[:16]
 
+    @staticmethod
+    def _scalers_fingerprint(scalers) -> Optional[str]:
+        """为外部训练 scaler 生成稳定指纹，避免误用其他 scaler 的缓存。"""
+        if not scalers:
+            return None
+        summary = {}
+        for name in sorted(scalers):
+            scaler = scalers[name]
+            summary[name] = {
+                'mean': np.asarray(getattr(scaler, 'mean_', [])).tolist(),
+                'scale': np.asarray(getattr(scaler, 'scale_', [])).tolist(),
+                'var': np.asarray(getattr(scaler, 'var_', [])).tolist(),
+            }
+        raw = json.dumps(summary, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
     def _cache_dir(self) -> str:
-        """缓存目录 = base_dir / cache_key / mode。"""
+        """缓存目录由完整预处理语义决定，与纯时间 split 名称无关。"""
         base = str(self.config.get('cache_preprocessed_dir', '.cache/preprocessed'))
         key = self._compute_cache_key()
-        return os.path.join(base, key, self.mode)
+        return os.path.join(base, key, 'payload')
 
     def _save_cache(self):
         """将预处理结果（scalers、normalized_data、climatology 等）保存到磁盘。"""
@@ -180,6 +272,9 @@ class OceanDataset(Dataset):
             return
         cache_dir = self._cache_dir()
         os.makedirs(cache_dir, exist_ok=True)
+        success_path = os.path.join(cache_dir, '_SUCCESS')
+        if os.path.exists(success_path):
+            os.remove(success_path)
 
         print(f"[CACHE] 保存预处理缓存到 {cache_dir} ...")
 
@@ -192,6 +287,9 @@ class OceanDataset(Dataset):
 
         # 3. 元信息（滑动区域、变量列表等）
         metadata = {
+            'cache_format_version': self._CACHE_FORMAT_VERSION,
+            'window_grid_policy': self._WINDOW_GRID_POLICY,
+            'mode_independent_payload': True,
             'sliding_regions': [
                 {
                     'lon_range': r['lon_range'],
@@ -214,6 +312,8 @@ class OceanDataset(Dataset):
             # normalized_data
             norm_dict = {}
             for var_name, arr in region.get('normalized_data', {}).items():
+                if var_name in {'SPATIAL_ENCODING', 'TIME_ENCODING'}:
+                    continue
                 norm_dict[f'norm_{var_name}'] = arr
             # coords
             for coord_name in ('lons', 'lats', 'levels', 'times'):
@@ -236,15 +336,16 @@ class OceanDataset(Dataset):
                     **clim_dict,
                 )
 
-            # anomaly_data（若启用 anomaly）
-            anom_dict = {}
-            for var_name, arr in region.get('anomaly_data', {}).items():
-                anom_dict[f'anom_{var_name}'] = arr
-            if anom_dict:
-                np.savez_compressed(
-                    os.path.join(cache_dir, f'region_{idx}_anom.npz'),
-                    **anom_dict,
-                )
+            # anomaly_data 只用于拟合/生成 normalized_data。缓存加载时可由
+            # normalized_data + scaler + climatology 恢复目标物理量，因此不再
+            # 重复落盘，避免每种数据消融额外保存一整份 TEMP/SALT anomaly。
+
+        # 完成标记最后写入。进程若在此前中断，加载器会拒绝整个半成品缓存，
+        # 而不是把缺文件的区域静默当作有效数据。
+        marker_tmp = success_path + '.tmp'
+        with open(marker_tmp, 'w', encoding='utf-8') as f:
+            f.write(f'cache_format_version={self._CACHE_FORMAT_VERSION}\n')
+        os.replace(marker_tmp, success_path)
 
         print(f"[CACHE] 缓存保存完成，共 {len(self.all_regions_data)} 个区域")
 
@@ -256,7 +357,12 @@ class OceanDataset(Dataset):
         cache_dir = self._cache_dir()
         meta_path = os.path.join(cache_dir, 'metadata.json')
         scalers_path = os.path.join(cache_dir, 'scalers.pkl')
-        if not os.path.isfile(meta_path) or not os.path.isfile(scalers_path):
+        success_path = os.path.join(cache_dir, '_SUCCESS')
+        if (
+            not os.path.isfile(success_path)
+            or not os.path.isfile(meta_path)
+            or not os.path.isfile(scalers_path)
+        ):
             return False
 
         try:
@@ -281,6 +387,8 @@ class OceanDataset(Dataset):
             # 4. 重建 all_regions_data
             self.all_regions_data = []
             sliding_list = metadata.get('sliding_regions', [])
+            if not sliding_list:
+                raise ValueError('缓存元信息不含任何空间区域')
             for idx, region_meta in enumerate(sliding_list):
                 region = {
                     'lon_range': region_meta['lon_range'],
@@ -290,8 +398,9 @@ class OceanDataset(Dataset):
 
                 # 加载 normalized_data
                 norm_path = os.path.join(cache_dir, f'region_{idx}.npz')
-                if os.path.isfile(norm_path):
-                    loaded = np.load(norm_path, allow_pickle=True)
+                if not os.path.isfile(norm_path):
+                    raise FileNotFoundError(f'缓存缺少区域文件: {norm_path}')
+                with np.load(norm_path, allow_pickle=False) as loaded:
                     norm_data = {}
                     coords = {}
                     for key in loaded.files:
@@ -304,37 +413,80 @@ class OceanDataset(Dataset):
                             if arr.dtype.kind == 'S' or arr.dtype.kind == 'U':
                                 arr = arr.astype(str)
                             coords[coord_name] = arr
-                    region['normalized_data'] = norm_data
-                    region['coords'] = coords
+                if not norm_data:
+                    raise ValueError(f'缓存区域 {idx} 不含 normalized_data')
+                missing_targets = [
+                    name for name in self.target_variables if name not in norm_data
+                ]
+                if missing_targets:
+                    raise ValueError(
+                        f'缓存区域 {idx} 缺少目标变量: {missing_targets}'
+                    )
+                region['normalized_data'] = norm_data
+                region['coords'] = coords
 
-                    # 加载 climatology
-                    clim_path = os.path.join(cache_dir, f'region_{idx}_clim.npz')
-                    if os.path.isfile(clim_path):
-                        clim_loaded = np.load(clim_path, allow_pickle=True)
+                # 加载 climatology
+                clim_path = os.path.join(cache_dir, f'region_{idx}_clim.npz')
+                if os.path.isfile(clim_path):
+                    with np.load(clim_path, allow_pickle=False) as clim_loaded:
                         clim_data = {}
                         for key in clim_loaded.files:
                             if key.startswith('clim_'):
                                 clim_data[key[5:]] = clim_loaded[key]
-                        region['climatology'] = clim_data
+                    region['climatology'] = clim_data
 
-                    # 加载 anomaly_data
-                    anom_path = os.path.join(cache_dir, f'region_{idx}_anom.npz')
-                    if os.path.isfile(anom_path):
-                        anom_loaded = np.load(anom_path, allow_pickle=True)
+                # 兼容旧缓存中的 anomaly_data；v4 自身不再重复保存。
+                anom_path = os.path.join(cache_dir, f'region_{idx}_anom.npz')
+                if os.path.isfile(anom_path):
+                    with np.load(anom_path, allow_pickle=False) as anom_loaded:
                         anom_data = {}
                         for key in anom_loaded.files:
                             if key.startswith('anom_'):
                                 anom_data[key[5:]] = anom_loaded[key]
-                        region['anomaly_data'] = anom_data
+                    region['anomaly_data'] = anom_data
 
-                    # 辅助字段，后续惰性填充
-                    region['data'] = {}
-                    if 'climatology' not in region:
-                        region['climatology'] = {}
-                    if 'anomaly_data' not in region:
-                        region['anomaly_data'] = {}
+                # 辅助字段，后续惰性填充
+                region['data'] = {}
+                if 'climatology' not in region:
+                    region['climatology'] = {}
+                if 'anomaly_data' not in region:
+                    region['anomaly_data'] = {}
 
                 self.all_regions_data.append(region)
+
+            # Reconstruct raw data from normalized data for baseline computation
+            needed_vars = set(self.target_variables)
+            for region in self.all_regions_data:
+                if not region.get('data'):
+                    region['data'] = {}
+                for var_name in needed_vars:
+                    if var_name in region['data']:
+                        continue
+                    norm_arr = region.get('normalized_data', {}).get(var_name)
+                    if norm_arr is None:
+                        continue
+                    scaler = self.scalers.get(var_name)
+                    if scaler is not None:
+                        orig_shape = norm_arr.shape
+                        recon = scaler.inverse_transform(
+                            norm_arr.reshape(-1, 1)
+                        ).reshape(orig_shape).astype(np.float32)
+                    else:
+                        recon = norm_arr.astype(np.float32)
+                    if self._is_anomaly_variable(var_name):
+                        clim = region.get('climatology', {}).get(var_name)
+                        if clim is not None:
+                            nsteps = recon.shape[0]
+                            recon = recon + clim[self.time_period_indices[:nsteps]]
+                    region['data'][var_name] = recon
+
+            # Auxiliary encodings are deterministic functions of coordinates
+            # and configuration. Rebuild them after cache load so positional
+            # and temporal ablations share one physical-data cache.
+            for region in self.all_regions_data:
+                for feature_name in ('SPATIAL_ENCODING', 'TIME_ENCODING'):
+                    region.get('normalized_data', {}).pop(feature_name, None)
+                self._add_auxiliary_encodings(region)
 
             if not self.all_regions_data:
                 return False
@@ -345,7 +497,7 @@ class OceanDataset(Dataset):
         except Exception as e:
             print(f"[CACHE] 缓存加载失败 ({e})，将重新预处理")
             return False
-        
+
     def _resolve_stride(self, config: dict):
         """根据模式选择对应的经纬度步长，支持推理阶段覆盖"""
         if self.override_stride_lon is not None and self.override_stride_lat is not None:
@@ -395,11 +547,16 @@ class OceanDataset(Dataset):
         print(f"  滑动步长: 经度={self.stride_lon}°, 纬度={self.stride_lat}°")
         print(f"  海洋阈值: {self.ocean_threshold} (100% 纯海洋)")
 
-        # 2D 滑动: 经度 + 纬度双向滑动
-        current_lon = min_lon
-        while current_lon + window_lon_size <= max_lon:
-            current_lat = min_lat
-            while current_lat + window_lat_size <= max_lat:
+        # 2D 滑动: 规则步长之外显式加入终端锚点。否则当跨度不能被
+        # stride 整除时，最东/最北边缘会留下从未被任何窗口覆盖的空带。
+        lon_starts = self._window_starts(
+            min_lon, max_lon, window_lon_size, self.stride_lon
+        )
+        lat_starts = self._window_starts(
+            min_lat, max_lat, window_lat_size, self.stride_lat
+        )
+        for current_lon in lon_starts:
+            for current_lat in lat_starts:
                 new_lon_range = [current_lon, current_lon + window_lon_size]
                 new_lat_range = [current_lat, current_lat + window_lat_size]
 
@@ -411,16 +568,33 @@ class OceanDataset(Dataset):
                             'region_type': 'sliding'
                         })
 
-                current_lat += self.stride_lat
-
-            current_lon += self.stride_lon
-
         print(f"找到 {len(self.sliding_regions)} 个100%海洋覆盖的区域")
         for i, region in enumerate(self.sliding_regions):
             print(
                 f"  区域 {i+1}: 经度 [{region['lon_range'][0]:.1f}, {region['lon_range'][1]:.1f}], "
                 f"纬度 [{region['lat_range'][0]:.1f}, {region['lat_range'][1]:.1f}]"
             )
+
+    @staticmethod
+    def _window_starts(
+        axis_min: float,
+        axis_max: float,
+        window_size: float,
+        stride: float,
+    ) -> List[float]:
+        """Generate regular starts and always include the terminal anchor."""
+        axis_min = float(axis_min)
+        axis_max = float(axis_max)
+        window_size = float(window_size)
+        stride = float(stride)
+        terminal = axis_max - window_size
+        if stride <= 0 or window_size <= 0 or terminal < axis_min:
+            return []
+        count = int(np.floor((terminal - axis_min) / stride + 1e-10)) + 1
+        starts = [axis_min + idx * stride for idx in range(count)]
+        if not starts or not np.isclose(starts[-1], terminal):
+            starts.append(terminal)
+        return [float(value) for value in starts]
 
     def _region_exists(self, lon_range: List[float], lat_range: List[float]) -> bool:
         """检查指定经纬度范围是否已经存在于滑动区域列表中"""
@@ -445,24 +619,24 @@ class OceanDataset(Dataset):
                 LATITUDE=slice(lat_range[0], lat_range[1]),
                 LEVEL=slice(0, 5.0)  # 只检查表层
             )
-            
+
             # 使用温度数据来判断海洋覆盖（有数据的地方认为是海洋）
             if 'TEMP' in region_data.data_vars:
                 temp_data = region_data.TEMP.isel(TIME=0, LEVEL=0).values  # 第一个时间步的表层数据
-                
+
                 # 计算有效数据比例（非NaN的部分认为是海洋）
                 total_points = temp_data.size
                 valid_points = np.sum(~np.isnan(temp_data))
                 ocean_ratio = valid_points / total_points if total_points > 0 else 0
-                
+
                 return ocean_ratio >= self.ocean_threshold
-            
+
         except Exception as e:
             print(f"检查区域 {lon_range} 时出错: {e}")
             return False
-        
+
         return False
-        
+
     def _preprocess_data(self):
         """
         预处理数据：对所有100%海洋窗口统一处理
@@ -502,31 +676,31 @@ class OceanDataset(Dataset):
             raise ValueError("没有有效的数据区域，无法创建数据集。请降低 ocean_threshold 或调整窗口大小。")
 
         self._merge_and_normalize_data()
-    
+
     def _process_single_region(self, dataset):
         """
         处理单个区域的数据
         """
         region_data = {}
-        
+
         # 过滤输入变量，只使用实际存在的变量
         valid_input_vars = []
         for var in self.input_variables:
             if var in self.available_variables and var in dataset.data_vars:
                 valid_input_vars.append(var)
-        
+
         # 处理所有有效变量
         for var in valid_input_vars + self.target_variables:
             if var in dataset.data_vars:
                 # 获取变量数据
                 data = dataset[var].values
-                
+
                 # 处理缺失值
-                if np.isnan(data).any():
+                if not np.isfinite(data).all():
                     data = self._fill_missing_values(data, variable=var)
-                
+
                 region_data[var] = data
-        
+
         if not region_data:
             return None
 
@@ -550,15 +724,21 @@ class OceanDataset(Dataset):
         return f"CLIMATOLOGY_{variable}"
 
     def _compute_region_climatology(self, region: Dict):
-        """基于训练时间段为单个窗口计算月气候态和 anomaly 源数据。"""
+        """基于训练期计算月气候态；模型开关只决定是否使用 anomaly。"""
         region['climatology'] = {}
         region['anomaly_data'] = {}
-        if not self.enable_climatology_anomaly:
-            return
 
         train_end_idx = int(len(self.times) * self.train_ratio)
         train_periods = self.time_period_indices[:train_end_idx]
-        variables = set(self.anomaly_variables)
+        # 所有目标都需要月气候态来构造 climatology/anomaly-persistence 基线。
+        # 这必须独立于模型是否在 anomaly 空间训练，否则不同消融的基线口径会变化。
+        variables = set(
+            getattr(self, 'config', {}).get(
+                'climatology_baseline_variables', self.target_variables
+            )
+        )
+        if self.enable_climatology_anomaly:
+            variables.update(self.anomaly_variables)
         if self.include_climatology_features:
             variables.update(self.climatology_feature_variables)
 
@@ -585,7 +765,7 @@ class OceanDataset(Dataset):
 
             region['climatology'][var] = climatology
 
-            if var in self.anomaly_variables:
+            if self._is_anomaly_variable(var):
                 periods = self.time_period_indices[:data.shape[0]]
                 region['anomaly_data'][var] = (data - climatology[periods]).astype(np.float32)
 
@@ -603,13 +783,13 @@ class OceanDataset(Dataset):
             if anomaly_data is not None:
                 return anomaly_data
         return region['data'].get(variable)
-    
+
     def _merge_and_normalize_data(self):
         """
         合并所有区域数据并进行标准化
         """
         print("合并和标准化所有区域数据...")
-        
+
         # 获取所有变量名
         all_vars = set()
         for region in self.all_regions_data:
@@ -622,58 +802,44 @@ class OceanDataset(Dataset):
             )
         for region in self.all_regions_data:
             self._compute_region_climatology(region)
-        
+
         # 如果提供了scalers，直接使用
         if self.provided_scalers is not None:
             print("使用提供的标准化参数 (防止数据泄露)...")
             self.scalers = self.provided_scalers
         else:
             print("计算全局标准化参数 (仅使用训练集数据)...")
-            # 为每个变量收集所有区域的数据用于计算全局统计量
             # 注意：只使用训练集时间段的数据来计算scaler，防止数据泄露
-            global_data = {}
-            
-            # 计算训练集结束的时间索引
+            # 使用 partial_fit 逐区域增量计算，避免将所有区域数据拼成大数组引发内核内存问题
+
             total_time_steps = len(self.times)
             train_end_idx = int(total_time_steps * self.train_ratio)
             print(f"标准化参数计算范围: 时间步 0 - {train_end_idx}")
-            
+
+            self.scalers = {}
             for var in all_vars:
-                var_data_list = []
+                scaler = StandardScaler()
                 for region in self.all_regions_data:
                     source_data = self._get_model_source_data(region, var)
                     if source_data is not None:
-                        # 只取训练时间段的数据
                         train_data = source_data[:train_end_idx]
-                        var_data_list.append(train_data)
-                
-                if var_data_list:
-                    # 合并所有区域的该变量数据
-                    global_data[var] = np.concatenate(var_data_list, axis=0)
+                        data_2d = train_data.reshape(-1, 1)
+                        scaler.partial_fit(data_2d)
+                self.scalers[var] = scaler
+                print(f"变量 {var} 全局标准化参数: 均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}")
 
             if self.include_climatology_features:
                 for var in self.climatology_feature_variables:
                     feature_name = self._climatology_feature_name(var)
-                    var_data_list = []
+                    scaler = StandardScaler()
                     for region in self.all_regions_data:
                         clim_series = self._build_climatology_series(region, var)
                         if clim_series is not None:
-                            var_data_list.append(clim_series[:train_end_idx])
-                    if var_data_list:
-                        global_data[feature_name] = np.concatenate(var_data_list, axis=0)
-            
-            # 计算全局标准化参数
-            self.scalers = {}
-            for var, data in global_data.items():
-                original_shape = data.shape
-                data_2d = data.reshape(-1, 1)
-                
-                scaler = StandardScaler()
-                scaler.fit(data_2d)
-                self.scalers[var] = scaler
-                
-                print(f"变量 {var} 全局标准化参数: 均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}")
-        
+                            clim_2d = clim_series[:train_end_idx].reshape(-1, 1)
+                            scaler.partial_fit(clim_2d)
+                    self.scalers[feature_name] = scaler
+                    print(f"变量 {feature_name} 全局标准化参数: 均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}")
+
         # 使用全局参数标准化各区域数据 (对所有数据进行变换)
         for region in self.all_regions_data:
             region['normalized_data'] = {}
@@ -700,7 +866,7 @@ class OceanDataset(Dataset):
 
         for region in self.all_regions_data:
             self._add_auxiliary_encodings(region)
-        
+
         # 设置主要数据（用于向后兼容）
         if self.all_regions_data:
             main_region = self.all_regions_data[0]  # 原始区域
@@ -724,10 +890,6 @@ class OceanDataset(Dataset):
             if spatial_features is not None:
                 normalized['SPATIAL_ENCODING'] = spatial_features.astype(np.float32)
 
-            depth_features = self._build_depth_encoding(coords, time_steps, lat_size, lon_size)
-            if depth_features is not None:
-                normalized['DEPTH_ENCODING'] = depth_features.astype(np.float32)
-
         if self.config.get('enable_time_encoding', False):
             time_features = self._build_time_encoding(coords, time_steps, lat_size, lon_size)
             if time_features is not None:
@@ -744,42 +906,24 @@ class OceanDataset(Dataset):
         lon_grid = np.deg2rad(lon_grid.astype(np.float32))
         lat_grid = np.deg2rad(lat_grid.astype(np.float32))
 
-        div_terms = np.power(10000.0, np.arange(num_freq, dtype=np.float32) / max(num_freq, 1))
         features = []
-        for div in div_terms:
-            features.append(np.sin(lon_grid / div))
-            features.append(np.cos(lon_grid / div))
-        for div in div_terms:
-            features.append(np.sin(lat_grid / div))
-            features.append(np.cos(lat_grid / div))
+        # Integer angular harmonics preserve the 0°/360° longitude seam and
+        # provide genuinely distinct spatial scales. Dividing radian values by
+        # Transformer-style 10000**k produced near-constant, non-periodic maps.
+        for harmonic in range(1, num_freq + 1):
+            features.append(np.sin(harmonic * lon_grid))
+            features.append(np.cos(harmonic * lon_grid))
+        for harmonic in range(1, num_freq + 1):
+            features.append(np.sin(harmonic * lat_grid))
+            features.append(np.cos(harmonic * lat_grid))
 
         if not features:
             return None
 
-        spatial_encoding = np.stack(features, axis=0)
-        spatial_encoding = np.repeat(spatial_encoding[np.newaxis, ...], time_steps, axis=0)
-        return spatial_encoding
-
-    def _build_depth_encoding(self, coords: Dict, time_steps: int, lat_size: int, lon_size: int) -> Optional[np.ndarray]:
-        num_freq = int(self.config.get('depth_encoding_frequencies', 0))
-        levels = coords.get('levels', self.levels)
-        if num_freq <= 0 or levels is None or len(levels) == 0:
-            return None
-
-        levels = np.array(levels, dtype=np.float32)
-        div_terms = np.power(10000.0, np.arange(num_freq, dtype=np.float32) / max(num_freq, 1))
-        feature_maps = []
-        for depth in levels:
-            for div in div_terms:
-                feature_maps.append(np.full((lat_size, lon_size), np.sin(depth / div), dtype=np.float32))
-                feature_maps.append(np.full((lat_size, lon_size), np.cos(depth / div), dtype=np.float32))
-
-        if not feature_maps:
-            return None
-
-        depth_encoding = np.stack(feature_maps, axis=0)
-        depth_encoding = np.repeat(depth_encoding[np.newaxis, ...], time_steps, axis=0)
-        return depth_encoding
+        # Static coordinates are stored once and broadcast only for the sampled
+        # 12-step sequence. Repeating them for all 121 times and 151 windows
+        # wastes GiB without changing a single model value.
+        return np.stack(features, axis=0)[np.newaxis, ...]
 
     def _extract_period_indices(self, times: np.ndarray, period: int) -> np.ndarray:
         """将 TIME 坐标转换为 0-based 周期索引，兼容 YYYYMM 整数和 datetime64。"""
@@ -849,15 +993,21 @@ class OceanDataset(Dataset):
 
         feature_maps = []
 
-        # 傅里叶时间编码
+        if times.shape[0] != time_steps:
+            raise ValueError(
+                f'时间坐标长度 {times.shape[0]} 与数据时间长度 {time_steps} 不一致'
+            )
+
+        # 时间特征只随时间变化，空间轴保留为 singleton，并在取样时广播。
+        # 预先复制到每个网格点会把几个 KiB 的信号放大成数 GiB。
         if num_freq > 0:
-            time_channels = np.zeros((time_steps, num_freq * 2, lat_size, lon_size), dtype=np.float32)
+            time_channels = np.zeros((time_steps, num_freq * 2, 1, 1), dtype=np.float32)
             months = self._extract_period_indices(times, period).astype(np.float32)
 
             for idx, freq in enumerate(range(1, num_freq + 1)):
                 angle = 2 * np.pi * months * freq / period
-                time_channels[:, 2 * idx, :, :] = np.sin(angle)[:, None, None]
-                time_channels[:, 2 * idx + 1, :, :] = np.cos(angle)[:, None, None]
+                time_channels[:, 2 * idx, 0, 0] = np.sin(angle)
+                time_channels[:, 2 * idx + 1, 0, 0] = np.cos(angle)
             feature_maps.append(time_channels)
 
         # 年份趋势
@@ -871,11 +1021,7 @@ class OceanDataset(Dataset):
                 else:
                     year_norm = np.zeros_like(years)
                 trend_values = ((year_norm - 0.5) * 2).astype(np.float32)
-                trend_channel = np.broadcast_to(
-                    trend_values[:, None, None],
-                    (time_steps, lat_size, lon_size)
-                )
-                feature_maps.append(trend_channel[:, None, :, :])
+                feature_maps.append(trend_values[:, None, None, None])
 
         if not feature_maps:
             return None
@@ -888,7 +1034,7 @@ class OceanDataset(Dataset):
 
     def _fallback_year_extraction(self, times: np.ndarray) -> Optional[np.ndarray]:
         return self._extract_year_values(times)
-        
+
     def _fill_missing_values(self, data: np.ndarray, variable: str = "unknown") -> np.ndarray:
         """
         填充缺失值。
@@ -897,200 +1043,395 @@ class OceanDataset(Dataset):
         进入预处理统计量。逐时间片仍优先使用该片已有空间值补洞；如果
         某片全为空，再使用训练段兜底均值。
         """
-        # 获取有效数据的索引
-        valid_mask = ~np.isnan(data)
-        
+        # 获取有效数据的索引（NaN/Inf 都不得进入 scaler 或模型）
+        valid_mask = np.isfinite(data)
+
         if valid_mask.sum() == 0:
             # 如果全部是缺失值，用0填充
             print(f"警告: 数据全部为缺失值，使用0填充")
             return np.zeros_like(data)
-        
+
         train_end_idx = int(len(self.times) * self.train_ratio)
         train_slice = data[:train_end_idx]
-        global_mean = np.nanmean(train_slice)
-        if np.isnan(global_mean):
-            global_mean = np.nanmean(data)
-        if np.isnan(global_mean):
-            print(f"警告: 变量 {variable} 无法计算有效均值，使用0填充")
+        finite_train = train_slice[np.isfinite(train_slice)]
+        if finite_train.size:
+            global_mean = float(np.mean(finite_train, dtype=np.float64))
+        else:
+            # Never inspect validation/test values to repair training-time
+            # preprocessing statistics. A zero sentinel is explicit and can be
+            # detected by the input ablations/data audit.
+            print(f"警告: 变量 {variable} 的训练段无有效值，使用0填充")
             global_mean = 0.0
-        
+
         # 根据数据维度进行不同的处理
         if data.ndim == 4:  # 4D数据: (time, level, lat, lon)
             for t in range(data.shape[0]):
                 for d in range(data.shape[1]):
                     slice_data = data[t, d, :, :]
-                    if np.isnan(slice_data).any():
+                    if not np.isfinite(slice_data).all():
                         # 首先尝试用该切片的有效值均值填充
-                        slice_mean = np.nanmean(slice_data)
-                        if not np.isnan(slice_mean):
-                            slice_data[np.isnan(slice_data)] = slice_mean
+                        finite_slice = slice_data[np.isfinite(slice_data)]
+                        slice_mean = float(np.mean(finite_slice)) if finite_slice.size else np.nan
+                        if np.isfinite(slice_mean):
+                            slice_data[~np.isfinite(slice_data)] = slice_mean
                         else:
                             # 如果该切片全为NaN，使用全局均值
-                            slice_data[np.isnan(slice_data)] = global_mean
+                            slice_data[~np.isfinite(slice_data)] = global_mean
                         data[t, d, :, :] = slice_data
         elif data.ndim == 3:  # 3D数据: (time, lat, lon)
             for t in range(data.shape[0]):
                 slice_data = data[t, :, :]
-                if np.isnan(slice_data).any():
+                if not np.isfinite(slice_data).all():
                     # 首先尝试用该时间步的有效值均值填充
-                    slice_mean = np.nanmean(slice_data)
-                    if not np.isnan(slice_mean):
-                        slice_data[np.isnan(slice_data)] = slice_mean
+                    finite_slice = slice_data[np.isfinite(slice_data)]
+                    slice_mean = float(np.mean(finite_slice)) if finite_slice.size else np.nan
+                    if np.isfinite(slice_mean):
+                        slice_data[~np.isfinite(slice_data)] = slice_mean
                     else:
                         # 如果该时间步全为NaN，使用全局均值
-                        slice_data[np.isnan(slice_data)] = global_mean
+                        slice_data[~np.isfinite(slice_data)] = global_mean
                     data[t, :, :] = slice_data
-        
+
         # 最终检查：如果还有NaN，用全局均值填充
-        if np.isnan(data).any():
-            print(f"警告: 插值后仍有NaN值，使用全局均值 {global_mean:.6f} 填充")
-            data[np.isnan(data)] = global_mean
-        
+        if not np.isfinite(data).all():
+            print(f"警告: 插值后仍有非有限值，使用全局均值 {global_mean:.6f} 填充")
+            data[~np.isfinite(data)] = global_mean
+
         return data
-    
-    def _handle_surface_variables(self):
-        """
-        处理表面变量（SSHA, UWND, VWND）的深度扩展
-        这些变量只有时间、纬度、经度三个维度，需要扩展到四个维度以匹配其他变量
-        """
-        surface_vars = ['SSHA', 'UWND', 'VWND', 'SSW']
-        
-        # 获取深度层数（从其他4D变量中获取）
-        depth_levels = None
-        for var in self.data_arrays:
-            if self.data_arrays[var].ndim == 4:
-                depth_levels = self.data_arrays[var].shape[1]
-                break
-        
-        if depth_levels is None:
-            print("无法确定深度层数，使用默认值27")
-            depth_levels = 27
-        
-        for var in surface_vars:
-            if var in self.data_arrays:
-                data = self.data_arrays[var]
-                if data.ndim == 3:  # (time, lat, lon)
-                    # 扩展到4D: (time, level, lat, lon)
-                    time_steps, lat_size, lon_size = data.shape
-                    expanded_data = np.zeros((time_steps, depth_levels, lat_size, lon_size))
-                    
-                    # 将表面数据复制到所有深度层
-                    for d in range(depth_levels):
-                        expanded_data[:, d, :, :] = data
-                    
-                    self.data_arrays[var] = expanded_data
-                    print(f"变量 {var} 已从3D扩展到4D，所有深度层使用表面值")
-                else:
-                    print(f"变量 {var} 已经是4D，无需扩展")
-    
-    def _normalize_data(self):
-        """
-        数据标准化
-        """
-        print("正在标准化数据...")
-        
-        self.scalers = {}
-        self.normalized_data = {}
-        
-        for var in self.data_arrays.keys():
-            data = self.data_arrays[var]
-            
-            # 将数据重塑为2D进行标准化
-            original_shape = data.shape
-            data_2d = data.reshape(-1, 1)
-            
-            # 创建标准化器
-            scaler = StandardScaler()
-            data_normalized = scaler.fit_transform(data_2d)
-            
-            # 恢复原始形状
-            self.normalized_data[var] = data_normalized.reshape(original_shape)
-            self.scalers[var] = scaler
-            
-            print(f"变量 {var} 标准化完成，均值: {scaler.mean_[0]:.4f}, 标准差: {scaler.scale_[0]:.4f}")
-    
+
     def _split_data(self):
         """
         分割数据集
         """
         total_time_steps = len(self.times)
-        
+
         train_end = int(total_time_steps * self.train_ratio)
         val_end = int(total_time_steps * (self.train_ratio + self.val_ratio))
-        
+
         if self.mode == 'train':
             self.time_indices = list(range(0, train_end))
         elif self.mode == 'val':
             self.time_indices = list(range(train_end, val_end))
         else:  # test
             self.time_indices = list(range(val_end, total_time_steps))
-        
+
         print(f"{self.mode.upper()}集时间范围: {self.time_indices[0]} - {self.time_indices[-1]} (共{len(self.time_indices)}个时步)")
-    
+
     def _create_sequences(self):
         """
-        创建时序序列（包括所有区域的数据）
+        创建时序序列（包括所有区域的数据）。
+
+        ``carry_history`` 下以预测目标所属分段为准：验证/测试可以使用
+        分界前已经观测到的历史，但所有预测目标仍严格留在当前分段。
         """
         self.sequences = []
-        
+
         # 获取该模式对应的时间范围
         if not hasattr(self, 'time_indices') or len(self.time_indices) == 0:
             print(f"警告: {self.mode}模式的时间索引为空")
             return
-        
-        min_time_idx = min(self.time_indices)
-        max_time_idx = max(self.time_indices)
-        
+
+        segment_start = min(self.time_indices)
+        segment_end = max(self.time_indices)
+
         # 确保有足够的时间步来创建序列
         required_length = self.sequence_length + self.prediction_length
-        available_length = max_time_idx - min_time_idx + 1
-        
-        if available_length < required_length:
-            print(f"警告: {self.mode}集时间步不足。需要{required_length}，可用{available_length}")
+        available_length = segment_end - segment_start + 1
+
+        context_policy = self.config.get('split_context_policy', 'carry_history')
+        minimum_segment_length = (
+            required_length if self.mode == 'train' or context_policy == 'strict_segment'
+            else self.prediction_length
+        )
+        if available_length < minimum_segment_length:
+            print(
+                f"警告: {self.mode}集时间步不足。需要{minimum_segment_length}，"
+                f"可用{available_length}"
+            )
             return
-        
+
+        if self.mode == 'train' or context_policy == 'strict_segment':
+            earliest_start = segment_start
+        else:
+            earliest_start = max(0, segment_start - self.sequence_length)
+        latest_start = segment_end - required_length + 1
+
         # 为每个区域创建序列（train/val/test 均包含所有100%海洋窗口）
         for region_idx, region_info in enumerate(self.all_regions_data):
             region_type = region_info['region_type']
 
             region_sequences = []
-            for t in range(min_time_idx, max_time_idx - required_length + 2):
-                if (t + self.sequence_length + self.prediction_length - 1) <= max_time_idx:
+            for t in range(earliest_start, latest_start + 1):
+                target_start = t + self.sequence_length
+                target_end = target_start + self.prediction_length - 1
+                if target_start >= segment_start and target_end <= segment_end:
                     region_sequences.append((t, region_idx))
 
             self.sequences.extend(region_sequences)
 
             print(f"区域 {region_idx} ({region_type}): {len(region_sequences)} 个序列")
-        
+
         print(f"{self.mode.upper()}集总序列数量: {len(self.sequences)}")
         if len(self.sequences) > 0:
-            print(f"  时间范围: {min_time_idx} 到 {max_time_idx}")
+            first_start = min(start for start, _ in self.sequences)
+            last_start = max(start for start, _ in self.sequences)
+            print(
+                f"  目标时间范围: {segment_start} 到 {segment_end}; "
+                f"历史起点范围: {first_start} 到 {last_start}"
+            )
         else:
-            print(f"  警告: 无法创建序列！时间范围: {min_time_idx}-{max_time_idx}, 需要长度: {required_length}")
-    
+            print(
+                f"  警告: 无法创建序列！目标范围: {segment_start}-{segment_end}, "
+                f"需要预测长度: {self.prediction_length}"
+            )
+
     def __len__(self) -> int:
         """
         返回数据集大小
         """
         return len(self.sequences)
-    
+
+    def build_sample_provenance(self, sample_indices: Optional[List[int]] = None) -> Dict:
+        """Describe the exact temporal origins and spatial windows in an evaluation.
+
+        The returned arrays follow ``sample_indices`` order, so they can be
+        paired directly with collected predictions even when a grouped batch
+        sampler changes iteration order.
+        """
+        if sample_indices is None:
+            sample_indices = list(range(len(self.sequences)))
+        else:
+            sample_indices = [int(value) for value in sample_indices]
+
+        samples = []
+        origins = {}
+        regions = {}
+        origin_ids = []
+        region_ids = []
+        target_time_indices = []
+        target_period_ids = []
+
+        def time_label(index: int) -> str:
+            return str(self.times[index])
+
+        for sample_idx in sample_indices:
+            if sample_idx < 0 or sample_idx >= len(self.sequences):
+                raise IndexError(f'sample index out of range: {sample_idx}')
+            start_idx, region_idx = self.sequences[sample_idx]
+            start_idx = int(start_idx)
+            region_idx = int(region_idx)
+            history_end = start_idx + self.sequence_length - 1
+            target_start = history_end + 1
+            future_indices = list(range(target_start, target_start + self.prediction_length))
+            future_periods = [int(self.time_period_indices[index]) for index in future_indices]
+
+            origin_key = str(start_idx)
+            if origin_key not in origins:
+                origins[origin_key] = {
+                    'history_start_index': start_idx,
+                    'history_end_index': history_end,
+                    'target_start_index': target_start,
+                    'target_end_index': future_indices[-1],
+                    'history_start_time': time_label(start_idx),
+                    'history_end_time': time_label(history_end),
+                    'target_times': [time_label(index) for index in future_indices],
+                    'target_period_ids': future_periods,
+                }
+
+            region_key = str(region_idx)
+            if region_key not in regions:
+                region = self.all_regions_data[region_idx]
+                coords = region.get('coords', {})
+                lons = np.asarray(coords.get('lons', []), dtype=np.float64)
+                lats = np.asarray(coords.get('lats', []), dtype=np.float64)
+                regions[region_key] = {
+                    'region_type': region.get('region_type', 'unknown'),
+                    'lon_range': (
+                        [float(value) for value in region.get('lon_range', [])]
+                        if region.get('lon_range') is not None else []
+                    ),
+                    'lat_range': (
+                        [float(value) for value in region.get('lat_range', [])]
+                        if region.get('lat_range') is not None else []
+                    ),
+                    'center_lon': float(np.mean(lons)) if lons.size else None,
+                    'center_lat': float(np.mean(lats)) if lats.size else None,
+                }
+
+            origin_ids.append(start_idx)
+            region_ids.append(region_idx)
+            target_time_indices.append(future_indices)
+            target_period_ids.append(future_periods)
+            samples.append({
+                'sample_index': sample_idx,
+                'origin_id': start_idx,
+                'region_id': region_idx,
+            })
+
+        return {
+            'samples': samples,
+            'origin_ids': origin_ids,
+            'region_ids': region_ids,
+            'target_time_indices': target_time_indices,
+            'target_period_ids': target_period_ids,
+            'origins': origins,
+            'regions': regions,
+            'period_definition': (
+                f'zero-based phase within climatology_period={self.climatology_period}; '
+                'for monthly data, 0=January and 11=December'
+            ),
+        }
+
+    def _initialize_channel_schema(self):
+        """在主进程中确定通道布局，避免 DataLoader worker 内惰性初始化丢失。"""
+        if not self.all_regions_data:
+            return
+        normalized_data = self.all_regions_data[0].get('normalized_data', {})
+
+        actual_input_variables = [
+            var for var in self.input_variables if var in normalized_data
+        ]
+        if self.include_climatology_features:
+            for var in self.climatology_feature_variables:
+                feature_name = self._climatology_feature_name(var)
+                if feature_name in normalized_data:
+                    actual_input_variables.append(feature_name)
+        if self.config.get('enable_positional_encoding', False):
+            if 'SPATIAL_ENCODING' in normalized_data:
+                actual_input_variables.append('SPATIAL_ENCODING')
+        if self.config.get('enable_time_encoding', False) and 'TIME_ENCODING' in normalized_data:
+            actual_input_variables.append('TIME_ENCODING')
+
+        self.actual_input_variables = actual_input_variables
+        offset = 0
+        for var_name in self.actual_input_variables:
+            arr = normalized_data[var_name]
+            channels = int(arr.shape[1]) if arr.ndim == 4 else 1
+            self.input_channel_slices[var_name] = slice(offset, offset + channels)
+            offset += channels
+
+        offset = 0
+        for var_name in self.target_variables:
+            arr = normalized_data.get(var_name)
+            if arr is None:
+                continue
+            channels = int(arr.shape[1]) if arr.ndim == 4 else 1
+            self.target_channel_slices[var_name] = slice(offset, offset + channels)
+            offset += channels
+
+    def _validate_channel_schema(self):
+        """Fail when configured variables/features did not become real channels."""
+        missing_inputs = [
+            name for name in self.input_variables
+            if name not in self.input_channel_slices
+        ]
+        missing_targets = [
+            name for name in self.target_variables
+            if name not in self.target_channel_slices
+        ]
+        expected_features = []
+        if self.include_climatology_features:
+            expected_features.extend(
+                self._climatology_feature_name(name)
+                for name in self.climatology_feature_variables
+            )
+        if (
+            self.config.get('enable_positional_encoding', False)
+            and int(self.config.get('positional_encoding_frequencies', 0)) > 0
+        ):
+            expected_features.append('SPATIAL_ENCODING')
+        if (
+            self.config.get('enable_time_encoding', False)
+            and (
+                int(self.config.get('time_encoding_frequencies', 0)) > 0
+                or self.config.get('include_year_trend', False)
+            )
+        ):
+            expected_features.append('TIME_ENCODING')
+        missing_features = [
+            name for name in expected_features
+            if name not in self.input_channel_slices
+        ]
+        if missing_inputs or missing_targets or missing_features:
+            raise ValueError(
+                '数据通道 schema 与配置不一致；拒绝静默删除变量。'
+                f'缺失输入={missing_inputs}, 缺失目标={missing_targets}, '
+                f'缺失特征={missing_features}'
+            )
+
+    @staticmethod
+    def _slice_and_broadcast_input(
+        data: np.ndarray,
+        start_idx: int,
+        length: int,
+        height: int,
+        width: int,
+        *,
+        variable: str,
+        allow_static_time: bool = False,
+        allow_spatial_broadcast: bool = False,
+    ) -> np.ndarray:
+        """严格切片输入，并只在语义允许的 singleton 轴上零拷贝广播。"""
+        array = np.asarray(data)
+        if array.ndim not in (3, 4):
+            raise ValueError(f'{variable} 输入维度必须为 3 或 4，实际为 {array.shape}')
+        if start_idx < 0 or length <= 0:
+            raise ValueError(f'{variable} 的切片参数非法: start={start_idx}, length={length}')
+
+        if array.shape[0] == 1 and allow_static_time:
+            window = array
+        else:
+            end_idx = start_idx + length
+            if end_idx > array.shape[0]:
+                raise IndexError(
+                    f'{variable} 时间长度不足: 请求 [{start_idx}:{end_idx}]，'
+                    f'实际长度={array.shape[0]}'
+                )
+            window = array[start_idx:end_idx]
+
+        if window.shape[0] == 1 and length != 1:
+            if not allow_static_time:
+                raise ValueError(f'{variable} 不允许沿时间轴广播')
+            window = np.broadcast_to(window, (length, *window.shape[1:]))
+        elif window.shape[0] != length:
+            raise ValueError(
+                f'{variable} 时间窗口长度不一致: expected={length}, actual={window.shape[0]}'
+            )
+
+        source_height, source_width = window.shape[-2:]
+        if (source_height, source_width) != (height, width):
+            if (
+                not allow_spatial_broadcast
+                or source_height not in (1, height)
+                or source_width not in (1, width)
+            ):
+                raise ValueError(
+                    f'{variable} 空间形状不兼容: expected={(height, width)}, '
+                    f'actual={(source_height, source_width)}'
+                )
+            window = np.broadcast_to(
+                window,
+                (*window.shape[:-2], height, width),
+            )
+        return window
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         获取单个样本
-        
+
         Args:
             idx: 样本索引
-            
+
         Returns:
             输入序列和目标序列的元组
         """
         # 解析序列信息：(时间起始索引, 区域索引)
         start_idx, region_idx = self.sequences[idx]
-        
+
         # 获取对应区域的数据
         region_info = self.all_regions_data[region_idx]
         normalized_data = region_info['normalized_data']
-        
+
         # 更新输入变量列表（第一次调用时）
         if not hasattr(self, 'actual_input_variables'):
             valid_input_vars = []
@@ -1105,26 +1446,46 @@ class OceanDataset(Dataset):
             if self.config.get('enable_positional_encoding', False):
                 if 'SPATIAL_ENCODING' in normalized_data:
                     valid_input_vars.append('SPATIAL_ENCODING')
-                if 'DEPTH_ENCODING' in normalized_data:
-                    valid_input_vars.append('DEPTH_ENCODING')
             if self.config.get('enable_time_encoding', False) and 'TIME_ENCODING' in normalized_data:
                 valid_input_vars.append('TIME_ENCODING')
             self.actual_input_variables = valid_input_vars
-        
+
+        reference_variable = next(
+            (name for name in self.input_variables if name in normalized_data),
+            None,
+        )
+        if reference_variable is None:
+            raise ValueError('没有可用于确定样本空间形状的物理输入变量')
+        reference_data = np.asarray(normalized_data[reference_variable])
+        if reference_data.ndim not in (3, 4):
+            raise ValueError(
+                f'{reference_variable} 输入维度必须为 3 或 4，实际为 {reference_data.shape}'
+            )
+        height, width = reference_data.shape[-2:]
+
         # 构建输入序列
         input_sequence = []
         for var in self.actual_input_variables:
             if var in normalized_data:
-                var_data = normalized_data[var][start_idx:start_idx + self.sequence_length]
+                var_data = self._slice_and_broadcast_input(
+                    normalized_data[var],
+                    start_idx,
+                    self.sequence_length,
+                    height,
+                    width,
+                    variable=var,
+                    allow_static_time=(var == 'SPATIAL_ENCODING'),
+                    allow_spatial_broadcast=(var == 'TIME_ENCODING'),
+                )
                 input_sequence.append(var_data)
-        
+
         # 构建目标序列
         target_sequence = []
         for var in self.target_variables:
             if var in normalized_data:
                 var_data = normalized_data[var][start_idx + self.sequence_length:start_idx + self.sequence_length + self.prediction_length]
                 target_sequence.append(var_data)
-        
+
         # 转换为numpy数组并调整维度
         # 数据形状: (seq_len, level, lat, lon) -> 需要转换为 (seq_len, lat, lon, level * channels)
         input_arrays = []
@@ -1143,7 +1504,7 @@ class OceanDataset(Dataset):
             for var_name, channel_len in zip(self.actual_input_variables, input_channel_lengths):
                 self.input_channel_slices[var_name] = slice(channel_offset, channel_offset + channel_len)
                 channel_offset += channel_len
-        
+
         target_arrays = []
         target_channel_lengths = []
         for var_data in target_sequence:
@@ -1160,7 +1521,7 @@ class OceanDataset(Dataset):
             for var_name, channel_len in zip(self.target_variables, target_channel_lengths):
                 self.target_channel_slices[var_name] = slice(channel_offset, channel_offset + channel_len)
                 channel_offset += channel_len
-        
+
         # 在深度维度上连接不同变量
         input_seq = np.concatenate(
             [arr.astype(np.float32, copy=False) for arr in input_arrays],
@@ -1170,7 +1531,7 @@ class OceanDataset(Dataset):
             [arr.astype(np.float32, copy=False) for arr in target_arrays],
             axis=-1
         )  # (pred_len, lat, lon, total_channels)
-        
+
         # 转换为PyTorch张量并调整维度顺序 (seq_len, channels, height, width)
         input_tensor = torch.FloatTensor(input_seq).permute(0, 3, 1, 2)
         target_tensor = torch.FloatTensor(target_seq).permute(0, 3, 1, 2)
@@ -1189,17 +1550,40 @@ class OceanDataset(Dataset):
         raise ValueError(f"不支持的序列维度: {data.shape}")
 
     def _resolve_target_slice(self, variable: str, var_idx: int, total_channels: int) -> slice:
+        del var_idx
         ch_slice = self.target_channel_slices.get(variable)
         if ch_slice is None:
             raw_slices = self.config.get('target_channel_slices', {})
             raw_slice = raw_slices.get(variable) if isinstance(raw_slices, dict) else None
             if isinstance(raw_slice, (list, tuple)) and len(raw_slice) >= 2:
                 ch_slice = slice(int(raw_slice[0]), int(raw_slice[1]))
-        if ch_slice is not None:
-            return slice(ch_slice.start or 0, ch_slice.stop or total_channels)
+        if ch_slice is None or ch_slice.start is None or ch_slice.stop is None:
+            raise ValueError(f'目标变量 {variable!r} 缺少显式 channel slice')
+        start, stop = int(ch_slice.start), int(ch_slice.stop)
+        if not 0 <= start < stop <= int(total_channels):
+            raise ValueError(
+                f'目标变量 {variable!r} 的 channel slice [{start}, {stop}) '
+                f'超出总通道数 {total_channels}'
+            )
+        return slice(start, stop)
 
-        channels_per_var = total_channels // max(1, len(self.target_variables))
-        return slice(var_idx * channels_per_var, (var_idx + 1) * channels_per_var)
+    def _validated_sample_indices(
+        self,
+        sample_indices: Optional[List[int]],
+        sample_count: int,
+    ) -> List[int]:
+        indices = (
+            list(range(sample_count))
+            if sample_indices is None else [int(index) for index in sample_indices]
+        )
+        if len(indices) != sample_count:
+            raise ValueError(
+                f'sample_indices 数量 {len(indices)} 与样本数 {sample_count} 不一致'
+            )
+        invalid = [index for index in indices if index < 0 or index >= len(self.sequences)]
+        if invalid:
+            raise IndexError(f'sample_indices 超出数据集范围: {invalid[:10]}')
+        return indices
 
     def _target_climatology_channels(
         self,
@@ -1235,13 +1619,11 @@ class OceanDataset(Dataset):
         if array.ndim != 5:
             raise ValueError(f"目标反标准化期望 4D/5D 数组，收到: {array.shape}")
 
-        restored = array.astype(np.float64, copy=True)
+        working_dtype = np.float64 if array.dtype == np.float64 else np.float32
+        restored = array.astype(working_dtype, copy=True)
         sample_count, pred_steps, total_channels = restored.shape[:3]
 
-        if sample_indices is None:
-            sample_indices = list(range(sample_count))
-        else:
-            sample_indices = list(sample_indices)
+        sample_indices = self._validated_sample_indices(sample_indices, sample_count)
 
         for var_idx, var_name in enumerate(self.target_variables):
             ch_slice = self._resolve_target_slice(var_name, var_idx, total_channels)
@@ -1249,15 +1631,14 @@ class OceanDataset(Dataset):
                 continue
 
             scaler = self.scalers.get(var_name)
+            if scaler is None:
+                raise ValueError(f'目标变量 {var_name!r} 缺少训练期 scaler')
             var_block = restored[:, :, ch_slice, :, :]
-            if scaler is not None:
-                original_shape = var_block.shape
-                var_block = scaler.inverse_transform(var_block.reshape(-1, 1)).reshape(original_shape)
+            original_shape = var_block.shape
+            var_block = scaler.inverse_transform(var_block.reshape(-1, 1)).reshape(original_shape)
 
             if self._is_anomaly_variable(var_name):
-                for out_idx, sample_idx in enumerate(sample_indices[:sample_count]):
-                    if sample_idx >= len(self.sequences):
-                        continue
+                for out_idx, sample_idx in enumerate(sample_indices):
                     start_idx, region_idx = self.sequences[int(sample_idx)]
                     target_start = start_idx + self.sequence_length
                     region = self.all_regions_data[region_idx]
@@ -1267,8 +1648,11 @@ class OceanDataset(Dataset):
                         target_start,
                         pred_steps
                     )
-                    if clim is not None and clim.shape == var_block[out_idx].shape:
-                        var_block[out_idx] = var_block[out_idx] + clim
+                    if clim is None or clim.shape != var_block[out_idx].shape:
+                        raise ValueError(
+                            f'样本 {sample_idx} 的 {var_name} 气候态形状不完整'
+                        )
+                    var_block[out_idx] = var_block[out_idx] + clim
 
             restored[:, :, ch_slice, :, :] = var_block
 
@@ -1288,13 +1672,11 @@ class OceanDataset(Dataset):
         if array.ndim != 5:
             raise ValueError(f"目标标准化期望 4D/5D 数组，收到: {array.shape}")
 
-        transformed = array.astype(np.float64, copy=True)
+        working_dtype = np.float64 if array.dtype == np.float64 else np.float32
+        transformed = array.astype(working_dtype, copy=True)
         sample_count, pred_steps, total_channels = transformed.shape[:3]
 
-        if sample_indices is None:
-            sample_indices = list(range(sample_count))
-        else:
-            sample_indices = list(sample_indices)
+        sample_indices = self._validated_sample_indices(sample_indices, sample_count)
 
         for var_idx, var_name in enumerate(self.target_variables):
             ch_slice = self._resolve_target_slice(var_name, var_idx, total_channels)
@@ -1303,9 +1685,7 @@ class OceanDataset(Dataset):
 
             var_block = transformed[:, :, ch_slice, :, :]
             if self._is_anomaly_variable(var_name):
-                for out_idx, sample_idx in enumerate(sample_indices[:sample_count]):
-                    if sample_idx >= len(self.sequences):
-                        continue
+                for out_idx, sample_idx in enumerate(sample_indices):
                     start_idx, region_idx = self.sequences[int(sample_idx)]
                     target_start = start_idx + self.sequence_length
                     region = self.all_regions_data[region_idx]
@@ -1315,13 +1695,17 @@ class OceanDataset(Dataset):
                         target_start,
                         pred_steps
                     )
-                    if clim is not None and clim.shape == var_block[out_idx].shape:
-                        var_block[out_idx] = var_block[out_idx] - clim
+                    if clim is None or clim.shape != var_block[out_idx].shape:
+                        raise ValueError(
+                            f'样本 {sample_idx} 的 {var_name} 气候态形状不完整'
+                        )
+                    var_block[out_idx] = var_block[out_idx] - clim
 
             scaler = self.scalers.get(var_name)
-            if scaler is not None:
-                original_shape = var_block.shape
-                var_block = scaler.transform(var_block.reshape(-1, 1)).reshape(original_shape)
+            if scaler is None:
+                raise ValueError(f'目标变量 {var_name!r} 缺少训练期 scaler')
+            original_shape = var_block.shape
+            var_block = scaler.transform(var_block.reshape(-1, 1)).reshape(original_shape)
 
             transformed[:, :, ch_slice, :, :] = var_block
 
@@ -1329,7 +1713,8 @@ class OceanDataset(Dataset):
 
     def build_reference_forecasts(
         self,
-        sample_indices: Optional[List[int]] = None
+        sample_indices: Optional[List[int]] = None,
+        spaces: Optional[Sequence[str]] = None,
     ) -> Dict[str, Dict[str, np.ndarray]]:
         """
         构造 Climatology / Persistence / Anomaly Persistence baseline。
@@ -1340,10 +1725,21 @@ class OceanDataset(Dataset):
               'normalized': {name: (N, T, C, H, W)}
             }
         """
+        requested_spaces = set(spaces or ('physical', 'normalized'))
+        unknown_spaces = requested_spaces - {'physical', 'normalized'}
+        if unknown_spaces or not requested_spaces:
+            raise ValueError(
+                f'基线空间必须是 physical/normalized 的非空子集，实际={sorted(requested_spaces)}'
+            )
+
         if sample_indices is None:
             sample_indices = list(range(len(self.sequences)))
         else:
-            sample_indices = list(sample_indices)
+            sample_indices = [int(index) for index in sample_indices]
+        sample_indices = self._validated_sample_indices(
+            sample_indices,
+            len(sample_indices),
+        )
 
         if len(sample_indices) == 0:
             empty = np.empty((0, self.prediction_length, 0, 0, 0), dtype=np.float32)
@@ -1352,13 +1748,9 @@ class OceanDataset(Dataset):
         if not self.target_channel_slices and len(self.sequences) > 0:
             _ = self[0]
 
-        physical_refs = {
-            'climatology': [],
-            'persistence': [],
-            'anomaly_persistence': [],
-        }
+        physical = None
 
-        for sample_idx in sample_indices:
+        for output_idx, sample_idx in enumerate(sample_indices):
             start_idx, region_idx = self.sequences[int(sample_idx)]
             target_start = start_idx + self.sequence_length
             last_hist_idx = target_start - 1
@@ -1404,26 +1796,53 @@ class OceanDataset(Dataset):
                 persistence_parts.append(persistence)
                 anomaly_persistence_parts.append(anomaly_persistence)
 
-            physical_refs['climatology'].append(np.concatenate(clim_parts, axis=1))
-            physical_refs['persistence'].append(np.concatenate(persistence_parts, axis=1))
-            physical_refs['anomaly_persistence'].append(np.concatenate(anomaly_persistence_parts, axis=1))
+            sample_forecasts = {
+                'climatology': np.concatenate(clim_parts, axis=1),
+                'persistence': np.concatenate(persistence_parts, axis=1),
+                'anomaly_persistence': np.concatenate(
+                    anomaly_persistence_parts, axis=1
+                ),
+            }
+            if physical is None:
+                physical = {
+                    name: np.empty(
+                        (len(sample_indices), *values.shape),
+                        dtype=np.float32,
+                    )
+                    for name, values in sample_forecasts.items()
+                }
+            for name, values in sample_forecasts.items():
+                if values.shape != physical[name].shape[1:]:
+                    raise ValueError(
+                        f'{name} 基线形状在样本间不一致: '
+                        f'{values.shape} != {physical[name].shape[1:]}'
+                    )
+                physical[name][output_idx] = values
 
-        physical = {
-            name: np.stack(values).astype(np.float32)
-            for name, values in physical_refs.items()
+        if physical is None:
+            raise RuntimeError('非空 sample_indices 未生成任何基线')
+
+        normalized = {}
+        if 'normalized' in requested_spaces:
+            keep_physical = 'physical' in requested_spaces
+            for name in tuple(physical):
+                values = physical[name] if keep_physical else physical.pop(name)
+                normalized[name] = self.transform_targets_to_model_space(
+                    values,
+                    sample_indices=sample_indices,
+                ).astype(np.float32, copy=False)
+
+        return {
+            'physical': physical if 'physical' in requested_spaces else {},
+            'normalized': normalized,
         }
-        normalized = {
-            name: self.transform_targets_to_model_space(values, sample_indices=sample_indices).astype(np.float32)
-            for name, values in physical.items()
-        }
-        return {'physical': physical, 'normalized': normalized}
-    
+
     def get_scaler(self, variable: str) -> Optional[StandardScaler]:
         """
         获取指定变量的标准化器
         """
         return self.scalers.get(variable, None)
-    
+
     def inverse_transform(self, data: np.ndarray, variable: str) -> np.ndarray:
         """
         反标准化数据
@@ -1461,16 +1880,24 @@ class TimeGroupedBatchSampler(Sampler[List[int]]):
             grouped.setdefault(int(start_idx), []).append(sample_idx)
         self.groups = list(grouped.values())
 
+    @property
+    def max_group_size(self) -> int:
+        return max((len(group) for group in self.groups), default=0)
+
     def __iter__(self):
         groups = [list(group) for group in self.groups]
         if self.shuffle:
             random.shuffle(groups)
 
         for group in groups:
-            if self.shuffle:
-                random.shuffle(group)
-            for offset in range(0, len(group), self.batch_size):
-                batch = group[offset:offset + self.batch_size]
+            if self.shuffle or self.drop_last:
+                if self.shuffle:
+                    random.shuffle(group)
+                batches = [group[offset:offset + self.batch_size] for offset in range(0, len(group), self.batch_size)]
+            else:
+                batch_count = (len(group) + self.batch_size - 1) // self.batch_size
+                batches = [group[offset::batch_count] for offset in range(batch_count)]
+            for batch in batches:
                 if len(batch) == self.batch_size or (batch and not self.drop_last):
                     yield batch
 
@@ -1484,6 +1911,39 @@ class TimeGroupedBatchSampler(Sampler[List[int]]):
         return total
 
 
+def validate_expected_canonical_window_count(datasets, expected_count):
+    """Fail fast when the frozen spatial protocol no longer matches the data."""
+    if expected_count is None:
+        return
+    actual = {
+        name: len(dataset.all_regions_data)
+        for name, dataset in datasets.items()
+    }
+    if isinstance(expected_count, dict):
+        missing = sorted(set(actual) - set(expected_count))
+        if missing:
+            raise ValueError(
+                'expected_canonical_windows_per_origin 缺少 split: '
+                f'{missing}'
+            )
+        expected = {name: int(expected_count[name]) for name in actual}
+    else:
+        expected = {name: int(expected_count) for name in actual}
+    if any(count <= 0 for count in expected.values()):
+        raise ValueError('expected_canonical_windows_per_origin 必须为正整数或 split 映射')
+    mismatched = {
+        name: {'expected': expected[name], 'actual': count}
+        for name, count in actual.items()
+        if count != expected[name]
+    }
+    if mismatched:
+        raise ValueError(
+            'canonical 空间窗口协议已变化；请先运行 '
+            'scripts/audit_dataset_protocol.py 审计数据，并显式更新冻结配置。'
+            f'不匹配={mismatched}'
+        )
+
+
 def create_data_loaders(
     data_path: str,
     config: dict,
@@ -1494,45 +1954,67 @@ def create_data_loaders(
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     创建训练、验证和测试数据加载器
-    
+
     Args:
         data_path: 数据文件路径
         config: 配置字典
         batch_size: 批次大小
         num_workers: 工作进程数
-        
+
     Returns:
         训练、验证、测试数据加载器的元组
     """
     # 创建数据集，使用配置中的分割比例
     train_ratio = config.get('train_ratio', 0.6)
     val_ratio = config.get('val_ratio', 0.2)
-    
+
     # 首先创建训练集，计算并获取scalers
     print("初始化训练集...")
-    train_dataset = OceanDataset(data_path, config, mode='train', 
+    train_dataset = OceanDataset(data_path, config, mode='train',
                                 train_ratio=train_ratio, val_ratio=val_ratio)
-    
+
     # 获取训练集计算出的scalers
     scalers = train_dataset.scalers
-    
-    # 使用训练集的scalers初始化验证集和测试集
+
+    # 时间 split 不应复制整套空间数组。只有模式对应的滑窗开关/步长不同
+    # （例如区域训练、全球验证）时，才构建独立的预处理 payload。
     print("初始化验证集 (使用训练集标准化参数)...")
-    val_dataset = OceanDataset(data_path, config, mode='val',
-                              train_ratio=train_ratio, val_ratio=val_ratio,
-                              scalers=scalers)
-    
+    if train_dataset.can_share_preprocessed_with_mode('val'):
+        print("[MEMORY] 验证集复用训练集只读预处理数组")
+        val_dataset = train_dataset.temporal_split_view('val')
+    else:
+        val_dataset = OceanDataset(
+            data_path, config, mode='val',
+            train_ratio=train_ratio, val_ratio=val_ratio,
+            scalers=scalers,
+        )
+
     print("初始化测试集 (使用训练集标准化参数)...")
-    test_dataset = OceanDataset(data_path, config, mode='test',
-                               train_ratio=train_ratio, val_ratio=val_ratio,
-                               scalers=scalers)
-    
+    if val_dataset.can_share_preprocessed_with_mode('test'):
+        print("[MEMORY] 测试集复用验证集只读预处理数组")
+        test_dataset = val_dataset.temporal_split_view('test')
+    else:
+        test_dataset = OceanDataset(
+            data_path, config, mode='test',
+            train_ratio=train_ratio, val_ratio=val_ratio,
+            scalers=scalers,
+        )
+
     # 检查数据集大小
     print(f"数据集大小检查:")
     print(f"训练集样本数: {len(train_dataset)}")
     print(f"验证集样本数: {len(val_dataset)}")
     print(f"测试集样本数: {len(test_dataset)}")
-    
+
+    validate_expected_canonical_window_count(
+        {
+            'train': train_dataset,
+            'validation': val_dataset,
+            'test': test_dataset,
+        },
+        config.get('expected_canonical_windows_per_origin'),
+    )
+
     # 验证数据集大小
     if len(val_dataset) == 0:
         print("⚠️  警告: 验证集为空！这可能是因为:")
@@ -1540,14 +2022,15 @@ def create_data_loaders(
         print("   2. 验证集分割比例太小")
         print("   3. 数据总时间步数不足")
         print("   建议: 减少sequence_length/prediction_length或增加val_ratio")
-    
+
     if len(train_dataset) == 0:
         raise ValueError("训练集为空，无法进行训练!")
-    
+
     # 创建数据加载器
     # 仅在多进程时启用预取与持久化，以避免 PyTorch 对 num_workers=0 的限制
     use_prefetch = prefetch_factor if num_workers > 0 else None
     use_persistent = persistent_workers and num_workers > 0
+    use_pin_memory = bool(config.get('pin_memory', True))
     group_batches = bool(config.get('group_batches_by_time', False))
 
     if group_batches:
@@ -1556,27 +2039,48 @@ def create_data_loaders(
         val_dataset.return_sample_index = True
         test_dataset.return_sample_index = True
 
+        train_sampler = TimeGroupedBatchSampler(train_dataset, batch_size, shuffle=True)
+        val_sampler = TimeGroupedBatchSampler(val_dataset, batch_size, shuffle=False)
+        test_sampler = TimeGroupedBatchSampler(test_dataset, batch_size, shuffle=False)
+        if (
+            config.get('enable_global_token_bank', False)
+            and config.get('global_token_bank_scope', 'time_group') == 'time_group'
+        ):
+            group_sizes = {
+                'train': train_sampler.max_group_size,
+                'validation': val_sampler.max_group_size,
+                'test': test_sampler.max_group_size,
+            }
+            oversized = {
+                split: size for split, size in group_sizes.items() if size > batch_size
+            }
+            if oversized:
+                raise ValueError(
+                    'Global Token Bank 的 time_group 协议要求一个 batch 覆盖同一起报时次的全部窗口；'
+                    f'当前 batch_size={batch_size}，超限分组={oversized}'
+                )
+
         train_loader = DataLoader(
             train_dataset,
-            batch_sampler=TimeGroupedBatchSampler(train_dataset, batch_size, shuffle=True),
+            batch_sampler=train_sampler,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             prefetch_factor=use_prefetch,
             persistent_workers=use_persistent,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_sampler=TimeGroupedBatchSampler(val_dataset, batch_size, shuffle=False),
+            batch_sampler=val_sampler,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             prefetch_factor=use_prefetch,
             persistent_workers=use_persistent,
         )
         test_loader = DataLoader(
             test_dataset,
-            batch_sampler=TimeGroupedBatchSampler(test_dataset, batch_size, shuffle=False),
+            batch_sampler=test_sampler,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             prefetch_factor=use_prefetch,
             persistent_workers=use_persistent,
         )
@@ -1586,7 +2090,7 @@ def create_data_loaders(
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             prefetch_factor=use_prefetch,
             persistent_workers=use_persistent,
         )
@@ -1596,7 +2100,7 @@ def create_data_loaders(
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             prefetch_factor=use_prefetch,
             persistent_workers=use_persistent,
         )
@@ -1606,32 +2110,32 @@ def create_data_loaders(
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             prefetch_factor=use_prefetch,
             persistent_workers=use_persistent,
         )
-    
+
     print(f"数据加载器创建完成:")
     print(f"训练集批次数: {len(train_loader)}")
     print(f"验证集批次数: {len(val_loader)}")
     print(f"测试集批次数: {len(test_loader)}")
-    
+
     return train_loader, val_loader, test_loader
 
 
 def get_data_info(data_path: str) -> Dict:
     """
     获取数据基本信息
-    
+
     Args:
         data_path: 数据文件路径
-        
+
     Returns:
         数据信息字典
     """
     try:
         dataset = xr.open_dataset(data_path)
-        
+
         info = {
             'dimensions': dict(dataset.dims),
             'variables': list(dataset.data_vars),
@@ -1643,10 +2147,10 @@ def get_data_info(data_path: str) -> Dict:
                 'level': [float(dataset.LEVEL.min()), float(dataset.LEVEL.max())]
             }
         }
-        
+
         dataset.close()
         return info
-    
+
     except Exception as e:
         print(f"读取数据信息时出错: {e}")
         return {}
@@ -1655,22 +2159,22 @@ def get_data_info(data_path: str) -> Dict:
 if __name__ == "__main__":
     # 测试数据加载器
     from convlstm_model import DEFAULT_CONFIG
-    
+
     data_path = "Data/FullData_preprocessed.nc"
     config = DEFAULT_CONFIG.copy()
-    
+
     try:
         # 获取数据信息
         print("数据文件信息:")
         data_info = get_data_info(data_path)
         for key, value in data_info.items():
             print(f"  {key}: {value}")
-        
+
         print("\n创建数据加载器...")
         train_loader, val_loader, test_loader = create_data_loaders(
             data_path, config, batch_size=2, num_workers=0
         )
-        
+
         # 测试数据加载
         print("\n测试数据加载...")
         for i, (inputs, targets) in enumerate(train_loader):
@@ -1679,9 +2183,9 @@ if __name__ == "__main__":
             print(f"  目标形状: {targets.shape}")
             if i >= 2:  # 只测试前几个批次
                 break
-        
+
         print("数据加载器测试完成！")
-        
+
     except Exception as e:
         print(f"测试失败: {e}")
         print("请确保数据文件存在且格式正确")

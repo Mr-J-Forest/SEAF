@@ -1,0 +1,12 @@
+{
+  "extends": "formal_base.json",
+  "train_sliding_enabled": false,
+  "val_sliding_enabled": true,
+  "test_sliding_enabled": true,
+  "expected_canonical_windows_per_origin": {
+    "train": 1,
+    "validation": 151,
+    "test": 151
+  },
+  "enable_global_token_bank": false
+}

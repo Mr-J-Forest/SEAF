@@ -14,27 +14,27 @@ class ConvLSTMCell(nn.Module):
     ConvLSTM单元 - 卷积长短期记忆网络的基本单元
     结合了卷积神经网络的空间特征提取能力和LSTM的时序建模能力
     """
-    
-    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: Tuple[int, int], 
+
+    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: Tuple[int, int],
                  bias: bool = True, padding: str = 'same'):
         """
         初始化ConvLSTM单元
-        
+
         Args:
             input_dim: 输入特征维度
-            hidden_dim: 隐藏状态维度  
+            hidden_dim: 隐藏状态维度
             kernel_size: 卷积核大小
             bias: 是否使用偏置
             padding: 填充方式
         """
         super(ConvLSTMCell, self).__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.kernel_size = kernel_size
         self.padding = kernel_size[0] // 2 if padding == 'same' else 0
         self.bias = bias
-        
+
         # 输入到隐藏状态的卷积层 (输入门、遗忘门、候选值、输出门)
         self.conv_ih = nn.Conv2d(
             in_channels=self.input_dim,
@@ -43,7 +43,7 @@ class ConvLSTMCell(nn.Module):
             padding=self.padding,
             bias=self.bias
         )
-        
+
         # 隐藏状态到隐藏状态的卷积层
         self.conv_hh = nn.Conv2d(
             in_channels=self.hidden_dim,
@@ -52,53 +52,53 @@ class ConvLSTMCell(nn.Module):
             padding=self.padding,
             bias=self.bias
         )
-    
+
     def forward(self, input_tensor: torch.Tensor, cur_state: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播
-        
+
         Args:
             input_tensor: 输入张量 (batch_size, input_dim, height, width)
             cur_state: 当前状态 (hidden_state, cell_state)
-            
+
         Returns:
             新的隐藏状态和细胞状态
         """
         h_cur, c_cur = cur_state
-        
+
         # 计算输入到隐藏状态的卷积
         combined_ih = self.conv_ih(input_tensor)
-        
+
         # 计算隐藏状态到隐藏状态的卷积
         combined_hh = self.conv_hh(h_cur)
-        
+
         # 组合输入和隐藏状态的贡献
         combined = combined_ih + combined_hh
-        
+
         # 分离四个门的输出
         cc_i, cc_f, cc_o, cc_g = torch.split(combined, self.hidden_dim, dim=1)
-        
+
         # 计算门控值
         i = torch.sigmoid(cc_i)  # 输入门
         f = torch.sigmoid(cc_f)  # 遗忘门
         o = torch.sigmoid(cc_o)  # 输出门
         g = torch.tanh(cc_g)     # 候选值
-        
+
         # 更新细胞状态和隐藏状态
         c_next = f * c_cur + i * g
         h_next = o * torch.tanh(c_next)
-        
+
         return h_next, c_next
-    
+
     def init_hidden(self, batch_size: int, image_size: Tuple[int, int], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         初始化隐藏状态和细胞状态
-        
+
         Args:
             batch_size: 批次大小
             image_size: 图像尺寸 (height, width)
             device: 设备
-            
+
         Returns:
             初始化的隐藏状态和细胞状态
         """
@@ -113,14 +113,14 @@ class ConvLSTM(nn.Module):
     多层ConvLSTM网络
     用于处理海洋数据的时空序列预测
     """
-    
+
     def __init__(self, input_dim: int, hidden_dims: List[int], kernel_size: Tuple[int, int],
-                 num_layers: int, batch_first: bool = True, bias: bool = True, 
+                 num_layers: int, batch_first: bool = True, bias: bool = True,
                  return_all_layers: bool = False, residual_between_layers: bool = False,
                  dropout: float = 0.0):
         """
         初始化ConvLSTM网络
-        
+
         Args:
             input_dim: 输入特征维度
             hidden_dims: 每层的隐藏维度列表
@@ -133,7 +133,7 @@ class ConvLSTM(nn.Module):
             dropout: 层间Dropout概率
         """
         super(ConvLSTM, self).__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
         self.kernel_size = kernel_size
@@ -143,7 +143,7 @@ class ConvLSTM(nn.Module):
         self.return_all_layers = return_all_layers
         self.residual_between_layers = residual_between_layers
         self.dropout = dropout
-        
+
         # 构建ConvLSTM层
         cell_list = []
         for i in range(self.num_layers):
@@ -154,50 +154,50 @@ class ConvLSTM(nn.Module):
                 kernel_size=self.kernel_size,
                 bias=self.bias
             ))
-        
+
         self.cell_list = nn.ModuleList(cell_list)
         self.dropout_layer = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
-    
+
     def forward(self, input_tensor: torch.Tensor, hidden_state: Optional[List] = None) -> Tuple[torch.Tensor, List]:
         """
         前向传播
-        
+
         Args:
             input_tensor: 输入张量 (batch_size, seq_len, input_dim, height, width)
             hidden_state: 初始隐藏状态
-            
+
         Returns:
             输出张量和最终隐藏状态
         """
         if not self.batch_first:
             # 如果不是批次优先，转换维度 (seq_len, batch_size, input_dim, height, width)
             input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
-        
+
         batch_size, seq_len = input_tensor.size(0), input_tensor.size(1)
         height, width = input_tensor.size(3), input_tensor.size(4)
-        
+
         # 初始化隐藏状态
         if hidden_state is None:
             hidden_state = self._init_hidden(batch_size, (height, width), input_tensor.device)
-        
+
         layer_output_list = []
         last_state_list = []
-        
+
         cur_layer_input = input_tensor
-        
+
         for layer_idx in range(self.num_layers):
             h, c = hidden_state[layer_idx]
             output_inner = []
-            
+
             for t in range(seq_len):
                 h, c = self.cell_list[layer_idx](cur_layer_input[:, t, :, :, :], (h, c))
                 output_inner.append(h)
-            
+
             layer_output = torch.stack(output_inner, dim=1)
 
             if self.residual_between_layers and cur_layer_input.shape[2] == layer_output.shape[2]:
                 layer_output = layer_output + cur_layer_input
-            
+
             # Apply dropout between layers
             if layer_idx < self.num_layers - 1 and self.dropout > 0:
                 B_drop, T_drop, C_drop, H_drop, W_drop = layer_output.shape
@@ -206,16 +206,16 @@ class ConvLSTM(nn.Module):
                 layer_output = layer_output_flat.view(B_drop, T_drop, C_drop, H_drop, W_drop)
 
             cur_layer_input = layer_output
-            
+
             layer_output_list.append(layer_output)
             last_state_list.append((h, c))
-        
+
         if not self.return_all_layers:
             layer_output_list = layer_output_list[-1:]
             last_state_list = last_state_list[-1:]
-        
+
         return layer_output_list, last_state_list
-    
+
     def _init_hidden(self, batch_size: int, image_size: Tuple[int, int], device: torch.device) -> List:
         """
         初始化所有层的隐藏状态
@@ -295,12 +295,25 @@ class GlobalTokenBankAttention(nn.Module):
         )
         self.gate = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def pool_tokens(x: torch.Tensor) -> torch.Tensor:
+        """Return one raw token per spatial window."""
+        return x.mean(dim=(2, 3))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        bank_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         b, c, h, w = x.shape
-        if b <= 1:
+        pooled_tokens = self.pool_tokens(x) if bank_tokens is None else bank_tokens
+        if pooled_tokens.ndim != 2 or pooled_tokens.shape[1] != c:
+            raise ValueError(
+                f'global token bank must have shape (windows, {c}), got {tuple(pooled_tokens.shape)}'
+            )
+        if pooled_tokens.shape[0] <= 1:
             return x
 
-        pooled_tokens = x.mean(dim=(2, 3))
         bank = self.token_norm(pooled_tokens).unsqueeze(0).expand(b, -1, -1)
 
         queries = x.view(b, c, h * w).permute(0, 2, 1)
@@ -312,11 +325,13 @@ class GlobalTokenBankAttention(nn.Module):
 
 
 class ThermohalineMemory(nn.Module):
-    """Learned water-mass memory over TEMP/SALT/PTEMP/PDEN/SPICE profiles.
+    """Learned water-mass memory over the configured profile channels.
 
     The module routes each grid column to soft water-mass prototypes, updates
     those prototype tokens with a tiny Transformer, then writes the water-mass
-    context back to the Eulerian grid as extra ConvLSTM input channels.
+    context back to the Eulerian grid as extra model input channels. The active
+    configuration uses TEMP/SALT only; other variables are used only when they
+    are both present in ``input_variables`` and listed in ``tsc_variables``.
     """
 
     def __init__(self, input_dim: int, config: dict):
@@ -389,7 +404,10 @@ class ThermohalineMemory(nn.Module):
                 selected.append((start, stop))
 
         if not selected:
-            selected.append((0, input_dim))
+            raise ValueError(
+                'ThermohalineMemory 未找到任何配置变量的输入通道；'
+                '拒绝静默把全部输入变量当作温盐剖面'
+            )
         return selected
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -452,7 +470,7 @@ class ConvGNAct3d(nn.Module):
 
 
 class SpectralLowModeMixer(nn.Module):
-    """FuXi-style global low-frequency spatial mixer using learnable Fourier modes."""
+    """Global low-frequency spatial mixer using learnable diagonal Fourier modes."""
 
     def __init__(self, channels: int, modes_y: int = 8, modes_x: int = 8, dropout: float = 0.0):
         super().__init__()
@@ -486,8 +504,8 @@ class SpectralLowModeMixer(nn.Module):
         return x + self.mix(spatial)
 
 
-class GlobalSpectralBranch(nn.Module):
-    """Flattened time-channel branch for global spectral teleconnection patterns."""
+class LowModeSpectralBranch(nn.Module):
+    """Flattened time-channel branch with learnable low-mode spatial filtering."""
 
     def __init__(self, input_channels: int, hidden_dim: int, modes_y: int, modes_x: int,
                  layers: int = 2, dropout: float = 0.0):
@@ -502,8 +520,8 @@ class GlobalSpectralBranch(nn.Module):
         return self.net(x)
 
 
-class Axiom3DStructureBranch(nn.Module):
-    """AxiomOcean-style 3D structure branch over variable-time-lat-lon cubes."""
+class SpatiotemporalStructureBranch(nn.Module):
+    """3D convolutional branch over channel-time-latitude-longitude cubes."""
 
     def __init__(self, input_dim: int, hidden_dim: int, layers: int = 2, dropout: float = 0.0):
         super().__init__()
@@ -523,8 +541,8 @@ class Axiom3DStructureBranch(nn.Module):
         return self.post(pooled)
 
 
-class TSCGlobalAxiomEnsembleNet(nn.Module):
-    """TSC + spectral + 3D-structure + gated ensemble ocean forecaster."""
+class TSCFusionNet(nn.Module):
+    """Thermohaline-memory, spectral, spatiotemporal, and gated fusion forecaster."""
 
     def __init__(self, config: dict):
         super().__init__()
@@ -554,8 +572,10 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
         self.disable_3d = bool(config.get('ablation_disable_3d', False))
         self.disable_ensemble = bool(config.get('ablation_disable_ensemble', False))
 
-        self.thermohaline_memory = ThermohalineMemory(self.input_dim, config)
         tsc_out_dim = int(config.get('tsc_output_dim', 16))
+        self.thermohaline_memory = (
+            None if self.disable_tsc else ThermohalineMemory(self.input_dim, config)
+        )
         self.augmented_dim = self.input_dim + (0 if self.disable_tsc else tsc_out_dim)
         ablation_tags = []
         if self.disable_tsc: ablation_tags.append("no-TSC")
@@ -574,7 +594,7 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
             ConvGNAct2d(flat_channels, hidden_dim, dropout=dropout),
             ConvGNAct2d(hidden_dim, hidden_dim, dropout=dropout),
         )
-        self.spectral_branch = GlobalSpectralBranch(
+        self.spectral_branch = LowModeSpectralBranch(
             flat_channels,
             hidden_dim,
             modes_y=modes_y,
@@ -583,7 +603,7 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
             dropout=dropout,
         ) if not self.disable_spectral else None
         struct_in_dim = self.augmented_dim if not self.disable_tsc else self.input_dim
-        self.structure_branch = Axiom3DStructureBranch(
+        self.structure_branch = SpatiotemporalStructureBranch(
             struct_in_dim,
             hidden_dim,
             layers=int(config.get('tsc_fusion_3d_layers', 2)),
@@ -624,7 +644,7 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
         else:
             self.global_token_bank = None
 
-        members = int(config.get('tsc_fusion_ensemble_members', 4))
+        members = 1 if self.disable_ensemble else int(config.get('tsc_fusion_ensemble_members', 4))
         out_channels = self.pred_len * self.output_dim
         self.member_heads = nn.ModuleList([
             nn.Sequential(
@@ -633,21 +653,31 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
             )
             for _ in range(members)
         ])
-        self.ensemble_gate = nn.Sequential(
+        self.ensemble_gate = None if self.disable_ensemble else nn.Sequential(
             nn.Conv2d(hidden_dim, max(8, hidden_dim // 2), kernel_size=1),
             nn.GELU(),
             nn.Conv2d(max(8, hidden_dim // 2), members, kernel_size=1),
             nn.Softmax(dim=1),
         )
 
-        self.persistence_slices = self._resolve_target_input_slices(config)
+        self.enable_persistence_residual = bool(config.get('enable_persistence_residual', True))
+        self.persistence_slices = (
+            self._resolve_target_input_slices(config) if self.enable_persistence_residual else []
+        )
+        if self.enable_persistence_residual and not self.persistence_slices:
+            raise ValueError(
+                '启用 persistence residual 时，所有目标变量必须能映射到输入通道'
+            )
         persistence_channels = sum(stop - start for start, stop in self.persistence_slices)
         self.persistence_proj = None
         if persistence_channels > 0 and persistence_channels != self.output_dim:
             self.persistence_proj = nn.Conv2d(persistence_channels, self.output_dim, kernel_size=1)
-        self.persistence_scale = nn.Parameter(
-            torch.tensor(float(config.get('tsc_fusion_persistence_init', 0.5)), dtype=torch.float32)
-        )
+        if self.enable_persistence_residual:
+            self.persistence_scale = nn.Parameter(
+                torch.tensor(float(config.get('tsc_fusion_persistence_init', 0.5)), dtype=torch.float32)
+            )
+        else:
+            self.register_parameter('persistence_scale', None)
 
     def _resolve_target_input_slices(self, config: dict) -> List[Tuple[int, int]]:
         raw_slices = config.get('input_channel_slices', {})
@@ -681,9 +711,8 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
             return None
         return base
 
-    def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
-        del targets
-        raw_x = x
+    def encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode a window without applying cross-window context or heads."""
         b = x.shape[0]
 
         if self.disable_tsc:
@@ -712,8 +741,23 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
         fused = self.fusion(torch.cat(branch_features, dim=1))
         if self.fusion_transformer is not None:
             fused = fused + self.fusion_transformer(fused)
+        return fused
+
+    def build_global_token_bank(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """Build raw cross-window tokens for exact two-pass inference."""
+        if self.global_token_bank is None:
+            return None
+        return self.global_token_bank.pool_tokens(self.encode_features(x))
+
+    def decode_features(
+        self,
+        fused: torch.Tensor,
+        raw_x: torch.Tensor,
+        global_bank_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        b, _, h, w = fused.shape
         if self.global_token_bank is not None:
-            fused = self.global_token_bank(fused)
+            fused = self.global_token_bank(fused, bank_tokens=global_bank_tokens)
 
         if self.disable_ensemble:
             # Single head, no gate — direct prediction
@@ -729,9 +773,19 @@ class TSCGlobalAxiomEnsembleNet(nn.Module):
             predictions = (members * weights).sum(dim=1)
 
         persistence = self._persistence_base(raw_x)
-        if persistence is not None:
+        if persistence is not None and self.persistence_scale is not None:
             predictions = predictions + self.persistence_scale * persistence.unsqueeze(1)
         return predictions
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        global_bank_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del targets
+        fused = self.encode_features(x)
+        return self.decode_features(fused, x, global_bank_tokens=global_bank_tokens)
 
 
 class OceanConvLSTMPredictor(nn.Module):
@@ -739,20 +793,20 @@ class OceanConvLSTMPredictor(nn.Module):
     海洋数据ConvLSTM预测模型
     专门用于温度和盐度的时空序列预测
     """
-    
+
     def __init__(self, config: dict):
         """
         初始化海洋预测模型
-        
+
         Args:
             config: 配置字典，包含模型参数
         """
         super(OceanConvLSTMPredictor, self).__init__()
-        
+
         self.config = config
         self.seq_len = config.get('sequence_length', 10)  # 输入序列长度
         self.pred_len = config.get('prediction_length', 5)  # 预测序列长度
-        
+
         # 计算实际的输入和输出维度
         if 'actual_input_channels' in config and 'actual_output_channels' in config:
             self.input_dim = config['actual_input_channels']
@@ -779,7 +833,7 @@ class OceanConvLSTMPredictor(nn.Module):
             residual_between_layers=False,
             dropout=config.get('dropout', 0.0),
         )
-        
+
         # ConvLSTM解码器
         self.decoder = ConvLSTM(
             input_dim=config.get('hidden_dims', [64, 64, 64])[-1],
@@ -792,7 +846,7 @@ class OceanConvLSTMPredictor(nn.Module):
             residual_between_layers=False,
             dropout=config.get('dropout', 0.0),
         )
-        
+
         # 输出投影层
         final_hidden_dim = config.get('hidden_dims', [64, 64, 64])[-1]
         self.output_proj = nn.Conv2d(
@@ -801,21 +855,21 @@ class OceanConvLSTMPredictor(nn.Module):
             kernel_size=1,
             padding=0
         )
-        
+
         # 旧 ConvLSTM 路径保留为简洁基线；TSC-Fusion 的细化由主干内部实现。
         dropout = config.get('dropout', 0.0)
         self.residual_refiner = ResidualRefiner(final_hidden_dim, dropout=dropout)
 
         # 批归一化
         self.batch_norm = nn.BatchNorm2d(self.output_dim)
-        
+
         # Dropout正则化
         self.dropout = nn.Dropout2d(config.get('dropout', 0.1))
-    
+
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         前向传播
-        
+
         Args:
             x: 输入张量 (batch_size, seq_len, channels, height, width)
 
@@ -824,23 +878,23 @@ class OceanConvLSTMPredictor(nn.Module):
         """
         # 编码阶段 - 处理输入序列
         encoder_outputs, encoder_states = self.encoder(x)
-        
+
         # 获取编码器的最后输出作为初始输入
         last_output = encoder_outputs[-1][:, -1, :, :, :]  # (batch_size, hidden_dim, height, width)
 
         # 解码阶段 - 生成预测序列
         decoder_input = last_output.unsqueeze(1)  # (batch_size, 1, hidden_dim, height, width)
-        
+
         # 使用编码器的最终状态初始化解码器
         decoder_hidden = encoder_states
-        
+
         predictions = []
-        
+
         for t in range(self.pred_len):
             # 解码器前向传播
             decoder_outputs, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
             current_output = decoder_outputs[-1][:, -1, :, :, :]  # 获取当前时步的输出
-            
+
             # 细化解码器输出
             if self.residual_refiner is not None:
                 current_output = self.residual_refiner(current_output)
@@ -849,23 +903,23 @@ class OceanConvLSTMPredictor(nn.Module):
             pred = self.output_proj(current_output)
             pred = self.batch_norm(pred)
             pred = self.dropout(pred)
-            
+
             predictions.append(pred)
-            
+
             # 使用当前输出作为下一时步的输入
             decoder_input = current_output.unsqueeze(1)
-        
+
         # 堆叠预测结果
         return torch.stack(predictions, dim=1)
 
     def predict_sequence(self, x: torch.Tensor, future_steps: int) -> torch.Tensor:
         """
         预测未来多个时步
-        
+
         Args:
             x: 输入序列 (batch_size, seq_len, channels, height, width)
             future_steps: 未来预测步数
-            
+
         Returns:
             预测结果 (batch_size, future_steps, output_channels, height, width)
         """
@@ -874,12 +928,12 @@ class OceanConvLSTMPredictor(nn.Module):
             # 临时修改预测长度
             original_pred_len = self.pred_len
             self.pred_len = future_steps
-            
+
             predictions = self.forward(x)
-            
+
             # 恢复原始预测长度
             self.pred_len = original_pred_len
-            
+
         return predictions
 
 
@@ -891,7 +945,7 @@ class SimpleCNN(nn.Module):
     def __init__(self, config: dict):
         super(SimpleCNN, self).__init__()
         self.config = config
-        
+
         # 计算输入输出维度
         if 'actual_input_channels' in config and 'actual_output_channels' in config:
             self.input_dim = config['actual_input_channels']
@@ -900,42 +954,42 @@ class SimpleCNN(nn.Module):
             assumed_depth_levels = config.get('assumed_depth_levels', 2)
             self.input_dim = len(config['input_variables']) * assumed_depth_levels
             self.output_dim = len(config['target_variables']) * assumed_depth_levels
-            
+
         self.seq_len = config.get('sequence_length', 10)
         self.pred_len = config.get('prediction_length', 5)
-        
+
         # 输入通道数 = 特征数 * 序列长度
         self.in_channels = self.input_dim * self.seq_len
         # 输出通道数 = 目标特征数 * 预测长度
         self.out_channels = self.output_dim * self.pred_len
-        
+
         hidden_dims = config.get('hidden_dims', [64, 128, 64])
-        
+
         layers = []
         # 第一层
         layers.append(nn.Conv2d(self.in_channels, hidden_dims[0], kernel_size=3, padding=1))
         layers.append(nn.BatchNorm2d(hidden_dims[0]))
         layers.append(nn.ReLU(inplace=True))
-        
+
         # 中间层
         for i in range(len(hidden_dims) - 1):
             layers.append(nn.Conv2d(hidden_dims[i], hidden_dims[i+1], kernel_size=3, padding=1))
             layers.append(nn.BatchNorm2d(hidden_dims[i+1]))
             layers.append(nn.ReLU(inplace=True))
-            
+
         # 输出层
         layers.append(nn.Conv2d(hidden_dims[-1], self.out_channels, kernel_size=1))
-        
+
         self.cnn = nn.Sequential(*layers)
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, seq, channels, height, width)
         b, s, c, h, w = x.shape
         # Flatten seq and channels: (batch, seq*channels, height, width)
         x = x.view(b, s * c, h, w)
-        
+
         out = self.cnn(x)
-        
+
         # Reshape output: (batch, pred_len, out_channels, height, width)
         out = out.view(b, self.pred_len, self.output_dim, h, w)
         return out
@@ -944,10 +998,10 @@ class SimpleCNN(nn.Module):
 def create_ocean_model(config: dict) -> nn.Module:
     """
     创建海洋预测模型的工厂函数
-    
+
     Args:
         config: 配置字典
-        
+
     Returns:
         配置好的海洋预测模型
     """
@@ -961,14 +1015,23 @@ def create_ocean_model(config: dict) -> nn.Module:
             return create_paper_reimplementation_model(config)
     except ImportError:
         pass
-    
-    if model_type.lower() == 'cnn':
+
+    normalized_type = str(model_type).lower()
+    if normalized_type == 'cnn':
         return SimpleCNN(config)
-    elif model_type.lower() in {'tsc_fusion', 'tscglobal', 'tsc_global_axiom_ensemble',
-                                'tsc-spectrum-axiom-ensemble', 'tsc_spectrum_axiom_ensemble'}:
-        return TSCGlobalAxiomEnsembleNet(config)
-    else:
+    if normalized_type in {'tsc_fusion', 'tscglobal', 'tsc_global_axiom_ensemble',
+                            'tsc-spectrum-axiom-ensemble', 'tsc_spectrum_axiom_ensemble'}:
+        return TSCFusionNet(config)
+    if normalized_type == 'convlstm':
         return OceanConvLSTMPredictor(config)
+    raise ValueError(f'未知 model_type: {model_type!r}；拒绝静默回退到 ConvLSTM')
+
+
+# Backward-compatible import aliases. They do not imply equivalence to any
+# external named model; formal reports use the generic TSCFusionNet name.
+GlobalSpectralBranch = LowModeSpectralBranch
+Axiom3DStructureBranch = SpatiotemporalStructureBranch
+TSCGlobalAxiomEnsembleNet = TSCFusionNet
 
 
 # 默认配置
@@ -991,20 +1054,20 @@ if __name__ == "__main__":
     # 测试模型
     config = DEFAULT_CONFIG.copy()
     model = create_ocean_model(config)
-    
+
     # 创建测试数据
     batch_size = 2
     seq_len = 10
     # channels = len(config['input_variables'])
     # 根据模型初始化逻辑，输入维度应该是 input_variables * assumed_depth_levels
-    channels = model.input_dim 
+    channels = model.input_dim
     height, width = 32, 21  # 根据数据描述的经纬度范围计算
-    
+
     test_input = torch.randn(batch_size, seq_len, channels, height, width)
-    
+
     print(f"模型配置: {config}")
     print(f"输入形状: {test_input.shape}")
-    
+
     # 前向传播测试
     output = model(test_input)
     print(f"输出形状: {output.shape}")
