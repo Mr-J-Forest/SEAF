@@ -32,6 +32,7 @@ Thumbs.db
 
 # --- Project data (large raw datasets) ---
 Data/*.nc
+Data/oras5/
 
 # --- Output predictions & logs ---
 outputs/

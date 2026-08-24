@@ -192,6 +192,31 @@ def audit_mask_stability(dataset: xr.Dataset, variables: list[str], reference: n
     return report
 
 
+def ocean_reference_mask(dataset: xr.Dataset, config: dict) -> tuple[np.ndarray, float]:
+    """Return the finite-water mask used by the training window selector."""
+    variable = config.get(
+        'ocean_mask_variable',
+        config.get('target_variables', ['TEMP'])[0],
+    )
+    if variable not in dataset.data_vars:
+        raise KeyError(f'海洋窗口参考变量不存在: {variable}')
+    reference = dataset[variable]
+    if 'TIME' in reference.dims:
+        reference = reference.isel(TIME=0)
+    if 'LEVEL' not in reference.dims:
+        return np.isfinite(np.asarray(reference.values)), float('nan')
+
+    requested_depth = config.get('ocean_coverage_depth')
+    if requested_depth is None:
+        selected = reference.isel(LEVEL=0)
+    else:
+        selected = reference.sel(LEVEL=float(requested_depth), method='nearest')
+    return (
+        np.isfinite(np.asarray(selected.values)),
+        float(selected.LEVEL.values),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='configs/experiments/full.json')
@@ -217,9 +242,10 @@ def main() -> int:
         lats = np.asarray(dataset.LATITUDE.values, dtype=np.float64)
         levels = np.asarray(dataset.LEVEL.values, dtype=np.float64)
         times = np.asarray(dataset.TIME.values)
-        reference_mask = np.isfinite(
+        surface_mask = np.isfinite(
             np.asarray(dataset['TEMP'].isel(TIME=0, LEVEL=0).values)
         )
+        reference_mask, reference_depth = ocean_reference_mask(dataset, config)
 
         lon_span = float(config['lon_range'][1] - config['lon_range'][0])
         lat_span = float(config['lat_range'][1] - config['lat_range'][0])
@@ -266,7 +292,15 @@ def main() -> int:
             'variables': sorted(str(name) for name in dataset.data_vars),
             'configured_input_variables': list(config['input_variables']),
             'configured_target_variables': list(config['target_variables']),
-            'surface_ocean_fraction': float(reference_mask.mean()),
+            'surface_ocean_fraction': float(surface_mask.mean()),
+            'window_ocean_mask': {
+                'variable': config.get(
+                    'ocean_mask_variable', config['target_variables'][0]
+                ),
+                'requested_depth_m': config.get('ocean_coverage_depth'),
+                'selected_depth_m': reference_depth,
+                'finite_fraction': float(reference_mask.mean()),
+            },
             'mask_stability': mask_stability,
             'window_grids': {
                 'canonical_training_and_evaluation': canonical,

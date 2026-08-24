@@ -79,8 +79,8 @@ class OceanDataset(Dataset):
         # 分模式滑动步长
         self._resolve_stride(config)
 
-        # 实际可用的变量（根据NetCDF文件描述）
-        self.available_variables = ['TEMP', 'SALT', 'PTEMP', 'PDEN', 'ADDEP', 'SPICE', 'SSHA', 'UWND', 'VWND', 'SSW']
+        # 在 _load_data 中从 NetCDF 动态解析，允许 ORAS5 等数据源增加物理输入。
+        self.available_variables = []
         self.coord_variables = ['LONGITUDE', 'LATITUDE', 'LEVEL', 'TIME']
 
         # 加载和预处理数据
@@ -172,6 +172,16 @@ class OceanDataset(Dataset):
         # 使用xarray加载NetCDF文件
         self.dataset = xr.open_dataset(self.data_path)
 
+        missing_coords = [
+            name for name in self.coord_variables if name not in self.dataset.coords
+        ]
+        if missing_coords:
+            raise ValueError(
+                f'数据文件缺少标准坐标 {missing_coords}；'
+                '请先转换为 TIME/LEVEL/LATITUDE/LONGITUDE schema'
+            )
+        self.available_variables = list(self.dataset.data_vars)
+
         # 仅按深度切片，保留完整经纬度范围供2D滑动窗口使用
         self.dataset = self.dataset.sel(
             LEVEL=slice(self.depth_range[0], self.depth_range[1])
@@ -201,7 +211,7 @@ class OceanDataset(Dataset):
     _WINDOW_GRID_POLICY = 'regular_plus_terminal_anchor_v1'
     _CACHE_CONFIG_KEYS = frozenset({
         'lon_range', 'lat_range', 'depth_range',
-        'ocean_threshold',
+        'ocean_threshold', 'ocean_coverage_depth', 'ocean_mask_variable',
         'input_variables',
         'anomaly_variables', 'climatology_period',
         'include_climatology_features', 'climatology_feature_variables',
@@ -617,16 +627,29 @@ class OceanDataset(Dataset):
             region_data = dataset.sel(
                 LONGITUDE=slice(lon_range[0], lon_range[1]),
                 LATITUDE=slice(lat_range[0], lat_range[1]),
-                LEVEL=slice(0, 5.0)  # 只检查表层
             )
 
-            # 使用温度数据来判断海洋覆盖（有数据的地方认为是海洋）
-            if 'TEMP' in region_data.data_vars:
-                temp_data = region_data.TEMP.isel(TIME=0, LEVEL=0).values  # 第一个时间步的表层数据
+            mask_variable = self.config.get(
+                'ocean_mask_variable',
+                self.target_variables[0] if self.target_variables else 'TEMP',
+            )
+            if mask_variable in region_data.data_vars:
+                reference = region_data[mask_variable]
+                if 'TIME' in reference.dims:
+                    reference = reference.isel(TIME=0)
+                if 'LEVEL' in reference.dims:
+                    coverage_depth = self.config.get('ocean_coverage_depth')
+                    if coverage_depth is None:
+                        reference = reference.isel(LEVEL=0)
+                    else:
+                        reference = reference.sel(
+                            LEVEL=float(coverage_depth), method='nearest'
+                        )
+                reference_data = np.asarray(reference.values)
 
-                # 计算有效数据比例（非NaN的部分认为是海洋）
-                total_points = temp_data.size
-                valid_points = np.sum(~np.isnan(temp_data))
+                # 有限值表示该参考深度上确有海水；不能忽略 NaN 后再求平均。
+                total_points = reference_data.size
+                valid_points = np.sum(np.isfinite(reference_data))
                 ocean_ratio = valid_points / total_points if total_points > 0 else 0
 
                 return ocean_ratio >= self.ocean_threshold

@@ -44,6 +44,9 @@ DATA_CONFIG = {
     # 数据增强 — 2D 滑动窗口采集100%海洋区域
     'sliding_enabled': True,       # 是否启用2D滑动窗口（经纬度双向滑动）
     'ocean_threshold': 1.0,        # 海洋面积占比阈值（1.0 = 仅保留100%海洋窗口）
+    # None 使用表层判断；设置为深度（米）时要求该深度层也满足海洋覆盖率。
+    # ORAS5 0-1000 m 实验用 1000，避免把海底以下的填充值当作可预测海水。
+    'ocean_coverage_depth': None,
     'lon_step': 2.0,              # 经纬度滑动步长（兜底默认值，优先使用分模式步长）
 
     # 分模式滑动步长（支持经纬度分别设置）
@@ -107,6 +110,8 @@ MODEL_CONFIG = {
     'tsc_fusion_transformer_ffn_dim': 256,
     'tsc_fusion_persistence_init': 0.5,
     'enable_persistence_residual': True,
+    # learned_scale 保留历史行为；fixed_identity 在 anomaly 空间提供严格 AP skip。
+    'persistence_residual_mode': 'learned_scale',
     'enable_global_token_bank': True,
     # time_group 要求训练/验证/测试时一个 batch 覆盖同一起报时次的全部窗口。
     # 密集全图推理使用两阶段外部 bank，可在不改变结果的前提下 micro-batch。
@@ -260,6 +265,9 @@ def validate_config(config):
     ocean_threshold = float(config.get('ocean_threshold', 1.0))
     if not 0.0 <= ocean_threshold <= 1.0:
         errors.append("ocean_threshold 必须位于[0, 1]")
+    ocean_coverage_depth = config.get('ocean_coverage_depth')
+    if ocean_coverage_depth is not None and float(ocean_coverage_depth) < 0:
+        errors.append("ocean_coverage_depth 必须为非负深度或 None")
     for key in (
         'train_stride_lon', 'train_stride_lat', 'val_stride_lon', 'val_stride_lat',
         'test_stride_lon', 'test_stride_lat', 'inference_stride_lon', 'inference_stride_lat'
@@ -351,6 +359,23 @@ def validate_config(config):
             )
         ):
             errors.append("启用 persistence residual 时 target_variables 必须是 input_variables 的子集")
+        persistence_mode = config.get('persistence_residual_mode', 'learned_scale')
+        if persistence_mode not in {'learned_scale', 'fixed_identity'}:
+            errors.append(
+                "persistence_residual_mode 必须为 learned_scale 或 fixed_identity"
+            )
+        if (
+            config.get('enable_persistence_residual', True)
+            and persistence_mode == 'fixed_identity'
+        ):
+            if not config.get('enable_climatology_anomaly', False):
+                errors.append("fixed_identity persistence 要求启用 climatology anomaly")
+            elif not set(config.get('target_variables', [])).issubset(
+                set(config.get('anomaly_variables', []))
+            ):
+                errors.append(
+                    "fixed_identity persistence 要求所有 target_variables 都属于 anomaly_variables"
+                )
         if config.get('tsc_fusion_hidden_dim', 0) <= 0:
             errors.append("tsc_fusion_hidden_dim 必须为正")
         spectral_modes = config.get('tsc_fusion_spectral_modes', [8, 8])

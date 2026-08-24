@@ -9,6 +9,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+import xarray as xr
 from sklearn.preprocessing import StandardScaler
 
 from config import DEFAULT_CONFIG, load_config, validate_config
@@ -552,6 +553,55 @@ class PipelineIntegrityTests(unittest.TestCase):
         no_persistence = create_ocean_model(no_persistence_config)
         self.assertEqual(no_persistence.persistence_slices, [])
         self.assertIsNone(no_persistence.persistence_scale)
+
+    def test_fixed_identity_persistence_starts_exactly_at_anomaly_persistence(self):
+        config = self._small_tsc_config()
+        config.update({
+            'actual_output_channels': 4,
+            'target_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
+            'persistence_residual_mode': 'fixed_identity',
+            'enable_climatology_anomaly': True,
+            'anomaly_variables': ['TEMP', 'SALT'],
+        })
+        model = create_ocean_model(config).eval()
+        inputs = torch.randn(2, 3, 8, 4, 5)
+
+        with torch.no_grad():
+            outputs = model(inputs)
+
+        expected = inputs[:, -1, :4].unsqueeze(1).expand(-1, 2, -1, -1, -1)
+        torch.testing.assert_close(outputs, expected, rtol=0, atol=0)
+        self.assertIsNone(model.persistence_proj)
+        self.assertFalse(model.persistence_scale.requires_grad)
+        self.assertEqual(float(model.persistence_scale), 1.0)
+
+    def test_ocean_window_can_require_a_full_water_column(self):
+        values = np.ones((1, 2, 2, 2), dtype=np.float32)
+        values[0, 1, 0, 0] = np.nan
+        source = xr.Dataset(
+            {'TEMP': (('TIME', 'LEVEL', 'LATITUDE', 'LONGITUDE'), values)},
+            coords={
+                'TIME': [200001],
+                'LEVEL': [0.0, 1000.0],
+                'LATITUDE': [0.0, 1.0],
+                'LONGITUDE': [10.0, 11.0],
+            },
+        )
+        dataset = OceanDataset.__new__(OceanDataset)
+        dataset.config = {
+            'ocean_mask_variable': 'TEMP',
+            'ocean_coverage_depth': 1000.0,
+        }
+        dataset.target_variables = ['TEMP']
+        dataset.ocean_threshold = 1.0
+
+        self.assertFalse(
+            dataset._check_ocean_coverage(source, [10.0, 11.0], [0.0, 1.0])
+        )
+        dataset.config['ocean_coverage_depth'] = None
+        self.assertTrue(
+            dataset._check_ocean_coverage(source, [10.0, 11.0], [0.0, 1.0])
+        )
 
     def test_climatology_is_independent_from_anomaly_training_switch(self):
         dataset = OceanDataset.__new__(OceanDataset)

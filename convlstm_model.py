@@ -661,6 +661,13 @@ class TSCFusionNet(nn.Module):
         )
 
         self.enable_persistence_residual = bool(config.get('enable_persistence_residual', True))
+        self.persistence_residual_mode = str(
+            config.get('persistence_residual_mode', 'learned_scale')
+        )
+        if self.persistence_residual_mode not in {'learned_scale', 'fixed_identity'}:
+            raise ValueError(
+                'persistence_residual_mode 必须为 learned_scale 或 fixed_identity'
+            )
         self.persistence_slices = (
             self._resolve_target_input_slices(config) if self.enable_persistence_residual else []
         )
@@ -671,13 +678,39 @@ class TSCFusionNet(nn.Module):
         persistence_channels = sum(stop - start for start, stop in self.persistence_slices)
         self.persistence_proj = None
         if persistence_channels > 0 and persistence_channels != self.output_dim:
-            self.persistence_proj = nn.Conv2d(persistence_channels, self.output_dim, kernel_size=1)
-        if self.enable_persistence_residual:
-            self.persistence_scale = nn.Parameter(
-                torch.tensor(float(config.get('tsc_fusion_persistence_init', 0.5)), dtype=torch.float32)
+            if self.persistence_residual_mode == 'fixed_identity':
+                raise ValueError(
+                    'fixed_identity persistence 要求输入目标通道与输出通道严格一致，'
+                    f'实际为 {persistence_channels} != {self.output_dim}'
+                )
+            self.persistence_proj = nn.Conv2d(
+                persistence_channels, self.output_dim, kernel_size=1
             )
+        if self.enable_persistence_residual:
+            if self.persistence_residual_mode == 'fixed_identity':
+                self.register_buffer(
+                    'persistence_scale', torch.tensor(1.0, dtype=torch.float32)
+                )
+                self._zero_initialize_residual_heads()
+            else:
+                self.persistence_scale = nn.Parameter(
+                    torch.tensor(
+                        float(config.get('tsc_fusion_persistence_init', 0.5)),
+                        dtype=torch.float32,
+                    )
+                )
         else:
             self.register_parameter('persistence_scale', None)
+
+    def _zero_initialize_residual_heads(self) -> None:
+        """Make the initial fixed-skip forecast exactly anomaly persistence."""
+        for head in self.member_heads:
+            output_layer = head[-1]
+            if not isinstance(output_layer, nn.Conv2d):
+                raise TypeError('TSC-Fusion residual head末层必须为 Conv2d')
+            nn.init.zeros_(output_layer.weight)
+            if output_layer.bias is not None:
+                nn.init.zeros_(output_layer.bias)
 
     def _resolve_target_input_slices(self, config: dict) -> List[Tuple[int, int]]:
         raw_slices = config.get('input_channel_slices', {})

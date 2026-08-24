@@ -4,6 +4,38 @@ TSC-Fusion 是一个面向海洋温度与盐度月尺度多步预报的研究代
 
 当前阶段以收集可复核证据为先。实验筛选、多随机种子确认和全域拼图尚未完成前，不应把任何旧表格、旧图片或单次运行写成论文结论。完整执行顺序见 [NEXT_STEPS_TSC_FUSION.md](NEXT_STEPS_TSC_FUSION.md)。
 
+## ORAS5 公开数据轨道
+
+项目提供 [ECMWF ORAS5](https://cds.climate.copernicus.eu/datasets/reanalysis-oras5?tab=overview) 的独立公开数据轨道。准备脚本读取 ICDC 发布的 1° 控制成员 `opa0`，并强制应用 ICDC 官方[修正版 land-sea mask](https://icdc.cen.uni-hamburg.de/thredds/fileServer/ftpthredds/EASYInit/oras5/r1x1/Correction_to_ORAS5_r1x1_files.pdf)。原始 r1x1 文件不能绕过这一步直接用于实验。
+
+先查看下载与磁盘估算，不写入数据：
+
+```bash
+python scripts/prepare_oras5.py --dry-run
+```
+
+准备完整的 1979–2014 数据：
+
+```bash
+python -u scripts/prepare_oras5.py
+```
+
+脚本逐年流式处理归档，默认不保留 tar.gz；中断后可从已经完成的变量×年份继续。输出为 `Data/oras5/ORAS5_197901_201412_1deg.nc`，包含 432 个月、20 个 0–1000 m 深度，以及 TEMP、SALT、UVEL、VVEL、SSHA、MLD、TAUX、TAUY、QNET、WFLUX。以 1979 年归档大小外推，完整下载约 15 GiB；浮点数据未压缩上界约 9 GiB，实际 NetCDF 会压缩。
+
+ORAS5 主实验使用 `configs/experiments/oras5_tsc_ap_residual.json`：1979–2006 train、2007–2010 validation、2011–2014 test；窗口在 1000 m 参考层要求 100% 有效海水，8° canonical 网格共有 76 个窗口。模型采用固定系数 1 的 anomaly-persistence skip，残差输出层零初始化，因此训练开始时严格等于 anomaly persistence，而不是可学习缩放的近似版本。
+
+```bash
+python scripts/audit_dataset_protocol.py \
+  --config configs/experiments/oras5_tsc_ap_residual.json \
+  --output outputs/evidence/oras5_dataset_protocol.json
+
+python -u train.py \
+  --config configs/experiments/oras5_smoke.json \
+  --note oras5_pipeline_smoke
+```
+
+同数据协议的基础对照配置为 `oras5_convlstm_baseline.json` 和 `oras5_cnn_baseline.json`。它们是本仓库实现的 sanity baselines，不应标成外部论文的官方复现。
+
 ## 已冻结的数据协议
 
 - 数据：`Data/FullData_preprocessed.nc`，121 个时步，实际时间标记为 `200901`–`201901`。
