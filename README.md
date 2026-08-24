@@ -36,6 +36,59 @@ python -u train.py \
 
 同数据协议的基础对照配置为 `oras5_convlstm_baseline.json` 和 `oras5_cnn_baseline.json`。它们是本仓库实现的 sanity baselines，不应标成外部论文的官方复现。
 
+### 近期公开架构基线
+
+正式的 ORAS5 对比另提供三套来自 2025 年
+[OceanForecastBench](https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench)
+公开基准的架构适配器：
+
+| 配置 | ORAS5 参数量 | 保留的核心机制 | ORAS5 任务适配 |
+|---|---:|---|---|
+| `oras5_ofb_fourcastnet_ap_residual.json` | 20.87M | FourCastNet 的 AFNO 频域块 | 12 个月多变量 patch stem + 5 lead residual head |
+| `oras5_ofb_climax_ap_residual.json` | 63.64M | ClimaX 的变量 tokenization、cross-attention 聚合和 ViT | 每个 ORAS5 变量/特征组单独编码 |
+| `oras5_ofb_swin_ap_residual.json` | 36.10M | Swin 的分层特征和 shifted-window attention | 两尺度 encoder-decoder + 5 lead residual head |
+
+三者都在本地 ORAS5 train split 从头训练，共享相同的输入、目标、气候态、标准化器和
+fixed anomaly-persistence skip；残差 head 均零初始化，所以初始预测逐元素严格等于 AP。
+它们是有明确源码 commit 和许可记录的 **architecture adapters**，不是官方权重，也不能把
+本项目得到的数值称为 OceanForecastBench 官方成绩。详细来源见各配置的
+`baseline_provenance` 和 `THIRD_PARTY_NOTICES.md`。
+
+验证并查看冻结的 4 模型队列：
+
+```bash
+python scripts/validate_experiment_matrix.py \
+  --matrix configs/oras5_recent_baseline_matrix.json
+
+python scripts/run_experiment_queue.py \
+  --matrix configs/oras5_recent_baseline_matrix.json \
+  --stage global_lr_calibrate \
+  --dry-run
+```
+
+先在服务器运行各模型独立的 validation-only 学习率网格：
+
+```bash
+nohup setsid .venv/bin/python -u scripts/run_experiment_queue.py \
+  --matrix configs/oras5_recent_baseline_matrix.json \
+  --stage global_lr_calibrate \
+  --campaign <training_source_hash>_oras5_recent_lr \
+  > run_logs/oras5_recent_lr.log 2>&1 < /dev/null &
+
+.venv/bin/python scripts/select_learning_rates.py \
+  --results-root outputs/results/campaigns/<training_source_hash>_oras5_recent_lr \
+  --stage global_lr_calibrate \
+  --matrix configs/oras5_recent_baseline_matrix.json
+```
+
+只有非边界最优学习率可以写回对应配置；若最优值位于网格边界，先补内部网格。随后提交、
+重新同步并用新 source hash 启动 `screen`，不能在看过 test 后回头调参。
+
+矩阵的 `screen` 只读 validation；`confirm_validation` 使用 3 个 seed。测试集条目只保留为
+`_final_test_template`，必须在模型与超参数冻结后显式转成 `final_test` 阶段。XiHe 官方发布物
+是针对 GLORYS12 日尺度固定层位的 ONNX 推理模型，FuXi-Ocean 当前公开论文也没有可直接
+重训的同协议代码，因此二者没有被伪装成 ORAS5 月尺度可训练基线。
+
 ## 已冻结的数据协议
 
 - 数据：`Data/FullData_preprocessed.nc`，121 个时步，实际时间标记为 `200901`–`201901`。

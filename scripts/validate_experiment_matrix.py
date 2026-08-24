@@ -111,6 +111,27 @@ def main() -> int:
                         "explicitly marked as non-official"
                     )
 
+            if str(config.get('model_type', '')).lower() in {
+                'ofb_fourcastnet', 'ofb-fourcastnet',
+                'ofb_climax', 'ofb-climax',
+                'ofb_swin', 'ofb-swin',
+            }:
+                provenance = config.get('baseline_provenance', {})
+                if not isinstance(provenance, dict):
+                    errors.append(
+                        f"{stage}/{job['name']}: baseline_provenance must be an object"
+                    )
+                elif (
+                    provenance.get('kind') != 'benchmark_architecture_adapter'
+                    or provenance.get('official_code') is not False
+                    or not provenance.get('method_name')
+                    or not provenance.get('source_commit')
+                ):
+                    errors.append(
+                        f"{stage}/{job['name']}: OceanForecastBench adapter provenance "
+                        "must identify the method/source and remain explicitly non-official"
+                    )
+
             if (
                 config.get('enable_global_token_bank', False)
                 and config.get('global_token_bank_scope') == 'time_group'
@@ -152,8 +173,15 @@ def main() -> int:
     if duplicate_run_ids:
         errors.append(f'duplicate run ids: {duplicate_run_ids}')
 
-    contrast_path = (PROJECT_ROOT / args.contrasts).resolve()
-    contrasts = json.loads(contrast_path.read_text(encoding='utf-8'))
+    contrast_setting = matrix.get('_contrasts', args.contrasts)
+    contrast_path = (
+        (PROJECT_ROOT / contrast_setting).resolve()
+        if contrast_setting else None
+    )
+    contrasts = (
+        json.loads(contrast_path.read_text(encoding='utf-8'))
+        if contrast_path else {}
+    )
     contrast_names = [item['name'] for item in contrasts.get('contrasts', [])]
     duplicate_contrasts = sorted(
         name for name, count in Counter(contrast_names).items() if count > 1
@@ -176,13 +204,14 @@ def main() -> int:
                 errors.append(
                     f"contrast {contrast['name']}: {role} lacks targets {missing_variables}"
                 )
-    protocol = contrasts.get('protocol', {})
-    if int(protocol.get('moving_block_length', 0)) < int(DEFAULT_CONFIG['prediction_length']):
-        errors.append('moving_block_length must be at least prediction_length')
-    for key in ('screening_fdr', 'confirmation_fdr'):
-        value = float(protocol.get(key, 0.0))
-        if not 0.0 < value < 1.0:
-            errors.append(f'{key} must be in (0, 1)')
+    if contrasts:
+        protocol = contrasts.get('protocol', {})
+        if int(protocol.get('moving_block_length', 0)) < int(DEFAULT_CONFIG['prediction_length']):
+            errors.append('moving_block_length must be at least prediction_length')
+        for key in ('screening_fdr', 'confirmation_fdr'):
+            value = float(protocol.get(key, 0.0))
+            if not 0.0 < value < 1.0:
+                errors.append(f'{key} must be in (0, 1)')
 
     summary = {
         'matrix': str(matrix_path),

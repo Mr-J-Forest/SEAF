@@ -1,0 +1,39 @@
+{
+  "extends": "../datasets/oras5_icdc_1deg_1979_2014.json",
+  "model_type": "ofb_swin",
+  "enable_global_token_bank": false,
+  "group_batches_by_time": false,
+  "batch_size": 8,
+  "optimizer_type": "adamw",
+  "optimizer_betas": [0.9, 0.95],
+  "learning_rate": 0.00005,
+  "weight_decay": 0.00001,
+  "baseline_patch_size": 2,
+  "baseline_embed_dim": 192,
+  "baseline_depth": 22,
+  "baseline_mlp_ratio": 4.0,
+  "baseline_drop_rate": 0.1,
+  "baseline_attention_dropout": 0.0,
+  "baseline_drop_path_rate": 0.2,
+  "swin_depths": [2, 18, 2],
+  "swin_num_heads": [3, 6, 3],
+  "swin_window_size": 7,
+  "expected_parameter_count": 36099800,
+  "baseline_provenance": {
+    "kind": "benchmark_architecture_adapter",
+    "method_name": "SwinTransformer",
+    "benchmark": "OceanForecastBench (2025)",
+    "official_code": false,
+    "training": "from_scratch_on_oras5_ap_residual",
+    "source_repository": "https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench",
+    "source_commit": "3a53d973ebda9e27ec711cb1a831c1aa5d385032",
+    "source_path": "baselines/swintransformer/src/climax/swin_model.py",
+    "source_license": "MIT",
+    "adaptations": [
+      "a two-scale shifted-window encoder-decoder is used on temporal-channel patch tokens",
+      "the head jointly predicts five TEMP/SALT anomaly-evolution residuals",
+      "a fixed anomaly-persistence skip is added in standardized anomaly space",
+      "optimization uses the repository's common validation-only ReduceLROnPlateau protocol"
+    ]
+  }
+}

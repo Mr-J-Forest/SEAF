@@ -83,6 +83,36 @@ class PipelineIntegrityTests(unittest.TestCase):
                     outputs = model(inputs)
                 self.assertEqual(outputs.shape, (2, 2, 3, 4, 4))
 
+    def test_recent_oceanforecastbench_adapters_start_at_exact_anomaly_persistence(self):
+        for model_type in ('ofb_fourcastnet', 'ofb_climax', 'ofb_swin'):
+            with self.subTest(model_type=model_type):
+                config = self._small_recent_baseline_config(model_type)
+                validate_config(config)
+                model = create_ocean_model(config).eval()
+                inputs = torch.randn((2, 3, 8, 5, 7))
+                with torch.no_grad():
+                    outputs = model(inputs)
+                expected_current = torch.cat(
+                    (inputs[:, -1, 0:1], inputs[:, -1, 1:3]), dim=1
+                )
+                expected = expected_current.unsqueeze(1).expand(-1, 2, -1, -1, -1)
+                self.assertEqual(outputs.shape, (2, 2, 3, 5, 7))
+                torch.testing.assert_close(outputs, expected, rtol=0.0, atol=0.0)
+
+    def test_recent_baseline_residual_heads_receive_gradients(self):
+        for model_type in ('ofb_fourcastnet', 'ofb_climax', 'ofb_swin'):
+            with self.subTest(model_type=model_type):
+                model = create_ocean_model(
+                    self._small_recent_baseline_config(model_type)
+                ).train()
+                inputs = torch.randn((1, 3, 8, 5, 7))
+                target = torch.randn((1, 2, 3, 5, 7))
+                loss = torch.nn.functional.mse_loss(model(inputs), target)
+                loss.backward()
+                self.assertIsNotNone(model.head.weight.grad)
+                self.assertTrue(torch.isfinite(model.head.weight.grad).all())
+                self.assertGreater(float(model.head.weight.grad.abs().sum()), 0.0)
+
     def test_frozen_canonical_window_count_fails_on_data_protocol_drift(self):
         class DatasetStub:
             def __init__(self, count):
@@ -123,6 +153,42 @@ class PipelineIntegrityTests(unittest.TestCase):
             'global_token_bank_heads': 4,
             'global_token_bank_ffn_dim': 32,
             'dropout': 0.0,
+        })
+        return config
+
+    @classmethod
+    def _small_recent_baseline_config(cls, model_type):
+        config = cls._small_tsc_config()
+        config.update({
+            'model_type': model_type,
+            'input_variables': ['TEMP', 'SALT', 'FORCING'],
+            'target_variables': ['TEMP', 'SALT'],
+            'anomaly_variables': ['TEMP', 'SALT'],
+            'climatology_feature_variables': ['TEMP', 'SALT'],
+            'enable_climatology_anomaly': True,
+            'enable_persistence_residual': True,
+            'persistence_residual_mode': 'fixed_identity',
+            'input_channel_slices': {
+                'TEMP': [0, 1],
+                'SALT': [1, 3],
+                'FORCING': [3, 8],
+            },
+            'target_channel_slices': {'TEMP': [0, 1], 'SALT': [1, 3]},
+            'baseline_patch_size': 2,
+            'baseline_embed_dim': 16,
+            'baseline_depth': 2,
+            'baseline_num_heads': 4,
+            'baseline_mlp_ratio': 2.0,
+            'baseline_drop_rate': 0.0,
+            'baseline_attention_dropout': 0.0,
+            'baseline_drop_path_rate': 0.0,
+            'afno_num_blocks': 4,
+            'afno_sparsity_threshold': 0.01,
+            'afno_hard_thresholding_fraction': 1.0,
+            'swin_depths': [1, 1, 1],
+            'swin_num_heads': [2, 4, 2],
+            'swin_window_size': 2,
+            'optimizer_type': 'adamw',
         })
         return config
 
@@ -821,6 +887,56 @@ class PipelineIntegrityTests(unittest.TestCase):
             self.assertEqual(result['status'], 'incomplete')
             self.assertTrue(result['selections']['full']['requires_supplemental_calibration'])
             self.assertIn('boundary', result['errors'][0])
+
+    def test_learning_rate_selector_accepts_matrix_defined_model_grid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / 'global_lr_calibrate'
+            matrix_path = root / 'matrix.json'
+            rates = [('1e5', 1e-5, 1.2), ('3e5', 3e-5, 0.8), ('1e4', 1e-4, 1.1)]
+            matrix_path.write_text(json.dumps({
+                '_stage_overrides': {
+                    'global_lr_calibrate': {'post_training_evaluation': 'none'},
+                },
+                'global_lr_calibrate': [
+                    {
+                        'name': f'lr_adapter_{label}',
+                        'config': 'unused.json',
+                        'seeds': [42],
+                        'overrides': {'learning_rate': rate},
+                    }
+                    for label, rate, _ in rates
+                ],
+            }), encoding='utf-8')
+            for label, rate, loss in rates:
+                run_dir = stage / f'lr_adapter_{label}' / 'seed_42'
+                run_dir.mkdir(parents=True)
+                (run_dir / '_SUCCESS').write_text('done\n', encoding='utf-8')
+                (run_dir / 'config.json').write_text(
+                    json.dumps({'learning_rate': rate}), encoding='utf-8'
+                )
+                (run_dir / 'run_summary.json').write_text(json.dumps({
+                    'evaluation_scope': 'none',
+                    'validation_selection_losses': [loss, loss, loss],
+                    'training_source_hash': 'abc',
+                }), encoding='utf-8')
+
+            output = root / 'selection.json'
+            with mock.patch.object(sys, 'argv', [
+                'select_learning_rates.py',
+                '--results-root', str(root),
+                '--matrix', str(matrix_path),
+                '--output', str(output),
+            ]):
+                self.assertEqual(select_learning_rates.main(), 0)
+            result = json.loads(output.read_text(encoding='utf-8'))
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(
+                result['selections']['adapter']['selected_learning_rate'], 3e-5
+            )
+            self.assertFalse(
+                result['selections']['adapter']['requires_supplemental_calibration']
+            )
 
     def test_stage_overrides_are_frozen_into_expanded_jobs(self):
         matrix = {

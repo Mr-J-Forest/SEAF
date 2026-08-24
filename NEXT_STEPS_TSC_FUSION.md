@@ -149,7 +149,7 @@ SHA-256: ee0bd5e9d97a69a0cca8a189914aea274d4f99eef61b3feabacdf27c2cc61206
 |---|---|---|---|
 | `classical_baselines` | persistence、climatology、anomaly-persistence | 已由同一训练期统计量构造 | 无训练下界和 skill 参照 |
 | `in_repo_baselines` | CNN、ConvLSTM | 已进入主矩阵 | 与 TSC-Fusion 使用同一数据协议重训的通用基线 |
-| `official_code_adapted_baselines` | PredFormer、OceanForecastBench-SwinTransformer、OceanForecastBench-FourCastNet；SimVPv2/gSTA 为可选项 | **待接入、尚未进入可运行矩阵** | `adapted from the official implementation and retrained under our protocol`；主表候选 |
+| `benchmark_architecture_adapters` | OceanForecastBench-FourCastNet、ClimaX、SwinTransformer | 已进入独立 ORAS5 可运行矩阵 | 基于公开核心架构、在 ORAS5 AP-residual 协议从头重训；必须标成非官方 architecture adapter |
 | `paper_reimplementation_baselines` | TianHai、FuXi-Ocean、FuXi-ONS、AxiomOcean | 已配置独立 LR、单 seed 和多 seed 阶段 | 只能称 paper-level reimplementation / paper-inspired proxy，不能称作者官方模型 |
 | `official_native_protocol_references` | ORCA-DL、NeuralOM、WenHai、XiHe | 有作者代码或权重，但协议不兼容 | 单独外部参考表或定性案例；不得与本项目主表数值直接排名 |
 
@@ -157,12 +157,12 @@ SHA-256: ee0bd5e9d97a69a0cca8a189914aea274d4f99eef61b3feabacdf27c2cc61206
 
 按与当前月尺度 12→5 联合温盐任务的适配难度、架构互补性和单卡 RTX 5090 可执行性，冻结以下优先级。该优先级必须在查看最终 test 结果前确定，不能根据谁的测试成绩更好再选择基线。
 
-1. **PredFormer**：纯时空 Transformer，作者仓库提供 WeatherBench 配置和单 GPU 脚本；改成 12 帧输入、5 帧输出和本项目联合温盐通道。来源：[论文/官方代码](https://github.com/yyyujintang/predformer)。
-2. **OceanForecastBench-SwinTransformer**：来自最新的海洋预测开放基准，适合提供层级窗口注意力路线；替换数据入口、通道映射和输出头后，在本项目协议下从头重训。来源：[JGR: Machine Learning and Computation 2026](https://agupubs.onlinelibrary.wiley.com/toc/29935210/2026/3/4)、[官方代码与权重](https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench)。
-3. **OceanForecastBench-FourCastNet**：提供与局地卷积/注意力不同的 AFNO 频域路线；先做滑窗边界、空间尺寸和显存 smoke，确认窗口内 Fourier 周期假设不会因实现错误产生额外劣势，再进入训练。来源：[论文](https://arxiv.org/abs/2511.18732)、[官方实现](https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench)。
-4. **SimVPv2/gSTA（可选）**：若前三项完成后仍需要一个轻量、非循环时空预测基线，再从 OpenSTL 接入；不为扩大表格而同时加入大量相似模型。来源：[OpenSTL（NeurIPS 2023 Datasets and Benchmarks）](https://github.com/chengtan9907/OpenSTL)。
+1. **OceanForecastBench-FourCastNet**：AFNO 频域路线，正式 ORAS5 配置为 20.87M 参数。来源：[论文](https://arxiv.org/abs/2511.18732)、[公开实现](https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench)。
+2. **OceanForecastBench-ClimaX**：变量 tokenization、cross-attention 聚合和 ViT 路线，正式 ORAS5 配置为 63.64M 参数。来源：[ClimaX 官方实现](https://github.com/microsoft/ClimaX)、[OceanForecastBench 适配](https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench)。
+3. **OceanForecastBench-SwinTransformer**：层级 shifted-window attention 路线，正式 ORAS5 配置为 36.10M 参数。来源：[Swin 官方实现](https://github.com/microsoft/Swin-Transformer)、[OceanForecastBench 适配](https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench)。
+4. **PredFormer / SimVPv2（可选）**：只有前三项完成 screen 后仍缺少纯时空轻量对照时再接入；不能为扩大表格临时增加模型。
 
-OFB-ResNet 与现有 CNN 信息重叠较大，ClimaX 的预期训练成本更高，第一轮不列为必做。正式必做集合为 **PredFormer + OFB-SwinTransformer + OFB-FourCastNet**；SimVPv2/gSTA 仅作为预先声明的可选第四项。
+三项已冻结在 `configs/oras5_recent_baseline_matrix.json`。输入/输出 stem 按 12→5 ORAS5 任务适配，核心 AFNO、变量聚合和 shifted-window 机制保留；所有配置均记录源码 commit、许可和必要修改，并明确 `official_code=false`。OFB-ResNet 与现有 CNN 信息重叠，不再重复加入。
 
 #### 官方代码适配的公平性规则
 
@@ -170,13 +170,13 @@ OFB-ResNet 与现有 CNN 信息重叠较大，ClimaX 的预期训练成本更高
 - 官方预训练权重若因日/月尺度、网格、深度或通道不同而不兼容，只使用其架构和作者训练代码；若使用任何迁移初始化，必须另立实验并明确标注，不能与从头训练结果混合。
 - 每个外部实现固定仓库 URL、commit SHA/tag、许可证、原始配置、适配补丁、参数量和环境；没有明确许可证时不能直接复制代码进仓库，须先确认授权方式。
 - 适配只允许数据接口、输入/输出头、空间尺寸和训练框架所必需的修改；核心模块发生实质变化时降级为 `paper_reimplementation`，不得继续称为官方代码适配。
-- 三个必做模型先分别通过 shape、forward/backward、NaN、峰值显存、保存/恢复和一个 validation batch 的 smoke，再为每个模型族独立做同一预声明 LR 网格的校准。
+- 三个必做模型先分别通过 shape、forward/backward、NaN、峰值显存、保存/恢复和一个 validation batch 的 smoke，再为每个模型族运行各自预声明、围绕公开默认值的三点 LR 网格。
 - 公平训练采用相同的最大 epoch、early-stop 信息边界和 seeds；可保留作者推荐的优化器或正则，但差异必须预先写入配置和报告。若要做严格架构对照，再补一组统一优化器/损失，而不是训练后选择更好的一种口径。
 - 主结果至少报告 3 seeds，并同时给出 TEMP/SALT、5 个 lead、20 个深度、参数量、峰值显存和 wall time；单 seed 只用于 smoke 和筛选。
 
 #### 有权重但只能按原生协议参考的模型
 
-- **ORCA-DL**（Science Advances 2025）是最接近当前月尺度、约 1° 任务的外部模型，作者提供权重和推理程序，官方报告单卡测试约需 12 GB 显存。但其输入需要三维海流 `u/v`、SSH、温盐及风应力，而当前数据没有海流变量，因此现阶段只能跑作者样例或单列 native-protocol 结果，不能进入公平主表。来源：[论文](https://www.science.org/doi/full/10.1126/sciadv.adu2488)、[官方代码](https://github.com/OpenEarthLab/ORCA-DL)。
+- **ORCA-DL**（Science Advances 2025）是最接近当前月尺度、约 1° 任务的外部模型，作者提供权重和推理程序，官方报告单卡测试约需 12 GB 显存。ORAS5 轨道已有海流和风应力，但 ORCA-DL 的原生 16 层全球网格、CMIP 训练分布、GODAS 初始化、标准化统计和季节到年代际 rollout 与本项目 20 层区域 12→5 任务不同；官方训练还使用 4×A100 FSDP。因此只能单列 native-protocol 参考，不能把权重直接放入公平主表。来源：[论文](https://www.science.org/doi/full/10.1126/sciadv.adu2488)、[官方代码](https://github.com/OpenEarthLab/ORCA-DL)。
 - **NeuralOM**（AAAI 2026）有 MIT 许可证、训练代码和预训练资源，但它是全球 0.5° 日尺度、多通道 S2S 模型，完整数据资源也不适合当前 50 GB 临时盘。保留为后续外部验证，不作为当前必跑项。来源：[AAAI 论文](https://ojs.aaai.org/index.php/AAAI/article/view/38495)、[官方代码](https://github.com/YuanGao-YG/NeuralOM)。
 - **WenHai**（Nature Communications 2025）和 **XiHe** 有官方 ONNX 权重，但都是全球 1/12° 日尺度预测，需要海流以及更多大气/海洋变量；只允许出现在外部原生协议表中。来源：[WenHai 论文](https://www.nature.com/articles/s41467-025-57389-2)、[WenHai 代码](https://github.com/Cuiyingzhe/WenHai)、[XiHe 代码](https://github.com/Ocean-Intelligent-Forecasting/XiHe-GlobalOceanForecasting)。
 
@@ -275,12 +275,15 @@ mv -- "$TARGET" "$CACHE_ROOT/.quarantine/${KEY}.$(date +%Y%m%dT%H%M%S)"
 | `paper_reimplementation_lr_calibrate` | 4 个论文级模型 ×4 个 LR，共 16 个 | 8 | 不生成最终 split 报告，只使用 validation selection loss | 分别为 TianHai、FuXi-Ocean、FuXi-ONS、AxiomOcean 复现选择 LR |
 | `paper_reimplementation_baselines` | 4 个论文级复现，seed 42 | 30 | validation | 在同协议下做单 seed 可行性和初筛；不冒充官方结果 |
 | `paper_reimplementation_confirm_validation` | 预先冻结的论文级模型，3 seeds | 80 | validation | 获得论文级复现的多 seed 不确定性和资源统计 |
+| ORAS5 `global_lr_calibrate`（独立矩阵） | 4 个模型族 ×3 个预声明 LR，共 12 个 | 8 | 只使用 validation selection loss | 在读 test 前为每个架构选择非边界学习率 |
+| ORAS5 `screen`（独立矩阵） | TSC-Fusion + OFB-FourCastNet/ClimaX/Swin，共 4 个 | 30 | validation | 在统一 fixed-AP residual 任务上筛选近期公开架构 |
+| ORAS5 `confirm_validation`（独立矩阵） | 上述 4 个模型 ×3 seeds | 80 | validation | 报告参数量、资源与多 seed 的 AP skill 不确定性 |
 | `final_test` | 冻结后的 pruned、full 和必要基线，各 3 seeds | 与确认一致 | test，只运行一次 | 论文最终泛化结果；当前尚未启用该阶段 |
 | dense full-map | 代表 seed/checkpoint，3 个起报时刻 × lead 1/3/5 | 不训练 | 最终冻结 test 时刻 | 开阔海域空间结构、覆盖范围、拼接一致性 |
 
-所有训练作业在单张 GPU 上串行执行。共享正式设置为 `batch_size=151`、AMP 开启、`num_workers=0`、`persistent_workers=false`、`torch.compile=false`、按起报月份分组；full 才启用 time-group GTB，ConvLSTM/CNN 不启用 GTB。`screen` 用矩阵 stage override 固定为 30 epoch、scheduler patience 4、early-stop patience 10；`confirm_validation` 固定为最多 80 epoch、patience 8/25。LR 校准只覆盖 `3e-4、8e-4、1.5e-3、3e-3`，不能在不同模块间临时换搜索网格。
+所有训练作业在单张 GPU 上串行执行。旧数据轨道共享设置为 `batch_size=151`、AMP 开启、`num_workers=0`、`persistent_workers=false`、`torch.compile=false`、按起报月份分组；full 才启用 time-group GTB，ConvLSTM/CNN 不启用 GTB。ORAS5 轨道的 TSC-Fusion 使用完整 time-group `batch_size=76`，三个 OFB adapter 不使用 GTB、使用各自冻结配置中的 `batch_size=8`。两个矩阵的 `screen` 都固定为 30 epoch、scheduler patience 4、early-stop patience 10；`confirm_validation` 固定为最多 80 epoch、patience 8/25。不同轨道或模型族的学习率不能在查看 test 后临时改变。
 
-`official_code_adapted_baselines` 当前只是冻结计划，尚未实现模型适配，也尚未出现在 `configs/experiment_matrix.json`，因此不得在服务器上使用不存在的 stage 名称。完成 PredFormer、OFB-SwinTransformer 和 OFB-FourCastNet 的本地集成测试后，再一次性加入独立的 `official_code_adapted_smoke`、`official_code_adapted_lr_calibrate`、`official_code_adapted_baselines` 和 `official_code_adapted_confirm_validation`。其 epoch、LR 网格、seeds、validation/test 边界与论文级复现阶段对齐；最终 test 模板仍保持禁用，直到所有模型和协议冻结。
+OFB 三个 architecture adapter 已通过 shape、forward/backward、奇数空间尺寸和严格 AP 初值测试，运行入口是 `configs/oras5_recent_baseline_matrix.json`。它与旧数据轨道的 `configs/experiment_matrix.json` 完全分离；启动时必须同时传 `--matrix`，不得误用旧矩阵的同名 `screen`。最终 test 条目仍只以 `_final_test_template` 保存，直到模型、优化器和 validation 选择全部冻结。
 
 按当前 smoke 速度粗估，LR 校准约需 2–4 GPU 小时，30 个 screen 作业约需 10–15 GPU 小时；confirmation 的耗时取决于晋级候选数，不能预先把全部 30 个模型都跑 3 seeds。每阶段启动前至少确认 15GB 可用磁盘；阶段结束后先汇总 JSON，再决定保留哪些中间 checkpoint。时间估计只用于排程，不是结果，也不得据此提前裁剪模型。
 

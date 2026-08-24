@@ -1039,6 +1039,10 @@ def create_ocean_model(config: dict) -> nn.Module:
         配置好的海洋预测模型
     """
     model_type = config.get('model_type', 'convlstm')
+    from recent_baseline_models import create_recent_baseline, is_recent_baseline
+    if is_recent_baseline(str(model_type)):
+        return create_recent_baseline(config)
+
     try:
         from paper_reimplementation_models import (
             create_paper_reimplementation_model,

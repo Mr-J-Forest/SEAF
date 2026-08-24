@@ -331,6 +331,16 @@ class OceanModelTrainer:
 
         self.parameter_count = sum(p.numel() for p in self.model.parameters())
         print(f"模型参数数量: {self.parameter_count:,}")
+        expected_parameter_count = config.get('expected_parameter_count')
+        if (
+            expected_parameter_count is not None
+            and self.parameter_count != int(expected_parameter_count)
+        ):
+            raise RuntimeError(
+                "模型参数量偏离冻结协议："
+                f"actual={self.parameter_count:,}, "
+                f"expected={int(expected_parameter_count):,}"
+            )
 
         # 设置损失函数和优化器
         self.criterion = nn.MSELoss()
@@ -348,10 +358,21 @@ class OceanModelTrainer:
             name: float(raw_weights[name]) / weight_sum for name in self.target_variables
         }
 
-        self.optimizer = optim.Adam(
+        optimizer_type = str(config.get('optimizer_type', 'adam')).lower()
+        optimizer_class = optim.AdamW if optimizer_type == 'adamw' else optim.Adam
+        optimizer_betas = tuple(float(value) for value in config.get(
+            'optimizer_betas', [0.9, 0.999]
+        ))
+        self.optimizer = optimizer_class(
             self.model.parameters(),
             lr=config['learning_rate'],
-            weight_decay=config['weight_decay']
+            weight_decay=config['weight_decay'],
+            betas=optimizer_betas,
+        )
+        print(
+            f"优化器: {optimizer_class.__name__} "
+            f"(lr={config['learning_rate']:.3g}, weight_decay={config['weight_decay']:.3g}, "
+            f"betas={optimizer_betas})"
         )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
@@ -1423,7 +1444,8 @@ def main():
     # 验证配置
     validate_config(config)
 
-    print("海洋数据ConvLSTM模型训练")
+    model_type = str(config.get('model_type', 'convlstm')).lower()
+    print("海洋温盐预测模型训练")
     print("=" * 50)
     print("使用统一配置文件:")
     print(f"  数据路径: {config['data_path']}")
@@ -1435,16 +1457,34 @@ def main():
     print(f"  训练轮数: {config['epochs']}")
     print(f"  Dropout: {config['dropout']}")
     print("-" * 50)
-    print("TSC-Fusion 组件状态:")
+    print(f"模型类型: {model_type}")
     print(f"  [PosEncode] 位置编码: {'开启' if config.get('enable_positional_encoding', False) else '关闭'}")
     print(f"  [TimeEncode] 时间编码: {'开启' if config.get('enable_time_encoding', False) else '关闭'}")
-    print(f"  [TSC] 热盐结构记忆: {'关闭(消融)' if config.get('ablation_disable_tsc', False) else '开启'}")
-    print(f"  [Spectral] 全局频谱分支: {'关闭(消融)' if config.get('ablation_disable_spectral', False) else '开启'}")
-    print(f"  [3D] 三维结构分支: {'关闭(消融)' if config.get('ablation_disable_3d', False) else '开启'}")
-    print(f"  [Ensemble] 门控集成: {'关闭(消融)' if config.get('ablation_disable_ensemble', False) else '开启'}")
-    print(f"  [GTB] 跨窗口上下文: {'开启' if config.get('enable_global_token_bank', False) else '关闭'}")
-    print(f"  [FusionTransformer] 层数: {int(config.get('tsc_fusion_transformer_layers', 0))}")
+    if model_type in {
+        'tsc_fusion', 'tscglobal', 'tsc_global_axiom_ensemble',
+        'tsc-spectrum-axiom-ensemble', 'tsc_spectrum_axiom_ensemble',
+    }:
+        print("  TSC-Fusion 组件状态:")
+        print(f"    [TSC] 热盐结构记忆: {'关闭(消融)' if config.get('ablation_disable_tsc', False) else '开启'}")
+        print(f"    [Spectral] 全局频谱分支: {'关闭(消融)' if config.get('ablation_disable_spectral', False) else '开启'}")
+        print(f"    [3D] 三维结构分支: {'关闭(消融)' if config.get('ablation_disable_3d', False) else '开启'}")
+        print(f"    [Ensemble] 门控集成: {'关闭(消融)' if config.get('ablation_disable_ensemble', False) else '开启'}")
+        print(f"    [GTB] 跨窗口上下文: {'开启' if config.get('enable_global_token_bank', False) else '关闭'}")
+        print(f"    [FusionTransformer] 层数: {int(config.get('tsc_fusion_transformer_layers', 0))}")
+    elif model_type in {
+        'ofb_fourcastnet', 'ofb-fourcastnet',
+        'ofb_climax', 'ofb-climax',
+        'ofb_swin', 'ofb-swin',
+    }:
+        provenance = config.get('baseline_provenance', {})
+        print(
+            "  [Baseline] OceanForecastBench architecture adapter: "
+            f"{provenance.get('method_name', model_type)}"
+        )
+        print("  [Baseline] 本地 ORAS5 从头训练；不是官方权重或官方成绩")
     print(f"  [Persistence] 持久性残差: {'开启' if config.get('enable_persistence_residual', True) else '关闭'}")
+    if config.get('enable_persistence_residual', True):
+        print(f"  [Persistence] 模式: {config.get('persistence_residual_mode', 'learned_scale')}")
     print("=" * 50)
 
     training_note = args.note.strip()

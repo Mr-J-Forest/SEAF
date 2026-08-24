@@ -136,6 +136,8 @@ TRAINING_CONFIG = {
     'group_batches_by_time': True, # 将同一历史起点的不同窗口组织到同一batch，供Global Token Bank使用
     
     # 优化器参数
+    'optimizer_type': 'adam',      # 可选 adam / adamw；基线按公开协议显式覆盖
+    'optimizer_betas': [0.9, 0.999],
     'weight_decay': 1e-4,          # 权重衰减
     'grad_clip_norm': 1.0,         # 梯度裁剪
     
@@ -301,6 +303,9 @@ def validate_config(config):
             errors.append("expected_canonical_windows_per_origin 必须为正整数或 split 映射")
     if int(config.get('epochs', 0)) <= 0:
         errors.append("epochs 必须为正整数")
+    expected_parameter_count = config.get('expected_parameter_count')
+    if expected_parameter_count is not None and int(expected_parameter_count) <= 0:
+        errors.append("expected_parameter_count 必须为正整数或 None")
     if int(config.get('early_stopping_patience', 0)) <= 0:
         errors.append("early_stopping_patience 必须为正整数")
     if float(config.get('grad_clip_norm', 0)) <= 0:
@@ -328,10 +333,22 @@ def validate_config(config):
             errors.append("target_loss_weights 总和必须为正")
 
     normalized_model_type = str(config.get('model_type', '')).lower()
+    tsc_model_types = {
+        'tsc_fusion',
+        'tscglobal',
+        'tsc_global_axiom_ensemble',
+        'tsc-spectrum-axiom-ensemble',
+        'tsc_spectrum_axiom_ensemble',
+    }
+    recent_baseline_types = {
+        'ofb_fourcastnet', 'ofb-fourcastnet',
+        'ofb_climax', 'ofb-climax',
+        'ofb_swin', 'ofb-swin',
+    }
     supported_model_types = {
         'convlstm', 'cnn',
-        'tsc_fusion', 'tscglobal', 'tsc_global_axiom_ensemble',
-        'tsc-spectrum-axiom-ensemble', 'tsc_spectrum_axiom_ensemble',
+        *tsc_model_types,
+        *recent_baseline_types,
         'tianhai_paper', 'tianhai-reimpl',
         'fuxi_ocean_paper', 'fuxi-ocean-reimpl',
         'fuxi_ons_paper', 'fuxi-ons-reimpl',
@@ -339,19 +356,9 @@ def validate_config(config):
     }
     if normalized_model_type not in supported_model_types:
         errors.append(f"未知 model_type: {config.get('model_type')!r}")
-    if normalized_model_type in {
-        'tsc_fusion',
-        'tscglobal',
-        'tsc_global_axiom_ensemble',
-        'tsc-spectrum-axiom-ensemble',
-        'tsc_spectrum_axiom_ensemble'
-    }:
-        if not config.get('ablation_disable_tsc', False):
-            tsc_variables = list(config.get('tsc_variables', []))
-            if not tsc_variables:
-                errors.append("启用 ThermohalineMemory 时 tsc_variables 不能为空")
-            elif not set(tsc_variables).issubset(set(config.get('input_variables', []))):
-                errors.append("tsc_variables 必须是 input_variables 的子集")
+
+    persistence_model_types = tsc_model_types | recent_baseline_types
+    if normalized_model_type in persistence_model_types:
         if (
             config.get('enable_persistence_residual', True)
             and not set(config.get('target_variables', [])).issubset(
@@ -365,6 +372,12 @@ def validate_config(config):
                 "persistence_residual_mode 必须为 learned_scale 或 fixed_identity"
             )
         if (
+            normalized_model_type in recent_baseline_types
+            and config.get('enable_persistence_residual', True)
+            and persistence_mode != 'fixed_identity'
+        ):
+            errors.append("OceanForecastBench adapters 仅支持 fixed_identity persistence")
+        if (
             config.get('enable_persistence_residual', True)
             and persistence_mode == 'fixed_identity'
         ):
@@ -376,6 +389,76 @@ def validate_config(config):
                 errors.append(
                     "fixed_identity persistence 要求所有 target_variables 都属于 anomaly_variables"
                 )
+
+    if normalized_model_type in recent_baseline_types:
+        patch_size = int(config.get('baseline_patch_size', 0))
+        embed_dim = int(config.get('baseline_embed_dim', 0))
+        depth = int(config.get('baseline_depth', 0))
+        if patch_size <= 0:
+            errors.append("baseline_patch_size 必须为正")
+        if embed_dim <= 0 or embed_dim % 4 != 0:
+            errors.append("baseline_embed_dim 必须为正且能被4整除")
+        if normalized_model_type not in {'ofb_swin', 'ofb-swin'} and depth <= 0:
+            errors.append("baseline_depth 必须为正")
+        if float(config.get('baseline_mlp_ratio', 0)) <= 0:
+            errors.append("baseline_mlp_ratio 必须为正")
+        for key in ('baseline_drop_rate', 'baseline_attention_dropout',
+                    'baseline_drop_path_rate'):
+            value = float(config.get(key, 0.0))
+            if not 0.0 <= value < 1.0:
+                errors.append(f"{key} 必须位于[0, 1)")
+        if normalized_model_type in {'ofb_fourcastnet', 'ofb-fourcastnet'}:
+            blocks = int(config.get('afno_num_blocks', 0))
+            fraction = float(config.get('afno_hard_thresholding_fraction', 0.0))
+            if blocks <= 0 or embed_dim % max(1, blocks) != 0:
+                errors.append("afno_num_blocks 必须为正且整除 baseline_embed_dim")
+            if not 0.0 < fraction <= 1.0:
+                errors.append("afno_hard_thresholding_fraction 必须位于(0, 1]")
+        elif normalized_model_type in {'ofb_climax', 'ofb-climax'}:
+            heads = int(config.get('baseline_num_heads', 0))
+            if heads <= 0 or embed_dim % max(1, heads) != 0:
+                errors.append("baseline_num_heads 必须为正且整除 baseline_embed_dim")
+        else:
+            depths = config.get('swin_depths', [])
+            heads = config.get('swin_num_heads', [])
+            if (
+                not isinstance(depths, (list, tuple))
+                or len(depths) != 3
+                or any(int(value) <= 0 for value in depths)
+            ):
+                errors.append("swin_depths 必须包含3个正整数")
+            if (
+                not isinstance(heads, (list, tuple))
+                or len(heads) != 3
+                or any(int(value) <= 0 for value in heads)
+            ):
+                errors.append("swin_num_heads 必须包含3个正整数")
+            elif isinstance(depths, (list, tuple)) and len(depths) == 3 and (
+                embed_dim % int(heads[0]) != 0
+                or (2 * embed_dim) % int(heads[1]) != 0
+                or embed_dim % int(heads[2]) != 0
+            ):
+                errors.append("Swin 各 stage 通道数必须能被对应 heads 整除")
+            if int(config.get('swin_window_size', 0)) <= 1:
+                errors.append("swin_window_size 必须大于1")
+
+    if str(config.get('optimizer_type', 'adam')).lower() not in {'adam', 'adamw'}:
+        errors.append("optimizer_type 必须为 adam 或 adamw")
+    optimizer_betas = config.get('optimizer_betas', [0.9, 0.999])
+    if (
+        not isinstance(optimizer_betas, (list, tuple))
+        or len(optimizer_betas) != 2
+        or not all(0.0 <= float(value) < 1.0 for value in optimizer_betas)
+    ):
+        errors.append("optimizer_betas 必须包含两个位于[0, 1)的数")
+
+    if normalized_model_type in tsc_model_types:
+        if not config.get('ablation_disable_tsc', False):
+            tsc_variables = list(config.get('tsc_variables', []))
+            if not tsc_variables:
+                errors.append("启用 ThermohalineMemory 时 tsc_variables 不能为空")
+            elif not set(tsc_variables).issubset(set(config.get('input_variables', []))):
+                errors.append("tsc_variables 必须是 input_variables 的子集")
         if config.get('tsc_fusion_hidden_dim', 0) <= 0:
             errors.append("tsc_fusion_hidden_dim 必须为正")
         spectral_modes = config.get('tsc_fusion_spectral_modes', [8, 8])
