@@ -220,6 +220,115 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertEqual(dataset.target_channel_slices['TEMP'], slice(0, 2))
         self.assertEqual(dataset.target_channel_slices['SALT'], slice(2, 5))
 
+    def test_tendency_feature_is_causal_backward_difference(self):
+        source = np.asarray([0.0, 1.0, 4.0, 2.0], dtype=np.float32).reshape(4, 1, 1)
+
+        tendency = OceanDataset._build_tendency_feature(source)
+
+        np.testing.assert_array_equal(
+            tendency[:, 0, 0],
+            np.asarray([0.0, 1.0, 3.0, -2.0], dtype=np.float32),
+        )
+
+    def test_tendency_auxiliary_feature_uses_physical_values(self):
+        dataset = OceanDataset.__new__(OceanDataset)
+        dataset.include_tendency_features = True
+        dataset.tendency_feature_variables = ['TEMP']
+        dataset.config = {
+            'enable_positional_encoding': False,
+            'enable_time_encoding': False,
+        }
+        physical = np.asarray([0.0, 2.0, 5.0], dtype=np.float32).reshape(3, 1, 1)
+        scaler = StandardScaler().fit(
+            np.asarray([[0.0], [2.0], [3.0]], dtype=np.float32)
+        )
+        dataset.scalers = {'TENDENCY_TEMP': scaler}
+        dataset.lats = np.asarray([0.0], dtype=np.float32)
+        dataset.lons = np.asarray([0.0], dtype=np.float32)
+        region = {
+            'data': {'TEMP': physical},
+            'normalized_data': {'TEMP': np.full_like(physical, 99.0)},
+            'coords': {},
+        }
+
+        dataset._add_auxiliary_encodings(region)
+
+        expected = scaler.transform(
+            np.asarray([[0.0], [2.0], [3.0]], dtype=np.float32)
+        ).reshape(physical.shape)
+        np.testing.assert_allclose(region['normalized_data']['TENDENCY_TEMP'], expected)
+
+    def test_damped_anomaly_persistence_uses_train_only_lag_regression(self):
+        dataset = OceanDataset.__new__(OceanDataset)
+        anomaly = np.concatenate((
+            (2.0 * np.power(0.5, np.arange(6))).astype(np.float32),
+            np.asarray([100.0, -100.0], dtype=np.float32),
+        ))
+        raw = anomaly.reshape(8, 1, 1, 1)
+        dataset.times = np.arange(8)
+        dataset.time_period_indices = np.zeros(8, dtype=np.int64)
+        dataset.train_ratio = 0.75
+        dataset.sequence_length = 3
+        dataset.prediction_length = 2
+        dataset.target_variables = ['TEMP']
+        dataset.target_channel_slices = {'TEMP': slice(0, 1)}
+        dataset.enable_climatology_anomaly = True
+        dataset.anomaly_variables = {'TEMP'}
+        dataset.sequences = [(0, 0)]
+        dataset.all_regions_data = [{
+            'data': {'TEMP': raw},
+            'climatology': {'TEMP': np.zeros((1, 1, 1, 1), dtype=np.float32)},
+        }]
+
+        dataset._estimate_damped_persistence_coefficients()
+        forecasts = dataset.build_reference_forecasts(
+            sample_indices=[0], spaces=('physical',)
+        )['physical']
+
+        np.testing.assert_allclose(
+            dataset.damped_persistence_coefficients['TEMP'][:, 0],
+            [0.5, 0.25],
+            rtol=1e-6,
+        )
+        np.testing.assert_allclose(
+            forecasts['damped_anomaly_persistence'][0, :, 0, 0, 0],
+            [0.25, 0.125],
+            rtol=1e-6,
+        )
+        np.testing.assert_allclose(
+            forecasts['anomaly_persistence'][0, :, 0, 0, 0],
+            [0.5, 0.5],
+            rtol=1e-6,
+        )
+
+    def test_oras5_ablation_configs_validate(self):
+        experiment_dir = Path(__file__).resolve().parents[1] / 'configs' / 'experiments'
+        names = (
+            'oras5_tsc_ap_residual.json',
+            'oras5_ablation_no_ap_residual.json',
+            'oras5_ablation_direct_full_field.json',
+            'oras5_ablation_no_tendency.json',
+            'oras5_ablation_thermohaline_only.json',
+            'oras5_ablation_no_tsc.json',
+            'oras5_ablation_no_spectral.json',
+            'oras5_ablation_no_3d.json',
+            'oras5_ablation_no_ensemble.json',
+            'oras5_ablation_temp_only.json',
+            'oras5_ablation_salt_only.json',
+        )
+        for name in names:
+            with self.subTest(config=name):
+                config = DEFAULT_CONFIG.copy()
+                config.update(load_config(experiment_dir / name))
+                validate_config(config)
+
+        full = DEFAULT_CONFIG.copy()
+        full.update(load_config(experiment_dir / 'oras5_tsc_ap_residual.json'))
+        no_tendency = DEFAULT_CONFIG.copy()
+        no_tendency.update(load_config(experiment_dir / 'oras5_ablation_no_tendency.json'))
+        self.assertTrue(full['include_tendency_features'])
+        self.assertFalse(no_tendency['include_tendency_features'])
+
     def test_compact_auxiliary_features_broadcast_only_on_allowed_axes(self):
         spatial = np.arange(24, dtype=np.float32).reshape(1, 2, 3, 4)
         spatial_window = OceanDataset._slice_and_broadcast_input(
@@ -521,6 +630,27 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertAlmostEqual(by_variable['A'], 1.0)
         self.assertAlmostEqual(by_variable['B'], 4.0)
         self.assertEqual(grad_loss, 0.0)
+
+    def test_single_target_validation_progress_uses_selection_loss(self):
+        trainer = OceanModelTrainer.__new__(OceanModelTrainer)
+        trainer.model = torch.nn.Identity()
+        trainer.forward_model = trainer.model
+        inputs = torch.zeros((1, 1, 1, 2, 2))
+        trainer.val_loader = [(inputs, inputs.clone())]
+        trainer.device = torch.device('cpu')
+        trainer.amp_enabled = False
+        trainer.compile_active = False
+        trainer.epoch = 0
+        trainer.target_variables = ['TEMP']
+        trainer.target_channel_slices = {'TEMP': slice(0, 1)}
+        trainer.target_loss_weights = {'TEMP': 1.0}
+        trainer.criterion = torch.nn.MSELoss()
+        trainer.config = {'use_gradient_loss': False}
+        trainer.writer = mock.Mock()
+
+        loss = trainer.validate_epoch()
+
+        self.assertEqual(loss, 0.0)
 
     def test_data_protocol_is_built_from_all_three_loaders(self):
         def dataset(mode, sequences):

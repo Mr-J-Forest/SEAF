@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_tsc_ap_residual.json",
+  "target_variables": ["TEMP"],
+  "target_loss_weights": {"TEMP": 1.0}
+}

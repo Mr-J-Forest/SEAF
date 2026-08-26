@@ -22,7 +22,7 @@ python -u scripts/prepare_oras5.py
 
 脚本逐年流式处理归档，默认不保留 tar.gz；中断后可从已经完成的变量×年份继续。输出为 `Data/oras5/ORAS5_197901_201412_1deg.nc`，包含 432 个月、20 个 0–1000 m 深度，以及 TEMP、SALT、UVEL、VVEL、SSHA、MLD、TAUX、TAUY、QNET、WFLUX。以 1979 年归档大小外推，完整下载约 15 GiB；浮点数据未压缩上界约 9 GiB，实际 NetCDF 会压缩。
 
-ORAS5 主实验使用 `configs/experiments/oras5_tsc_ap_residual.json`：1979–2006 train、2007–2010 validation、2011–2014 test；窗口在 1000 m 参考层要求 100% 有效海水，8° canonical 网格共有 76 个窗口。模型采用固定系数 1 的 anomaly-persistence skip，残差输出层零初始化，因此训练开始时严格等于 anomaly persistence，而不是可学习缩放的近似版本。
+ORAS5 主实验使用 `configs/experiments/oras5_tsc_ap_residual.json`：1979–2006 train、2007–2010 validation、2011–2014 test；窗口在 1000 m 参考层要求 100% 有效海水，8° canonical 网格共有 76 个窗口。模型采用固定系数 1 的 anomaly-persistence skip，残差输出层零初始化，因此训练开始时严格等于 anomaly persistence，而不是可学习缩放的近似版本。输入额外包含 TEMP/SALT 物理量的因果一步后向差分；tendency 使用独立的训练期 scaler，第一个时间步固定为零，不读取未来值。
 
 ```bash
 python scripts/audit_dataset_protocol.py \
@@ -36,6 +36,30 @@ python -u train.py \
 
 同数据协议的基础对照配置为 `oras5_convlstm_baseline.json` 和 `oras5_cnn_baseline.json`。它们是本仓库实现的 sanity baselines，不应标成外部论文的官方复现。
 
+每次 ORAS5 评估都会同时构造 Climatology、Persistence、Anomaly Persistence 和 Damped Anomaly Persistence。Damped AP 的系数只用 1979–2006 训练段估计，按目标变量、lead 和深度分别做 pooled lag regression，并限制在 `[0, 1]`；验证/测试数据不参与系数估计。
+
+### ORAS5 消融实验
+
+冻结消融矩阵为 `configs/oras5_ablation_matrix.json`，覆盖 AP residual、anomaly 目标、显式 tendency、外部动力/表面输入、TSC Memory、Spectral、3D 时空分支、Ensemble gate，以及 TEMP/SALT 联合训练。所有结构消融共享完整模型的冻结超参数，不为每个消融单独挑学习率。
+
+```bash
+python scripts/validate_experiment_matrix.py \
+  --matrix configs/oras5_ablation_matrix.json
+
+python scripts/run_experiment_queue.py \
+  --matrix configs/oras5_ablation_matrix.json \
+  --stage screen \
+  --dry-run
+
+python scripts/compare_ablation_contrasts.py \
+  --results-root outputs/results/campaigns/<training_source_hash>_oras5_ablation \
+  --stage screen \
+  --contrasts configs/oras5_ablation_contrasts.json \
+  --strict
+```
+
+`screen` 为 11 个单 seed、30 epoch 的 validation-only 任务；`confirm_validation` 将相同 11 个配置扩展到 3 个 seed、80 epoch。消融矩阵没有 test 阶段。
+
 ### 近期公开架构基线
 
 正式的 ORAS5 对比另提供三套来自 2025 年
@@ -44,9 +68,9 @@ python -u train.py \
 
 | 配置 | ORAS5 参数量 | 保留的核心机制 | ORAS5 任务适配 |
 |---|---:|---|---|
-| `oras5_ofb_fourcastnet_ap_residual.json` | 20.87M | FourCastNet 的 AFNO 频域块 | 12 个月多变量 patch stem + 5 lead residual head |
-| `oras5_ofb_climax_ap_residual.json` | 63.64M | ClimaX 的变量 tokenization、cross-attention 聚合和 ViT | 每个 ORAS5 变量/特征组单独编码 |
-| `oras5_ofb_swin_ap_residual.json` | 36.10M | Swin 的分层特征和 shifted-window attention | 两尺度 encoder-decoder + 5 lead residual head |
+| `oras5_ofb_fourcastnet_ap_residual.json` | 21.67M | FourCastNet 的 AFNO 频域块 | 12 个月多变量 patch stem + 5 lead residual head |
+| `oras5_ofb_climax_ap_residual.json` | 65.61M | ClimaX 的变量 tokenization、cross-attention 聚合和 ViT | 每个 ORAS5 变量/特征组单独编码 |
+| `oras5_ofb_swin_ap_residual.json` | 36.47M | Swin 的分层特征和 shifted-window attention | 两尺度 encoder-decoder + 5 lead residual head |
 
 三者都在本地 ORAS5 train split 从头训练，共享相同的输入、目标、气候态、标准化器和
 fixed anomaly-persistence skip；残差 head 均零初始化，所以初始预测逐元素严格等于 AP。

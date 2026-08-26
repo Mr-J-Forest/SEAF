@@ -77,6 +77,9 @@ DATA_CONFIG = {
     'include_climatology_features': True,        # 将目标变量气候态作为额外输入通道
     'climatology_feature_variables': ['TEMP', 'SALT'],
     'climatology_baseline_variables': ['TEMP', 'SALT'],
+    # 显式物理量后向差分只使用当前及过去观测，并使用独立训练期 scaler。
+    'include_tendency_features': False,
+    'tendency_feature_variables': ['TEMP', 'SALT'],
 
     # 预处理持久化缓存（避免每次训练重复滑窗搜索、气候态计算、标准化拟合）
     'cache_preprocessed': True,                  # 是否启用预处理缓存
@@ -263,6 +266,13 @@ def validate_config(config):
             errors.append("启用 include_climatology_features 时 climatology_feature_variables 不能为空")
         elif not set(feature_variables).issubset(set(config.get('input_variables', []))):
             errors.append("climatology_feature_variables 必须是 input_variables 的子集")
+
+    if config.get('include_tendency_features', False):
+        tendency_variables = config.get('tendency_feature_variables', [])
+        if not isinstance(tendency_variables, (list, tuple)) or not tendency_variables:
+            errors.append("启用 include_tendency_features 时 tendency_feature_variables 不能为空")
+        elif not set(tendency_variables).issubset(set(config.get('input_variables', []))):
+            errors.append("tendency_feature_variables 必须是 input_variables 的子集")
 
     ocean_threshold = float(config.get('ocean_threshold', 1.0))
     if not 0.0 <= ocean_threshold <= 1.0:

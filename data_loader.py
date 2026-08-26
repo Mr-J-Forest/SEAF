@@ -58,6 +58,13 @@ class OceanDataset(Dataset):
         self.climatology_feature_variables = list(
             config.get('climatology_feature_variables', self.target_variables)
         )
+        self.include_tendency_features = bool(
+            config.get('include_tendency_features', False)
+        )
+        self.tendency_feature_variables = list(
+            config.get('tendency_feature_variables', self.target_variables)
+        )
+        self.damped_persistence_coefficients = {}
         self.return_sample_index = bool(config.get('return_sample_index', False))
         # 数据范围设置（优先使用配置中的范围）
         self.lon_range = list(config.get('lon_range', [130.5, 162.5]))
@@ -205,9 +212,9 @@ class OceanDataset(Dataset):
 
     # ========== 预处理缓存持久化 ==========
 
-    # v5 introduced terminal anchors; v6 also shares mode-independent payloads
-    # across validation/test when every preprocessing semantic is identical.
-    _CACHE_FORMAT_VERSION = 6
+    # v5 introduced terminal anchors; v6 shares mode-independent payloads;
+    # v7 adds train-scaled causal physical tendency features.
+    _CACHE_FORMAT_VERSION = 7
     _WINDOW_GRID_POLICY = 'regular_plus_terminal_anchor_v1'
     _CACHE_CONFIG_KEYS = frozenset({
         'lon_range', 'lat_range', 'depth_range',
@@ -215,6 +222,7 @@ class OceanDataset(Dataset):
         'input_variables',
         'anomaly_variables', 'climatology_period',
         'include_climatology_features', 'climatology_feature_variables',
+        'tendency_feature_variables',
         'climatology_baseline_variables',
         'enable_climatology_anomaly',
     })
@@ -240,6 +248,7 @@ class OceanDataset(Dataset):
         required_variables.update(self.config.get('anomaly_variables', []))
         required_variables.update(self.config.get('climatology_feature_variables', []))
         required_variables.update(self.config.get('climatology_baseline_variables', []))
+        required_variables.update(self.config.get('tendency_feature_variables', []))
         relevant['required_physical_variables'] = sorted(required_variables)
         relevant['sliding_enabled'] = self.sliding_enabled
         relevant['stride_lon'] = self.stride_lon
@@ -322,7 +331,10 @@ class OceanDataset(Dataset):
             # normalized_data
             norm_dict = {}
             for var_name, arr in region.get('normalized_data', {}).items():
-                if var_name in {'SPATIAL_ENCODING', 'TIME_ENCODING'}:
+                if (
+                    var_name in {'SPATIAL_ENCODING', 'TIME_ENCODING'}
+                    or var_name.startswith('TENDENCY_')
+                ):
                     continue
                 norm_dict[f'norm_{var_name}'] = arr
             # coords
@@ -465,7 +477,7 @@ class OceanDataset(Dataset):
                 self.all_regions_data.append(region)
 
             # Reconstruct raw data from normalized data for baseline computation
-            needed_vars = set(self.target_variables)
+            needed_vars = set(self.target_variables) | set(self.tendency_feature_variables)
             for region in self.all_regions_data:
                 if not region.get('data'):
                     region['data'] = {}
@@ -490,12 +502,19 @@ class OceanDataset(Dataset):
                             recon = recon + clim[self.time_period_indices[:nsteps]]
                     region['data'][var_name] = recon
 
+            self._estimate_damped_persistence_coefficients()
+
             # Auxiliary encodings are deterministic functions of coordinates
             # and configuration. Rebuild them after cache load so positional
             # and temporal ablations share one physical-data cache.
             for region in self.all_regions_data:
-                for feature_name in ('SPATIAL_ENCODING', 'TIME_ENCODING'):
-                    region.get('normalized_data', {}).pop(feature_name, None)
+                normalized = region.get('normalized_data', {})
+                for feature_name in tuple(normalized):
+                    if (
+                        feature_name in {'SPATIAL_ENCODING', 'TIME_ENCODING'}
+                        or feature_name.startswith('TENDENCY_')
+                    ):
+                        normalized.pop(feature_name, None)
                 self._add_auxiliary_encodings(region)
 
             if not self.all_regions_data:
@@ -746,6 +765,21 @@ class OceanDataset(Dataset):
     def _climatology_feature_name(variable: str) -> str:
         return f"CLIMATOLOGY_{variable}"
 
+    @staticmethod
+    def _tendency_feature_name(variable: str) -> str:
+        return f"TENDENCY_{variable}"
+
+    @staticmethod
+    def _build_tendency_feature(source: np.ndarray) -> np.ndarray:
+        """Return a causal one-step backward difference with a zero first step."""
+        values = np.asarray(source, dtype=np.float32)
+        if values.ndim not in (3, 4):
+            raise ValueError(f"tendency 源数据维度必须为 3 或 4，实际为 {values.shape}")
+        tendency = np.empty_like(values, dtype=np.float32)
+        tendency[0] = 0.0
+        tendency[1:] = values[1:] - values[:-1]
+        return tendency
+
     def _compute_region_climatology(self, region: Dict):
         """基于训练期计算月气候态；模型开关只决定是否使用 anomaly。"""
         region['climatology'] = {}
@@ -792,6 +826,61 @@ class OceanDataset(Dataset):
                 periods = self.time_period_indices[:data.shape[0]]
                 region['anomaly_data'][var] = (data - climatology[periods]).astype(np.float32)
 
+    def _estimate_damped_persistence_coefficients(self) -> None:
+        """Estimate train-only lag regression coefficients for damped AP.
+
+        Coefficients are pooled over the same canonical windows used by the
+        evaluation metric and retained per target, lead, and depth channel.
+        Clipping to [0, 1] makes this a genuine damping baseline rather than an
+        unconstrained linear autoregression.
+        """
+        train_end_idx = int(len(self.times) * self.train_ratio)
+        coefficients = {}
+        for variable in self.target_variables:
+            numerator = None
+            denominator = None
+            for region in self.all_regions_data:
+                raw_data = region.get('data', {}).get(variable)
+                climatology = region.get('climatology', {}).get(variable)
+                if raw_data is None or climatology is None:
+                    continue
+                periods = self.time_period_indices[:train_end_idx]
+                anomaly = (
+                    raw_data[:train_end_idx] - climatology[periods]
+                ).astype(np.float32, copy=False)
+                anomaly = self._series_to_channel_first(anomaly)
+                if numerator is None:
+                    shape = (self.prediction_length, anomaly.shape[1])
+                    numerator = np.zeros(shape, dtype=np.float64)
+                    denominator = np.zeros(shape, dtype=np.float64)
+                for lead in range(1, self.prediction_length + 1):
+                    if anomaly.shape[0] <= lead:
+                        continue
+                    source = anomaly[:-lead]
+                    future = anomaly[lead:]
+                    numerator[lead - 1] += np.sum(
+                        source * future,
+                        axis=(0, 2, 3),
+                        dtype=np.float64,
+                    )
+                    denominator[lead - 1] += np.sum(
+                        source * source,
+                        axis=(0, 2, 3),
+                        dtype=np.float64,
+                    )
+            if numerator is None or denominator is None:
+                raise ValueError(
+                    f'无法从训练期数据估计 {variable} damped persistence 系数'
+                )
+            rho = np.divide(
+                numerator,
+                denominator,
+                out=np.zeros_like(numerator),
+                where=denominator > np.finfo(np.float64).eps,
+            )
+            coefficients[variable] = np.clip(rho, 0.0, 1.0).astype(np.float32)
+        self.damped_persistence_coefficients = coefficients
+
     def _build_climatology_series(self, region: Dict, variable: str) -> Optional[np.ndarray]:
         climatology = region.get('climatology', {}).get(variable)
         if climatology is None:
@@ -825,6 +914,8 @@ class OceanDataset(Dataset):
             )
         for region in self.all_regions_data:
             self._compute_region_climatology(region)
+
+        self._estimate_damped_persistence_coefficients()
 
         # 如果提供了scalers，直接使用
         if self.provided_scalers is not None:
@@ -862,6 +953,24 @@ class OceanDataset(Dataset):
                             scaler.partial_fit(clim_2d)
                     self.scalers[feature_name] = scaler
                     print(f"变量 {feature_name} 全局标准化参数: 均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}")
+
+            for var in self.tendency_feature_variables:
+                feature_name = self._tendency_feature_name(var)
+                scaler = StandardScaler()
+                fitted = False
+                for region in self.all_regions_data:
+                    raw_data = region.get('data', {}).get(var)
+                    if raw_data is None:
+                        continue
+                    tendency = self._build_tendency_feature(raw_data)
+                    scaler.partial_fit(tendency[:train_end_idx].reshape(-1, 1))
+                    fitted = True
+                if fitted:
+                    self.scalers[feature_name] = scaler
+                    print(
+                        f"变量 {feature_name} 全局标准化参数: "
+                        f"均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}"
+                    )
 
         # 使用全局参数标准化各区域数据 (对所有数据进行变换)
         for region in self.all_regions_data:
@@ -902,6 +1011,17 @@ class OceanDataset(Dataset):
         coords = region.get('coords', {})
         if not normalized:
             return
+
+        if getattr(self, 'include_tendency_features', False):
+            for variable in self.tendency_feature_variables:
+                feature_name = self._tendency_feature_name(variable)
+                source = region.get('data', {}).get(variable)
+                scaler = self.scalers.get(feature_name)
+                if source is not None and scaler is not None:
+                    tendency = self._build_tendency_feature(source)
+                    normalized[feature_name] = scaler.transform(
+                        tendency.reshape(-1, 1)
+                    ).reshape(tendency.shape).astype(np.float32)
 
         sample_array = next(iter(region['data'].values()))
         time_steps = sample_array.shape[0]
@@ -1319,6 +1439,11 @@ class OceanDataset(Dataset):
                 feature_name = self._climatology_feature_name(var)
                 if feature_name in normalized_data:
                     actual_input_variables.append(feature_name)
+        if getattr(self, 'include_tendency_features', False):
+            for var in self.tendency_feature_variables:
+                feature_name = self._tendency_feature_name(var)
+                if feature_name in normalized_data:
+                    actual_input_variables.append(feature_name)
         if self.config.get('enable_positional_encoding', False):
             if 'SPATIAL_ENCODING' in normalized_data:
                 actual_input_variables.append('SPATIAL_ENCODING')
@@ -1357,6 +1482,11 @@ class OceanDataset(Dataset):
             expected_features.extend(
                 self._climatology_feature_name(name)
                 for name in self.climatology_feature_variables
+            )
+        if getattr(self, 'include_tendency_features', False):
+            expected_features.extend(
+                self._tendency_feature_name(name)
+                for name in self.tendency_feature_variables
             )
         if (
             self.config.get('enable_positional_encoding', False)
@@ -1464,6 +1594,11 @@ class OceanDataset(Dataset):
             if self.include_climatology_features:
                 for var in self.climatology_feature_variables:
                     feature_name = self._climatology_feature_name(var)
+                    if feature_name in normalized_data:
+                        valid_input_vars.append(feature_name)
+            if getattr(self, 'include_tendency_features', False):
+                for var in self.tendency_feature_variables:
+                    feature_name = self._tendency_feature_name(var)
                     if feature_name in normalized_data:
                         valid_input_vars.append(feature_name)
             if self.config.get('enable_positional_encoding', False):
@@ -1740,7 +1875,7 @@ class OceanDataset(Dataset):
         spaces: Optional[Sequence[str]] = None,
     ) -> Dict[str, Dict[str, np.ndarray]]:
         """
-        构造 Climatology / Persistence / Anomaly Persistence baseline。
+        构造 Climatology / Persistence / Anomaly Persistence / Damped AP baseline。
 
         Returns:
             {
@@ -1782,6 +1917,7 @@ class OceanDataset(Dataset):
             clim_parts = []
             persistence_parts = []
             anomaly_persistence_parts = []
+            damped_anomaly_persistence_parts = []
 
             for var_name in self.target_variables:
                 raw_data = region['data'][var_name]
@@ -1814,16 +1950,34 @@ class OceanDataset(Dataset):
                     hist_clim = future_clim[:1]
                 last_anomaly = last_raw - hist_clim[0]
                 anomaly_persistence = future_clim + last_anomaly[np.newaxis, ...]
+                coefficients = self.damped_persistence_coefficients.get(var_name)
+                if coefficients is None:
+                    raise RuntimeError(f'{var_name} 缺少训练期 damped persistence 系数')
+                expected_shape = (self.prediction_length, last_anomaly.shape[0])
+                if coefficients.shape != expected_shape:
+                    raise ValueError(
+                        f'{var_name} damped persistence 系数形状错误: '
+                        f'{coefficients.shape} != {expected_shape}'
+                    )
+                damped_anomaly_persistence = (
+                    future_clim
+                    + coefficients[:, :, np.newaxis, np.newaxis]
+                    * last_anomaly[np.newaxis, ...]
+                )
 
                 clim_parts.append(future_clim)
                 persistence_parts.append(persistence)
                 anomaly_persistence_parts.append(anomaly_persistence)
+                damped_anomaly_persistence_parts.append(damped_anomaly_persistence)
 
             sample_forecasts = {
                 'climatology': np.concatenate(clim_parts, axis=1),
                 'persistence': np.concatenate(persistence_parts, axis=1),
                 'anomaly_persistence': np.concatenate(
                     anomaly_persistence_parts, axis=1
+                ),
+                'damped_anomaly_persistence': np.concatenate(
+                    damped_anomaly_persistence_parts, axis=1
                 ),
             }
             if physical is None:

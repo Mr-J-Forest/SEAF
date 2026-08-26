@@ -198,6 +198,12 @@ def summarize_dataset_protocol(dataset) -> dict:
     )
     origin_payload = json.dumps(origins, separators=(',', ':'))
     times = list(getattr(dataset, 'times', []))
+    damped_coefficients = {
+        name: np.asarray(values, dtype=np.float32).tolist()
+        for name, values in getattr(
+            dataset, 'damped_persistence_coefficients', {}
+        ).items()
+    }
     return {
         'mode': getattr(dataset, 'mode', None),
         'samples': len(sequences),
@@ -217,6 +223,11 @@ def summarize_dataset_protocol(dataset) -> dict:
         'stride_lat': float(getattr(dataset, 'stride_lat', 0.0)),
         'window_grid_policy': getattr(dataset, '_WINDOW_GRID_POLICY', None),
         'cache_format_version': getattr(dataset, '_CACHE_FORMAT_VERSION', None),
+        'damped_anomaly_persistence': {
+            'estimation_split': 'train',
+            'method': 'pooled_origin_regression_clipped_0_1_by_variable_lead_depth',
+            'coefficients': damped_coefficients,
+        },
     }
 
 
@@ -736,7 +747,9 @@ class OceanModelTrainer:
                 else:
                     progress_bar.set_postfix({
                         'Val Loss': f'{loss.item():.6f}',
-                        'Avg Val Loss': f'{total_loss/max(valid_samples, 1):.6f}'
+                        'Avg Val Loss': (
+                            f'{total_selection_loss / max(valid_samples, 1):.6f}'
+                        ),
                     })
 
                 # 记录验证损失到TensorBoard

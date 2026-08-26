@@ -1,0 +1,40 @@
+{
+  "_contrasts": "configs/oras5_ablation_contrasts.json",
+  "_protocol": {
+    "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
+    "task": "12-month history to 5-month TEMP/SALT forecast",
+    "selection_rule": "all ablations use the frozen full-model hyperparameters and validation only",
+    "test_policy": "test remains sealed; ablations are reported on validation"
+  },
+  "_stage_overrides": {
+    "screen": {
+      "epochs": 30,
+      "scheduler_patience": 4,
+      "early_stopping_patience": 10,
+      "post_training_evaluation": "validation"
+    },
+    "confirm_validation": {
+      "epochs": 80,
+      "scheduler_patience": 8,
+      "early_stopping_patience": 25,
+      "post_training_evaluation": "validation"
+    }
+  },
+  "screen": [
+    {"name": "full", "config": "configs/experiments/oras5_tsc_ap_residual.json", "seeds": [42]},
+    {"name": "no_ap_residual", "config": "configs/experiments/oras5_ablation_no_ap_residual.json", "seeds": [42]},
+    {"name": "direct_full_field", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42]},
+    {"name": "no_tendency", "config": "configs/experiments/oras5_ablation_no_tendency.json", "seeds": [42]},
+    {"name": "thermohaline_only", "config": "configs/experiments/oras5_ablation_thermohaline_only.json", "seeds": [42]},
+    {"name": "no_tsc", "config": "configs/experiments/oras5_ablation_no_tsc.json", "seeds": [42]},
+    {"name": "no_spectral", "config": "configs/experiments/oras5_ablation_no_spectral.json", "seeds": [42]},
+    {"name": "no_3d", "config": "configs/experiments/oras5_ablation_no_3d.json", "seeds": [42]},
+    {"name": "no_ensemble", "config": "configs/experiments/oras5_ablation_no_ensemble.json", "seeds": [42]},
+    {"name": "temp_only", "config": "configs/experiments/oras5_ablation_temp_only.json", "seeds": [42]},
+    {"name": "salt_only", "config": "configs/experiments/oras5_ablation_salt_only.json", "seeds": [42]}
+  ],
+  "confirm_validation": {
+    "from_stage": "screen",
+    "seeds": [42, 123, 3407]
+  }
+}

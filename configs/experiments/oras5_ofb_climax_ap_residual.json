@@ -16,7 +16,7 @@
   "baseline_drop_rate": 0.1,
   "baseline_attention_dropout": 0.0,
   "baseline_drop_path_rate": 0.2,
-  "expected_parameter_count": 63643424,
+  "expected_parameter_count": 65613600,
   "baseline_provenance": {
     "kind": "benchmark_architecture_adapter",
     "method_name": "ClimaX",

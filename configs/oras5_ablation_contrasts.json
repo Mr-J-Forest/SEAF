@@ -1,0 +1,26 @@
+{
+  "protocol": {
+    "primary_metric": "mse",
+    "paired_unit": "forecast_origin",
+    "moving_block_length": 5,
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260826,
+    "screening_fdr": 0.10,
+    "confirmation_fdr": 0.05,
+    "positive_score": "log(reference_mse / candidate_mse); positive favors candidate",
+    "meaningful_reduction_fraction": 0.01,
+    "baseline_requirement": "Every evaluation reports climatology, persistence, anomaly persistence, and train-only damped anomaly persistence."
+  },
+  "contrasts": [
+    {"name": "ap_residual_learning", "module": "fixed_anomaly_persistence_skip", "candidate": "full", "reference": "no_ap_residual", "variables": ["TEMP", "SALT"]},
+    {"name": "anomaly_target_without_ap_skip", "module": "training_only_climatology_anomaly_target", "candidate": "no_ap_residual", "reference": "direct_full_field", "variables": ["TEMP", "SALT"]},
+    {"name": "explicit_tendency_features", "module": "causal_one_step_tendency", "candidate": "full", "reference": "no_tendency", "variables": ["TEMP", "SALT"]},
+    {"name": "external_dynamic_and_surface_inputs", "module": "UVEL_VVEL_SSHA_MLD_TAUX_TAUY_QNET_WFLUX", "candidate": "full", "reference": "thermohaline_only", "variables": ["TEMP", "SALT"]},
+    {"name": "thermohaline_memory", "module": "tsc_memory", "candidate": "full", "reference": "no_tsc", "variables": ["TEMP", "SALT"]},
+    {"name": "spectral_branch", "module": "global_spectral_branch", "candidate": "full", "reference": "no_spectral", "variables": ["TEMP", "SALT"]},
+    {"name": "spatiotemporal_branch", "module": "spatiotemporal_3d_branch", "candidate": "full", "reference": "no_3d", "variables": ["TEMP", "SALT"]},
+    {"name": "ensemble_gate", "module": "gated_ensemble", "candidate": "full", "reference": "no_ensemble", "variables": ["TEMP", "SALT"]},
+    {"name": "joint_training_for_temp", "module": "joint_temperature_salinity_training", "candidate": "full", "reference": "temp_only", "variables": ["TEMP"]},
+    {"name": "joint_training_for_salt", "module": "joint_temperature_salinity_training", "candidate": "full", "reference": "salt_only", "variables": ["SALT"]}
+  ]
+}

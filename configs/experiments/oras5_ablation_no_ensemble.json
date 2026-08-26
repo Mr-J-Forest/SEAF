@@ -1,0 +1,4 @@
+{
+  "extends": "oras5_tsc_ap_residual.json",
+  "ablation_disable_ensemble": true
+}

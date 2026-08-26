@@ -18,7 +18,7 @@
   "swin_depths": [2, 18, 2],
   "swin_num_heads": [3, 6, 3],
   "swin_window_size": 7,
-  "expected_parameter_count": 36099800,
+  "expected_parameter_count": 36468440,
   "baseline_provenance": {
     "kind": "benchmark_architecture_adapter",
     "method_name": "SwinTransformer",

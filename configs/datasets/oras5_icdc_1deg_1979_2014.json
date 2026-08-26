@@ -54,6 +54,8 @@
   "include_climatology_features": true,
   "climatology_feature_variables": ["TEMP", "SALT"],
   "climatology_baseline_variables": ["TEMP", "SALT"],
+  "include_tendency_features": true,
+  "tendency_feature_variables": ["TEMP", "SALT"],
   "cache_preprocessed_dir": ".cache/preprocessed/oras5_1979_2014",
   "tsc_variables": ["TEMP", "SALT"],
   "enable_persistence_residual": true,

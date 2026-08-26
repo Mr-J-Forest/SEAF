@@ -17,7 +17,7 @@
   "afno_num_blocks": 16,
   "afno_sparsity_threshold": 0.01,
   "afno_hard_thresholding_fraction": 1.0,
-  "expected_parameter_count": 20866944,
+  "expected_parameter_count": 21665664,
   "baseline_provenance": {
     "kind": "benchmark_architecture_adapter",
     "method_name": "FourCastNet (AFNO)",
