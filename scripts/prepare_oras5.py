@@ -44,7 +44,9 @@ DEFAULT_DEPTHS_M = (
 ICDC_FIRST_YEAR = 1979
 ICDC_LAST_YEAR = 2018
 DOWNLOAD_BLOCK_BYTES = 4 * 2**20
-PARALLEL_MIN_CHUNK_BYTES = 8 * 2**20
+# ICDC occasionally truncates larger Range responses at 4 MiB.  Keeping each
+# request at that size avoids waiting for a socket timeout before retrying.
+PARALLEL_MIN_CHUNK_BYTES = 4 * 2**20
 
 
 @dataclass(frozen=True)
