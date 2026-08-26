@@ -16,9 +16,14 @@ mistaken for the full-grid dataset.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import time
 from datetime import datetime, timezone
@@ -399,16 +404,30 @@ def prepare(args: argparse.Namespace) -> Path:
         if f"{spec.output_name}:{year}{month:02d}" not in completed
     ]
     total = len(tasks) + len(completed)
+    executor_kind = args.executor
+    if executor_kind == "auto":
+        executor_kind = "process" if args.workers > 8 else "thread"
     print(
         f"OPeNDAP 区域准备: {len(years) * 12} 个月 × {len(specs)} 变量，"
-        f"区域 {len(latitudes)}×{len(longitudes)}，{args.workers} workers；"
+        f"区域 {len(latitudes)}×{len(longitudes)}，{args.workers} "
+        f"{executor_kind} workers；"
         f"已完成 {len(completed)}/{total}",
         flush=True,
     )
     started = time.time()
     finished = len(completed)
     try:
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        if executor_kind == "process":
+            # Spawn rather than fork: netCDF4/libcurl keeps native global
+            # state, and inheriting it across a fork can reintroduce the
+            # thread-safety crash this backend is designed to avoid.
+            executor_context = ProcessPoolExecutor(
+                max_workers=args.workers,
+                mp_context=mp.get_context("spawn"),
+            )
+        else:
+            executor_context = ThreadPoolExecutor(max_workers=args.workers)
+        with executor_context as executor:
             futures = {
                 executor.submit(
                     _read_month,
@@ -519,6 +538,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=(130.0, 162.0),
     )
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--executor",
+        choices=("auto", "thread", "process"),
+        default="auto",
+        help=(
+            "并发后端；auto 在 workers>8 时使用独立进程，"
+            "避免 netCDF4 原生库线程不安全"
+        ),
+    )
     parser.add_argument("--retries", type=int, default=6)
     parser.add_argument("--state-every", type=int, default=16)
     parser.add_argument("--overwrite", action="store_true")
