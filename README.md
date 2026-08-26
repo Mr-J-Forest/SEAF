@@ -38,6 +38,10 @@ python scripts/prepare_oras5_opendap_region.py --dry-run
 python -u scripts/prepare_oras5_opendap_region.py --workers 8
 ```
 
+若服务器允许更多进程，可用 `--workers 16 --executor process`；这里必须使用独立进程隔离
+netCDF4 原生 OPeNDAP 状态，不能把 16 路直接改成线程。`auto` 会在 workers 大于 8 时
+自动选择进程池。
+
 默认输出 `Data/oras5/ORAS5_197901_201412_1deg_region.nc`，覆盖
 `130–162°E, 6.5–27.5°N`，仍包含 10 个物理变量、432 个月和 20 个深度层，
 但经纬度维度只保留该区域。它对应显式的
