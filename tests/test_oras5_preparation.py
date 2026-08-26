@@ -2,6 +2,11 @@ import unittest
 
 import numpy as np
 
+from scripts.prepare_oras5_opendap_region import (
+    _coordinate_slice,
+    monthly_url,
+    parse_range,
+)
 from scripts.prepare_oras5 import (
     VARIABLE_SPECS,
     apply_surface_mask,
@@ -79,6 +84,26 @@ class Oras5PreparationTests(unittest.TestCase):
             range_end=1023,
         )
         self.assertEqual(request.headers['Range'], 'bytes=0-1023')
+
+    def test_monthly_opendap_url_points_to_single_month(self):
+        temp = select_specs(['TEMP'])[0]
+        self.assertTrue(
+            monthly_url(temp, 1980, 3).endswith(
+                '/votemper/opa0/votemper_ORAS5_1m_198003_r1x1.nc'
+            )
+        )
+
+    def test_regional_coordinate_slice_is_inclusive_and_contiguous(self):
+        start, end, selected = _coordinate_slice(
+            np.arange(10, dtype=np.float32), (2.0, 5.0), 'longitude'
+        )
+        self.assertEqual((start, end), (2, 5))
+        np.testing.assert_array_equal(selected, [2.0, 3.0, 4.0, 5.0])
+
+    def test_regional_range_parser_rejects_descending_bounds(self):
+        self.assertEqual(parse_range('6.5,27.5', '--lat-range'), (6.5, 27.5))
+        with self.assertRaises(Exception):
+            parse_range('27.5,6.5', '--lat-range')
 
 
 if __name__ == '__main__':
