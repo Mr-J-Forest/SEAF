@@ -10,6 +10,7 @@ from scripts.prepare_oras5 import (
     interpolate_masked_depths,
     parse_depths,
     select_specs,
+    _request,
 )
 
 
@@ -70,6 +71,14 @@ class Oras5PreparationTests(unittest.TestCase):
             parse_depths('0,10,5')
         with self.assertRaises(Exception):
             parse_depths('0,5,5')
+
+    def test_range_request_includes_zero_start_and_inclusive_end(self):
+        request = _request(
+            'https://example.test/archive.tar.gz',
+            range_start=0,
+            range_end=1023,
+        )
+        self.assertEqual(request.headers['Range'], 'bytes=0-1023')
 
 
 if __name__ == '__main__':

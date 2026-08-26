@@ -9,6 +9,7 @@ TIME/LEVEL/LATITUDE/LONGITUDE NetCDF file; there is no unsafe opt-out.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -42,6 +43,8 @@ DEFAULT_DEPTHS_M = (
 )
 ICDC_FIRST_YEAR = 1979
 ICDC_LAST_YEAR = 2018
+DOWNLOAD_BLOCK_BYTES = 4 * 2**20
+PARALLEL_MIN_CHUNK_BYTES = 8 * 2**20
 
 
 @dataclass(frozen=True)
@@ -206,10 +209,17 @@ def apply_surface_mask(values: np.ndarray, valid_mask: np.ndarray) -> np.ndarray
     return np.where(mask & np.isfinite(data), data, np.nan).astype(np.float32)
 
 
-def _request(url: str, *, method: str = "GET", range_start: int | None = None):
+def _request(
+    url: str,
+    *,
+    method: str = "GET",
+    range_start: int | None = None,
+    range_end: int | None = None,
+):
     headers = {"User-Agent": "TSC-Fusion-ORAS5-preparer/1.0"}
-    if range_start:
-        headers["Range"] = f"bytes={range_start}-"
+    if range_start is not None:
+        end = "" if range_end is None else str(range_end)
+        headers["Range"] = f"bytes={range_start}-{end}"
     return urllib.request.Request(url, headers=headers, method=method)
 
 
@@ -222,7 +232,7 @@ def remote_size(url: str) -> int | None:
         return None
 
 
-def download_file(url: str, target: Path, retries: int = 8) -> Path:
+def _download_file_serial(url: str, target: Path, retries: int = 8) -> Path:
     """Download with a resumable .part file and atomic final rename."""
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.is_file() and target.stat().st_size > 0:
@@ -244,7 +254,7 @@ def download_file(url: str, target: Path, retries: int = 8) -> Path:
                 next_report = downloaded + 64 * 1024 * 1024
                 with partial.open(mode) as handle:
                     while True:
-                        block = response.read(4 * 1024 * 1024)
+                        block = response.read(DOWNLOAD_BLOCK_BYTES)
                         if not block:
                             break
                         handle.write(block)
@@ -270,12 +280,182 @@ def download_file(url: str, target: Path, retries: int = 8) -> Path:
     raise AssertionError("unreachable")
 
 
-def load_corrected_masks(work_dir: Path, specs: tuple[VariableSpec, ...]):
+def _segment_path(partial: Path, start: int, end: int) -> Path:
+    return partial.with_name(
+        f"{partial.name}.chunk-{start:016d}-{end:016d}"
+    )
+
+
+def _download_range_segment(
+    url: str,
+    path: Path,
+    start: int,
+    end: int,
+    retries: int,
+    label: str,
+) -> Path:
+    """Download one inclusive byte range, resuming its own chunk file."""
+    expected = end - start + 1
+    for attempt in range(1, retries + 1):
+        existing = path.stat().st_size if path.exists() else 0
+        if existing > expected:
+            raise IOError(
+                f"分段文件过大: {path} ({existing} > {expected} bytes)"
+            )
+        if existing == expected:
+            return path
+        try:
+            request = _request(
+                url,
+                range_start=start + existing,
+                range_end=end,
+            )
+            with urllib.request.urlopen(request, timeout=120) as response:
+                if getattr(response, "status", None) != 206:
+                    raise IOError(
+                        f"服务器未返回 206 Partial Content（status="
+                        f"{getattr(response, 'status', None)}）"
+                    )
+                remaining = response.headers.get("Content-Length")
+                if remaining is not None and int(remaining) != expected - existing:
+                    raise IOError(
+                        "分段 Content-Length 不匹配: "
+                        f"expected={expected - existing}, actual={remaining}"
+                    )
+                downloaded = existing
+                with path.open("ab" if existing else "wb") as handle:
+                    while True:
+                        block = response.read(DOWNLOAD_BLOCK_BYTES)
+                        if not block:
+                            break
+                        handle.write(block)
+                        downloaded += len(block)
+                if downloaded != expected:
+                    raise IOError(
+                        f"分段大小不匹配: expected={expected}, actual={downloaded}"
+                    )
+            return path
+        except (OSError, urllib.error.URLError, ValueError) as exc:
+            if attempt == retries:
+                raise RuntimeError(f"分段下载失败: {url} [{start}-{end}]") from exc
+            print(f"    {label} 分段中断，第 {attempt}/{retries} 次重试: {exc}")
+            time.sleep(min(2**attempt, 8))
+    raise AssertionError("unreachable")
+
+
+def _download_file_parallel(
+    url: str,
+    target: Path,
+    total: int,
+    workers: int,
+    retries: int = 8,
+) -> Path:
+    """Download a file using resumable, ordered byte-range segments."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+    partial = target.with_suffix(target.suffix + ".part")
+    existing = partial.stat().st_size if partial.exists() else 0
+    if existing > total:
+        raise IOError(
+            f"现有 partial 大于远端文件: {partial} ({existing} > {total} bytes)"
+        )
+    if existing == total:
+        os.replace(partial, target)
+        return target
+
+    remaining = total - existing
+    if remaining <= PARALLEL_MIN_CHUNK_BYTES:
+        return _download_file_serial(url, target, retries=retries)
+
+    chunk_size = max(
+        PARALLEL_MIN_CHUNK_BYTES,
+        (remaining + workers * 2 - 1) // (workers * 2),
+    )
+    segments: list[tuple[int, int, Path]] = []
+    start = existing
+    while start < total:
+        end = min(total - 1, start + chunk_size - 1)
+        segments.append((start, end, _segment_path(partial, start, end)))
+        start = end + 1
+
+    print(
+        f"    {target.name}: 并发分段 {workers} workers，"
+        f"断点 {existing / 2**20:.1f}/{total / 2**20:.1f} MiB"
+    )
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _download_range_segment,
+                url,
+                path,
+                segment_start,
+                segment_end,
+                retries,
+                f"{target.name} [{segment_start}-{segment_end}]",
+            ): path
+            for segment_start, segment_end, path in segments
+        }
+        for future in as_completed(futures):
+            future.result()
+
+    merge = partial.with_name(partial.name + ".merge")
+    merge.unlink(missing_ok=True)
+    with merge.open("wb") as merged:
+        if existing:
+            with partial.open("rb") as prefix:
+                shutil.copyfileobj(prefix, merged, length=DOWNLOAD_BLOCK_BYTES)
+        for _, _, path in segments:
+            with path.open("rb") as chunk:
+                shutil.copyfileobj(chunk, merged, length=DOWNLOAD_BLOCK_BYTES)
+    os.replace(merge, partial)
+    for _, _, path in segments:
+        path.unlink(missing_ok=True)
+    os.replace(partial, target)
+    return target
+
+
+def download_file(
+    url: str,
+    target: Path,
+    retries: int = 8,
+    workers: int = 1,
+) -> Path:
+    """Download atomically, optionally using resumable parallel ranges."""
+    if workers < 1:
+        raise ValueError("workers 必须是正整数")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+    if workers == 1:
+        return _download_file_serial(url, target, retries=retries)
+    total = remote_size(url)
+    if total is None:
+        print(f"    {target.name}: 无法获取 Content-Length，退回单连接下载")
+        return _download_file_serial(url, target, retries=retries)
+    return _download_file_parallel(
+        url,
+        target,
+        total=total,
+        workers=workers,
+        retries=retries,
+    )
+
+
+def load_corrected_masks(
+    work_dir: Path,
+    specs: tuple[VariableSpec, ...],
+    download_workers: int = 1,
+):
     required = {(spec.mask_file, spec.mask_variable) for spec in specs}
     masks: dict[str, np.ndarray] = {}
     latitudes = longitudes = None
     for filename, variable in sorted(required):
-        path = download_file(mask_url(filename), work_dir / "masks" / filename)
+        path = download_file(
+            mask_url(filename),
+            work_dir / "masks" / filename,
+            workers=download_workers,
+        )
         with netCDF4.Dataset(path) as dataset:
             raw = dataset.variables[variable][:]
             valid = np.squeeze(np.ma.filled(raw, 0) > 0)
@@ -565,6 +745,8 @@ def estimate_report(
 def prepare(args: argparse.Namespace) -> Path:
     if args.end_year < args.start_year:
         raise ValueError("--end-year 必须不小于 --start-year")
+    if args.download_workers < 1:
+        raise ValueError("--download-workers 必须是正整数")
     if args.start_year < ICDC_FIRST_YEAR or args.end_year > ICDC_LAST_YEAR:
         raise ValueError(
             "ICDC ORAS5 r1x1 opa0 仅覆盖 "
@@ -595,7 +777,11 @@ def prepare(args: argparse.Namespace) -> Path:
         raise FileExistsError(f"输出已存在: {output}；如需重建请使用 --overwrite")
 
     payload = _config_payload(specs, years, depths)
-    masks, latitudes, longitudes = load_corrected_masks(work_dir, specs)
+    masks, latitudes, longitudes = load_corrected_masks(
+        work_dir,
+        specs,
+        download_workers=args.download_workers,
+    )
     if latitudes.shape != (180,) or longitudes.shape != (360,):
         raise ValueError(
             f"ICDC r1x1 grid changed: lat={latitudes.shape}, lon={longitudes.shape}"
@@ -624,7 +810,11 @@ def prepare(args: argparse.Namespace) -> Path:
                 url = archive_url(spec, year)
                 archive = archives_dir / spec.source_name / Path(url).name
                 print(f"[{spec.output_name}] {year}: {url}")
-                download_file(url, archive)
+                download_file(
+                    url,
+                    archive,
+                    workers=args.download_workers,
+                )
                 mapping = process_archive(
                     archive,
                     spec,
@@ -691,6 +881,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-archives", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=1,
+        help=(
+            "每个归档使用的并发 Range 下载连接数；默认 1，"
+            "ICDC 可用时建议 4-16"
+        ),
+    )
     return parser
 
 

@@ -20,6 +20,14 @@ python scripts/prepare_oras5.py --dry-run
 python -u scripts/prepare_oras5.py
 ```
 
+ICDC 支持 HTTP Range 时，可以用可恢复的并发分段下载加速大归档；例如服务器上使用 16 条连接：
+
+```bash
+python -u scripts/prepare_oras5.py --download-workers 16
+```
+
+每个分段写入独立临时文件，全部完成后才按顺序合并并原子替换；中断后会继续已有的 `.part`/分段文件。若服务端不支持 Range 或没有 `Content-Length`，脚本会自动退回单连接模式。
+
 脚本逐年流式处理归档，默认不保留 tar.gz；中断后可从已经完成的变量×年份继续。输出为 `Data/oras5/ORAS5_197901_201412_1deg.nc`，包含 432 个月、20 个 0–1000 m 深度，以及 TEMP、SALT、UVEL、VVEL、SSHA、MLD、TAUX、TAUY、QNET、WFLUX。以 1979 年归档大小外推，完整下载约 15 GiB；浮点数据未压缩上界约 9 GiB，实际 NetCDF 会压缩。
 
 ORAS5 主实验使用 `configs/experiments/oras5_tsc_ap_residual.json`：1979–2006 train、2007–2010 validation、2011–2014 test；窗口在 1000 m 参考层要求 100% 有效海水，8° canonical 网格共有 76 个窗口。模型采用固定系数 1 的 anomaly-persistence skip，残差输出层零初始化，因此训练开始时严格等于 anomaly persistence，而不是可学习缩放的近似版本。输入额外包含 TEMP/SALT 物理量的因果一步后向差分；tendency 使用独立的训练期 scaler，第一个时间步固定为零，不读取未来值。
