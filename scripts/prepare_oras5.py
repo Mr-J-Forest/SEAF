@@ -45,8 +45,9 @@ ICDC_FIRST_YEAR = 1979
 ICDC_LAST_YEAR = 2018
 DOWNLOAD_BLOCK_BYTES = 4 * 2**20
 # ICDC occasionally truncates larger Range responses at 4 MiB.  Keeping each
-# request at that size avoids waiting for a socket timeout before retrying.
-PARALLEL_MIN_CHUNK_BYTES = 4 * 2**20
+# request at exactly that size avoids waiting for a socket timeout before
+# retrying and keeps the merge order deterministic.
+PARALLEL_CHUNK_BYTES = 4 * 2**20
 
 
 @dataclass(frozen=True)
@@ -367,13 +368,10 @@ def _download_file_parallel(
         return target
 
     remaining = total - existing
-    if remaining <= PARALLEL_MIN_CHUNK_BYTES:
+    if remaining <= PARALLEL_CHUNK_BYTES:
         return _download_file_serial(url, target, retries=retries)
 
-    chunk_size = max(
-        PARALLEL_MIN_CHUNK_BYTES,
-        (remaining + workers * 2 - 1) // (workers * 2),
-    )
+    chunk_size = PARALLEL_CHUNK_BYTES
     segments: list[tuple[int, int, Path]] = []
     start = existing
     while start < total:
