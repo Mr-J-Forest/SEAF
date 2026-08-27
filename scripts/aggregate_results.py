@@ -57,6 +57,8 @@ COMMON_PROTOCOL_KEYS = (
     "early_stopping_patience",
     "min_delta",
     "mixed_precision",
+    "mixed_precision_dtype",
+    "nonfinite_grad_skip_limit",
     "compile_model",
     "group_batches_by_time",
     "gradient_loss_mode",

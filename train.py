@@ -395,8 +395,22 @@ class OceanModelTrainer:
                 print(f"警告: torch.compile 启用失败，按配置回退 eager 模式: {exc}")
 
         self.amp_enabled = bool(config.get('mixed_precision', False) and self.device.type == 'cuda')
-        self.grad_scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled)
-        print(f"混合精度训练: {'开启' if self.amp_enabled else '关闭'}")
+        self.amp_dtype = self._resolve_amp_dtype(config.get('mixed_precision_dtype', 'auto'))
+        # bf16 的动态范围与 fp32 相同，不需要 loss scaling；只有 fp16 需要 GradScaler。
+        self.grad_scaler = torch.amp.GradScaler(
+            'cuda',
+            enabled=self.amp_enabled and self.amp_dtype == torch.float16,
+        )
+        self.nonfinite_grad_skip_limit = max(
+            1, int(config.get('nonfinite_grad_skip_limit', 30))
+        )
+        # 梯度溢出统计：瞬时溢出按 AMP 语义跳步，连续溢出超限才判定发散。
+        self.grad_overflow_skips_total = 0
+        self._consecutive_nonfinite_grads = 0
+        print(
+            f"混合精度训练: {'开启' if self.amp_enabled else '关闭'}"
+            + (f"（dtype={str(self.amp_dtype).replace('torch.', '')}）" if self.amp_enabled else '')
+        )
 
         self.parameter_count = sum(p.numel() for p in self.model.parameters())
         print(f"模型参数数量: {self.parameter_count:,}")
@@ -457,6 +471,7 @@ class OceanModelTrainer:
         self.best_val_loss = float('inf')
         self.train_losses = []
         self.val_losses = []
+        self.epoch_grad_overflow_skips = []
         self.epoch_times = []
         self.epoch = 0
 
@@ -585,6 +600,42 @@ class OceanModelTrainer:
             self.config['compile_model'] = False
             return self.model(inputs)
 
+    def _resolve_amp_dtype(self, requested) -> torch.dtype:
+        """
+        解析 AMP autocast 精度。
+
+        fp16 尾数位多但最大值约 65504，反向梯度容易溢出为 inf；
+        bf16 与 fp32 共享指数域，数值范围一致，从根上消除梯度上溢这一类故障。
+        默认 'auto'：设备支持 bf16 就用 bf16，否则回退 fp16。
+        """
+        raw = str(requested).strip().lower()
+        if raw in {'bf16', 'bfloat16'}:
+            dtype = torch.bfloat16
+        elif raw in {'fp16', 'float16', 'half'}:
+            dtype = torch.float16
+        elif raw == 'auto':
+            if self.device.type == 'cuda':
+                dtype = (
+                    torch.bfloat16
+                    if torch.cuda.is_bf16_supported()
+                    else torch.float16
+                )
+            else:
+                dtype = torch.bfloat16
+        else:
+            raise ValueError(
+                f"mixed_precision_dtype 不支持: {requested!r}；"
+                "可选 'auto' | 'bfloat16' | 'float16'"
+            )
+
+        if dtype == torch.bfloat16 and self.device.type == 'cuda':
+            if not torch.cuda.is_bf16_supported():
+                raise ValueError(
+                    "当前 GPU 不支持 bfloat16，请将 mixed_precision_dtype "
+                    "设为 'auto' 或 'float16'"
+                )
+        return dtype
+
     def compute_gradient_loss(self, pred, target):
         """
         计算空间梯度损失。默认分别匹配 x/y 分量，保留梯度方向；
@@ -674,7 +725,7 @@ class OceanModelTrainer:
 
             # 前向传播
             self.optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp_enabled):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                 outputs = self._forward(inputs)
                 loss, variable_losses, grad_loss_val = self.compute_weighted_loss(outputs, targets)
 
@@ -700,15 +751,34 @@ class OceanModelTrainer:
                 max_norm=float(self.config.get('grad_clip_norm', 1.0)),
             )
 
-            # 检查梯度
+            # 梯度非有限处理：损失与输出均有限而梯度为 inf/NaN，属于 AMP 反向
+            # 溢出的标准场景（尤其 fp16）。正确语义是跳过本步参数更新并让
+            # GradScaler 回退 scale，而不是终止整个实验；只有连续溢出超过
+            # 容忍上限（说明模型真实发散，而非瞬时数值溢出）才失败保现场。
             if not torch.isfinite(grad_norm):
-                self.optimizer.zero_grad(set_to_none=True)
-                raise FloatingPointError(
-                    f"epoch {self.epoch + 1} batch {batch_idx} 梯度范数非有限: {grad_norm.item()}"
+                self.grad_overflow_skips_total += 1
+                self._consecutive_nonfinite_grads += 1
+                if self._consecutive_nonfinite_grads > self.nonfinite_grad_skip_limit:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(
+                        f"epoch {self.epoch + 1} batch {batch_idx} 连续 "
+                        f"{self._consecutive_nonfinite_grads} 个 batch 梯度范数非有限"
+                        f"（上限 {self.nonfinite_grad_skip_limit}）: {grad_norm.item()}"
+                    )
+                print(
+                    f"警告: epoch {self.epoch + 1} batch {batch_idx} 梯度范数非有限"
+                    f"({grad_norm.item()})，跳过本步参数更新"
+                    f"（连续 {self._consecutive_nonfinite_grads}/{self.nonfinite_grad_skip_limit}）"
                 )
-
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+                if self.grad_scaler.is_enabled():
+                    # unscale_ 阶段已记录 inf，step() 会自动跳过；update() 回退 scale。
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+            else:
+                self._consecutive_nonfinite_grads = 0
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
 
             batch_samples = int(inputs.shape[0])
             total_loss += loss.item() * batch_samples
@@ -771,7 +841,7 @@ class OceanModelTrainer:
 
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp_enabled):
+                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self._forward(inputs)
                     loss, variable_losses, grad_loss_val = self.compute_weighted_loss(outputs, targets)
 
@@ -847,6 +917,9 @@ class OceanModelTrainer:
             'epochs_without_improvement': self.epochs_without_improvement,
             'best_epoch': self.best_epoch,
             'grad_scaler_state_dict': self.grad_scaler.state_dict(),
+            'grad_overflow_skips_total': self.grad_overflow_skips_total,
+            'consecutive_nonfinite_grads': self._consecutive_nonfinite_grads,
+            'epoch_grad_overflow_skips': list(self.epoch_grad_overflow_skips),
             'rng_state': capture_rng_state(),
             'config': self.config,
             'training_config_fingerprint': training_config_fingerprint(self.config),
@@ -911,7 +984,7 @@ class OceanModelTrainer:
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            if checkpoint.get('grad_scaler_state_dict'):
+            if checkpoint.get('grad_scaler_state_dict') and self.grad_scaler.is_enabled():
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state_dict'])
 
             self.epoch = next_epoch
@@ -919,6 +992,15 @@ class OceanModelTrainer:
             self.train_losses = checkpoint['train_losses']
             self.val_losses = checkpoint['val_losses']
             self.epoch_times = checkpoint.get('epoch_times', [])
+            self.epoch_grad_overflow_skips = checkpoint.get(
+                'epoch_grad_overflow_skips', []
+            )
+            self.grad_overflow_skips_total = int(
+                checkpoint.get('grad_overflow_skips_total', 0)
+            )
+            self._consecutive_nonfinite_grads = int(
+                checkpoint.get('consecutive_nonfinite_grads', 0)
+            )
             self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
             self.best_epoch = checkpoint.get('best_epoch')
             restored_rng = restore_rng_state(checkpoint.get('rng_state'))
@@ -994,7 +1076,10 @@ class OceanModelTrainer:
             start_time = time.time()
 
             # 训练
+            skips_before = self.grad_overflow_skips_total
             train_loss = self.train_epoch()
+            epoch_grad_skips = self.grad_overflow_skips_total - skips_before
+            self.epoch_grad_overflow_skips.append(epoch_grad_skips)
             if not np.isfinite(train_loss):
                 raise RuntimeError(f"epoch {epoch + 1} 训练损失非有限值: {train_loss}")
 
@@ -1047,12 +1132,15 @@ class OceanModelTrainer:
                 self.plot_training_curves()
 
             # 打印epoch信息
+            skip_note = (
+                f" | 梯度溢出跳步: {epoch_grad_skips}" if epoch_grad_skips > 0 else ""
+            )
             print(f"Epoch {epoch+1:3d}/{epochs} | "
                   f"训练损失: {train_loss:.6f} | "
                   f"验证损失: {val_loss:.6f} | "
                   f"最佳验证损失: {self.best_val_loss:.6f} | "
                   f"学习率: {self.optimizer.param_groups[0]['lr']:.2e} | "
-                  f"时间: {epoch_time:.1f}s")
+                  f"时间: {epoch_time:.1f}s{skip_note}")
 
             # 检查损失是否为NaN
             if self.epochs_without_improvement >= int(self.config.get('early_stopping_patience', 20)):
@@ -1117,7 +1205,7 @@ class OceanModelTrainer:
 
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp_enabled):
+                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self._forward(inputs)
                     loss, variable_losses, _ = self.compute_weighted_loss(outputs, targets)
                 batch_samples = int(inputs.shape[0])
@@ -1638,6 +1726,12 @@ def main():
             'compile_requested': trainer.compile_requested,
             'compile_active': trainer.compile_active,
             'compile_fallback_used': trainer.compile_fallback_used,
+            'mixed_precision_enabled': trainer.amp_enabled,
+            'mixed_precision_dtype': (
+                str(trainer.amp_dtype).replace('torch.', '') if trainer.amp_enabled else None
+            ),
+            'grad_overflow_skips_total': trainer.grad_overflow_skips_total,
+            'epoch_grad_overflow_skips': list(trainer.epoch_grad_overflow_skips),
             'peak_cuda_memory_bytes': (
                 int(torch.cuda.max_memory_allocated(trainer.device))
                 if trainer.device.type == 'cuda' else None

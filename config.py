@@ -182,6 +182,8 @@ PREDICTION_CONFIG = {
 HARDWARE_CONFIG = {
     'device': 'auto',              # 设备选择：'auto', 'cpu', 'cuda'
     'mixed_precision': True,       # 启用混合精度训练(AMP)，提升RTX 5090性能
+    'mixed_precision_dtype': 'auto',  # AMP 精度：'auto'(bf16优先,不支持回退fp16)|'bfloat16'|'float16'
+    'nonfinite_grad_skip_limit': 30,  # 连续非有限梯度跳过上限；损失/输出有限但梯度溢出时按 AMP 语义跳步，超过该上限判定为真实发散
     'compile_model': False,        # 实测动态形状 compile 更慢且会重复编译，正式协议使用 eager
     'cudnn_benchmark': False,      # 固定 seed 的正式实验关闭 autotuner，减少运行间漂移
 }
