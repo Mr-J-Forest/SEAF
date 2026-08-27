@@ -1221,8 +1221,11 @@ class OceanModelTrainer:
                 test_samples += batch_samples
 
                 # 收集预测结果
-                predictions.append(outputs.cpu().numpy())
-                targets_list.append(targets.cpu().numpy())
+                # AMP 下模型输出可能是 bfloat16/float16，NumPy 不支持这两种
+                # 标量类型的 .numpy() 转换；先统一转回 float32 再导出，避免
+                # 训练后评估在早停后的导出阶段崩溃（与精度无关，纯数值导出）。
+                predictions.append(outputs.float().cpu().numpy())
+                targets_list.append(targets.float().cpu().numpy())
 
         # 检查是否有测试数据
         if num_batches == 0:
