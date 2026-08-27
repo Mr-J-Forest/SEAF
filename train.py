@@ -84,7 +84,13 @@ def capture_rng_state() -> dict:
         'python': random.getstate(),
         'numpy': {
             'bit_generator': numpy_state[0],
-            'state': torch.from_numpy(numpy_state[1].copy()),
+            # NumPy's MT19937 state is uint32.  PyTorch 2.8 can use this
+            # dtype in memory but its zip serializer has no registered
+            # storage type for torch.uint32, so storing a tensor here makes
+            # every checkpoint fail at the end of the first epoch.  A plain
+            # integer list is portable across PyTorch versions and is
+            # converted back to uint32 only when restoring NumPy's state.
+            'state': numpy_state[1].astype(np.uint32, copy=True).tolist(),
             'position': int(numpy_state[2]),
             'has_gauss': int(numpy_state[3]),
             'cached_gaussian': float(numpy_state[4]),
@@ -102,9 +108,13 @@ def restore_rng_state(state: Optional[dict]) -> bool:
         return False
     random.setstate(state['python'])
     numpy_state = state['numpy']
+    raw_numpy_state = numpy_state['state']
+    if torch.is_tensor(raw_numpy_state):
+        # Read checkpoints produced before the portable-list representation.
+        raw_numpy_state = raw_numpy_state.cpu().numpy()
     np.random.set_state((
         numpy_state['bit_generator'],
-        numpy_state['state'].cpu().numpy().astype(np.uint32, copy=False),
+        np.asarray(raw_numpy_state, dtype=np.uint32),
         int(numpy_state['position']),
         int(numpy_state['has_gauss']),
         float(numpy_state['cached_gaussian']),

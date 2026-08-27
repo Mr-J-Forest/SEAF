@@ -854,6 +854,16 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertEqual(actual[1], expected[1])
         torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
 
+    def test_checkpoint_rng_snapshot_is_torch_serializable(self):
+        """NumPy's uint32 state must not create an unsupported torch storage."""
+        state = capture_rng_state()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'rng_state.pth'
+            torch.save(state, path)
+            restored = torch.load(path, map_location='cpu')
+        self.assertIsInstance(restored['numpy']['state'], list)
+        self.assertTrue(restore_rng_state(restored))
+
     def test_resume_fingerprint_ignores_only_runtime_controls(self):
         base = {'epochs': 80, 'batch_size': 151, 'learning_rate': 8e-4, 'training_note': 'a'}
         extended = {
