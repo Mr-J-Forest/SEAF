@@ -29,6 +29,7 @@ import platform
 import subprocess
 import hashlib
 import gc
+from contextlib import contextmanager
 from datetime import datetime
 import re
 from typing import Dict, List, Tuple, Optional
@@ -49,6 +50,53 @@ from metrics_utils import (
 
 # 初始化中文字体
 setup_chinese_fonts()
+
+
+@contextmanager
+def interprocess_evaluation_lock(lock_path: Optional[str]):
+    """Serialize memory-heavy post-training evaluation across local processes."""
+    if not lock_path:
+        yield 0.0
+        return
+
+    absolute_path = os.path.abspath(lock_path)
+    os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+    handle = open(absolute_path, 'a+b')
+    wait_started = time.perf_counter()
+    try:
+        if os.name == 'nt':
+            import msvcrt
+
+            if os.path.getsize(absolute_path) == 0:
+                handle.write(b'0')
+                handle.flush()
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+        wait_seconds = time.perf_counter() - wait_started
+        yield wait_seconds
+    finally:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _sanitize_note_for_path(note: str, max_length: int = 40) -> str:
@@ -1534,12 +1582,21 @@ def main():
         # 校准可只看训练期 validation loss；消融筛选输出 validation 报告；
         # 测试集仅在协议与候选模块冻结后运行。
         evaluation_scope = config.get('post_training_evaluation', 'validation')
-        phase_started = time.perf_counter()
-        results = (
-            trainer.evaluate(split=evaluation_scope)
-            if evaluation_scope in {'validation', 'test'} else {}
-        )
-        phase_timings['post_training_evaluation'] = time.perf_counter() - phase_started
+        evaluation_lock_path = os.environ.get('TSC_POST_EVAL_LOCK')
+        if evaluation_scope in {'validation', 'test'} and evaluation_lock_path:
+            print(f'[EVAL-LOCK] 等待训练后评估锁: {evaluation_lock_path}')
+        with interprocess_evaluation_lock(
+            evaluation_lock_path if evaluation_scope in {'validation', 'test'} else None
+        ) as evaluation_lock_wait:
+            phase_timings['post_training_evaluation_lock_wait'] = evaluation_lock_wait
+            if evaluation_scope in {'validation', 'test'} and evaluation_lock_path:
+                print(f'[EVAL-LOCK] 已获取评估锁，等待 {evaluation_lock_wait:.1f}s')
+            phase_started = time.perf_counter()
+            results = (
+                trainer.evaluate(split=evaluation_scope)
+                if evaluation_scope in {'validation', 'test'} else {}
+            )
+            phase_timings['post_training_evaluation'] = time.perf_counter() - phase_started
         if evaluation_scope == 'none':
             print('按配置跳过训练后评估；本次运行仅可用于超参数校准')
 

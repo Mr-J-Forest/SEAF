@@ -163,8 +163,16 @@ def main(
         help="immutable campaign namespace; strongly recommended for scientific runs",
     )
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=1,
+        help="maximum number of independent training jobs to run concurrently",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.max_parallel < 1:
+        raise ValueError("max-parallel must be at least 1")
 
     project_root = (
         Path(project_root).resolve()
@@ -198,6 +206,7 @@ def main(
             "matrix_sha256": matrix_hash,
             "stages": stages,
             "only": sorted(only) if only else None,
+            "max_parallel": args.max_parallel,
         }
         if manifest_path.is_file():
             existing = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -219,6 +228,11 @@ def main(
                     f"campaign {args.campaign!r} belongs to experiment selection "
                     f"{existing.get('only')}, not {sorted(only) if only else None}"
                 )
+            if int(existing.get("max_parallel", 1)) != args.max_parallel:
+                raise RuntimeError(
+                    f"campaign {args.campaign!r} belongs to max_parallel "
+                    f"{existing.get('max_parallel', 1)}, not {args.max_parallel}"
+                )
         else:
             atomic_json_dump(manifest_path, manifest)
     else:
@@ -230,13 +244,19 @@ def main(
     )
     log_dir.mkdir(parents=True, exist_ok=True)
     result_root.mkdir(parents=True, exist_ok=True)
+    # All queues rooted in the same checkout share the host-memory-heavy
+    # evaluation phase, even when they belong to different campaigns.
+    evaluation_lock_path = project_root / "outputs" / ".post_training_evaluation.lock"
 
     state = {
         "matrix": str(matrix_path),
+        "max_parallel": args.max_parallel,
+        "post_training_evaluation_lock": str(evaluation_lock_path),
         "updated_at": datetime.now().isoformat(),
         "jobs": [],
     }
     failures = 0
+    pending = []
 
     for position, job in enumerate(jobs, start=1):
         run_id = f"{job['stage']}__{job['name']}_seed{job['seed']}"
@@ -287,62 +307,139 @@ def main(
             print(" ".join(command), flush=True)
             continue
 
-        record["status"] = "running"
-        record["started_at"] = datetime.now().isoformat()
+        record["status"] = "pending"
         state["jobs"].append(record)
-        state["updated_at"] = datetime.now().isoformat()
-        atomic_json_dump(state_path, state)
-        print(f"[{position}/{len(jobs)}] START {run_id} ({record['mode']})", flush=True)
+        pending.append({
+            "position": position,
+            "record": record,
+            "run_dir": run_dir,
+            "log_path": log_path,
+            "command": command,
+        })
 
-        environment = os.environ.copy()
-        environment["PYTHONUNBUFFERED"] = "1"
-        with log_path.open("a", encoding="utf-8") as log_handle:
-            log_handle.write(f"\n=== queue start {datetime.now().isoformat()} ===\n")
-            log_handle.flush()
-            process = subprocess.Popen(
-                command,
-                cwd=project_root,
-                env=environment,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
-            record['pid'] = process.pid
-            peak_tree_rss = None
-            last_state_write = 0.0
-            while True:
+    state["updated_at"] = datetime.now().isoformat()
+    atomic_json_dump(state_path, state)
+    if args.dry_run:
+        return 0
+
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["TSC_POST_EVAL_LOCK"] = str(evaluation_lock_path)
+    active = []
+    last_state_write = 0.0
+
+    try:
+        while pending or active:
+            while pending and len(active) < args.max_parallel:
+                item = pending.pop(0)
+                record = item["record"]
+                log_handle = item["log_path"].open("a", encoding="utf-8")
+                record["status"] = "running"
+                record["started_at"] = datetime.now().isoformat()
+                print(
+                    f"[{item['position']}/{len(jobs)}] START "
+                    f"{record['run_id']} ({record['mode']})",
+                    flush=True,
+                )
+                log_handle.write(f"\n=== queue start {datetime.now().isoformat()} ===\n")
+                log_handle.flush()
+                process = subprocess.Popen(
+                    item["command"],
+                    cwd=project_root,
+                    env=environment,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+                record["pid"] = process.pid
+                item.update({
+                    "process": process,
+                    "log_handle": log_handle,
+                    "peak_tree_rss": None,
+                })
+                active.append(item)
+
+            state["updated_at"] = datetime.now().isoformat()
+            atomic_json_dump(state_path, state)
+            finished = []
+            abort_returncode = None
+
+            for item in active:
+                process = item["process"]
+                record = item["record"]
                 current_tree_rss = linux_process_tree_rss_bytes(process.pid)
                 if current_tree_rss is not None:
-                    peak_tree_rss = max(peak_tree_rss or 0, current_tree_rss)
-                    record['peak_process_tree_rss_bytes'] = peak_tree_rss
+                    item["peak_tree_rss"] = max(
+                        item["peak_tree_rss"] or 0,
+                        current_tree_rss,
+                    )
+                    record["peak_process_tree_rss_bytes"] = item["peak_tree_rss"]
+
                 returncode = process.poll()
+                if returncode is None:
+                    continue
+
+                item["log_handle"].close()
+                record["returncode"] = returncode
+                record["finished_at"] = datetime.now().isoformat()
+                if returncode == 0 and is_complete(
+                    item["run_dir"],
+                    expected_source_hash=source_hash if args.campaign else None,
+                ):
+                    record["status"] = "completed"
+                    print(
+                        f"[{item['position']}/{len(jobs)}] DONE {record['run_id']}",
+                        flush=True,
+                    )
+                else:
+                    record["status"] = "failed"
+                    failures += 1
+                    print(
+                        f"[{item['position']}/{len(jobs)}] FAILED {record['run_id']}; "
+                        f"see {item['log_path']}",
+                        flush=True,
+                    )
+                    if not args.continue_on_error:
+                        abort_returncode = returncode or 1
+                finished.append(item)
+
+            for item in finished:
+                active.remove(item)
+
+            state["updated_at"] = datetime.now().isoformat()
+            atomic_json_dump(state_path, state)
+
+            if abort_returncode is not None:
+                for item in active:
+                    item["process"].terminate()
+                for item in active:
+                    process = item["process"]
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    item["log_handle"].close()
+                    item["record"]["returncode"] = process.returncode
+                    item["record"]["finished_at"] = datetime.now().isoformat()
+                    item["record"]["status"] = "cancelled_after_failure"
+                state["updated_at"] = datetime.now().isoformat()
+                atomic_json_dump(state_path, state)
+                return abort_returncode
+
+            if active and not finished:
                 now = time.monotonic()
-                if returncode is not None:
-                    break
                 if now - last_state_write >= 5.0:
-                    state['updated_at'] = datetime.now().isoformat()
+                    state["updated_at"] = datetime.now().isoformat()
                     atomic_json_dump(state_path, state)
                     last_state_write = now
                 time.sleep(1.0)
-
-        record["returncode"] = returncode
-        record["finished_at"] = datetime.now().isoformat()
-        if returncode == 0 and is_complete(
-            run_dir, expected_source_hash=source_hash if args.campaign else None
-        ):
-            record["status"] = "completed"
-            print(f"[{position}/{len(jobs)}] DONE {run_id}", flush=True)
-        else:
-            record["status"] = "failed"
-            failures += 1
-            print(
-                f"[{position}/{len(jobs)}] FAILED {run_id}; see {log_path}",
-                flush=True,
-            )
-        state["updated_at"] = datetime.now().isoformat()
-        atomic_json_dump(state_path, state)
-
-        if record["status"] == "failed" and not args.continue_on_error:
-            return returncode or 1
+    except BaseException:
+        for item in active:
+            process = item["process"]
+            if process.poll() is None:
+                process.terminate()
+            item["log_handle"].close()
+        raise
 
     return 1 if failures else 0
 

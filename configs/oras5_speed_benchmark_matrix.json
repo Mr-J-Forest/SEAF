@@ -1,0 +1,63 @@
+{
+  "_stage_overrides": {
+    "speed": {
+      "epochs": 2,
+      "scheduler_patience": 2,
+      "early_stopping_patience": 2,
+      "post_training_evaluation": "none"
+    },
+    "parallel_evaluation_probe": {
+      "epochs": 1,
+      "scheduler_patience": 1,
+      "early_stopping_patience": 1,
+      "post_training_evaluation": "validation"
+    }
+  },
+  "speed": [
+    {
+      "name": "workers_0",
+      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "seeds": [42],
+      "overrides": {
+        "num_workers": 0,
+        "persistent_workers": false,
+        "prefetch_factor": 2,
+        "compile_model": false
+      }
+    },
+    {
+      "name": "workers_2",
+      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "seeds": [42],
+      "overrides": {
+        "num_workers": 2,
+        "persistent_workers": true,
+        "prefetch_factor": 2,
+        "compile_model": false
+      }
+    },
+    {
+      "name": "workers_4",
+      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "seeds": [42],
+      "overrides": {
+        "num_workers": 4,
+        "persistent_workers": true,
+        "prefetch_factor": 2,
+        "compile_model": false
+      }
+    }
+  ],
+  "parallel_evaluation_probe": [
+    {
+      "name": "lane_a",
+      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "seeds": [42]
+    },
+    {
+      "name": "lane_b",
+      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "seeds": [42]
+    }
+  ]
+}

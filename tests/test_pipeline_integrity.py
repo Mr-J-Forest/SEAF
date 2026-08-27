@@ -36,6 +36,7 @@ from scripts import select_learning_rates
 from train import (
     OceanModelTrainer,
     capture_rng_state,
+    interprocess_evaluation_lock,
     peak_host_memory_bytes,
     restore_rng_state,
     set_seed,
@@ -44,6 +45,15 @@ from train import (
 
 
 class PipelineIntegrityTests(unittest.TestCase):
+    def test_interprocess_evaluation_lock_creates_reusable_lock_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / 'evaluation.lock'
+            with interprocess_evaluation_lock(str(lock_path)) as wait_seconds:
+                self.assertGreaterEqual(wait_seconds, 0.0)
+                self.assertTrue(lock_path.is_file())
+            with interprocess_evaluation_lock(str(lock_path)) as wait_seconds:
+                self.assertGreaterEqual(wait_seconds, 0.0)
+
     def test_peak_host_memory_is_nonnegative_when_supported(self):
         peak_bytes = peak_host_memory_bytes()
         self.assertTrue(peak_bytes is None or peak_bytes >= 0)
@@ -994,6 +1004,90 @@ class PipelineIntegrityTests(unittest.TestCase):
             ).read_text(encoding='utf-8'))
             self.assertEqual(state['jobs'][0]['status'], 'completed')
             self.assertEqual(state['jobs'][0]['returncode'], 0)
+
+    def test_queue_honors_max_parallel_without_mixing_run_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            matrix_path = project_root / 'matrix.json'
+            config_path = project_root / 'config.json'
+            matrix_path.write_text(json.dumps({
+                'unit': [
+                    {'name': 'first', 'config': str(config_path), 'seeds': [42]},
+                    {'name': 'second', 'config': str(config_path), 'seeds': [42]},
+                ],
+            }), encoding='utf-8')
+            config_path.write_text('{}', encoding='utf-8')
+            (project_root / 'source_state.json').write_text(json.dumps({
+                'training_source_hash': 'abc',
+            }), encoding='utf-8')
+
+            class ConcurrentSuccessfulProcess:
+                active = 0
+                peak = 0
+                next_pid = 900000
+                lock_paths = []
+
+                def __init__(self, command, **_kwargs):
+                    self.pid = type(self).next_pid
+                    type(self).next_pid += 1
+                    type(self).active += 1
+                    type(self).peak = max(type(self).peak, type(self).active)
+                    type(self).lock_paths.append(
+                        _kwargs['env'].get('TSC_POST_EVAL_LOCK')
+                    )
+                    self._finished = False
+                    run_dir = Path(command[command.index('--result_dir') + 1])
+                    run_dir.mkdir(parents=True)
+                    (run_dir / 'config.json').write_text('{}', encoding='utf-8')
+                    (run_dir / 'run_summary.json').write_text(json.dumps({
+                        'status': 'completed',
+                        'evaluation_scope': 'none',
+                        'evaluation_file': None,
+                        'training_source_hash': 'abc',
+                    }), encoding='utf-8')
+                    (run_dir / '_SUCCESS').write_text('done\n', encoding='utf-8')
+
+                def poll(self):
+                    if not self._finished:
+                        self._finished = True
+                        type(self).active -= 1
+                    return 0
+
+            with mock.patch(
+                'scripts.run_experiment_queue.subprocess.Popen',
+                ConcurrentSuccessfulProcess,
+            ):
+                returncode = queue_main(
+                    [
+                        '--matrix', str(matrix_path),
+                        '--stage', 'unit',
+                        '--campaign', 'abc_parallel_unit',
+                        '--max-parallel', '2',
+                    ],
+                    project_root=project_root,
+                )
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(ConcurrentSuccessfulProcess.peak, 2)
+            self.assertEqual(len(set(ConcurrentSuccessfulProcess.lock_paths)), 1)
+            self.assertTrue(ConcurrentSuccessfulProcess.lock_paths[0])
+            state = json.loads((
+                project_root / 'outputs' / 'results' / 'campaigns'
+                / 'abc_parallel_unit' / 'experiment_queue_state.json'
+            ).read_text(encoding='utf-8'))
+            self.assertEqual(state['max_parallel'], 2)
+            self.assertEqual(
+                state['post_training_evaluation_lock'],
+                ConcurrentSuccessfulProcess.lock_paths[0],
+            )
+            self.assertEqual(
+                [job['status'] for job in state['jobs']],
+                ['completed', 'completed'],
+            )
+            self.assertEqual(
+                len({job['result_dir'] for job in state['jobs']}),
+                2,
+            )
 
     def test_learning_rate_selector_rejects_coarse_grid_boundary(self):
         with tempfile.TemporaryDirectory() as temporary:

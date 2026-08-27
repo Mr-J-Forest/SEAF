@@ -38,6 +38,10 @@
   "inference_stride_lat": 4.0,
   "expected_canonical_windows_per_origin": 76,
   "batch_size": 76,
+  "num_workers": 2,
+  "persistent_workers": true,
+  "prefetch_factor": 2,
+  "pin_memory": true,
   "enable_climatology_anomaly": true,
   "anomaly_variables": [
     "TEMP",

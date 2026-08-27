@@ -126,6 +126,7 @@ nohup setsid .venv/bin/python -u scripts/run_experiment_queue.py \
   --matrix configs/oras5_recent_baseline_matrix.json \
   --stage global_lr_calibrate \
   --campaign <training_source_hash>_oras5_recent_lr \
+  --max-parallel 2 \
   > run_logs/oras5_recent_lr.log 2>&1 < /dev/null &
 
 .venv/bin/python scripts/select_learning_rates.py \
@@ -214,8 +215,14 @@ python -u train.py \
 ```bash
 python -u scripts/run_experiment_queue.py \
   --stage screen \
-  --campaign <training_source_hash>_screen
+  --campaign <training_source_hash>_screen \
+  --max-parallel 2
 ```
+
+`--max-parallel 2` 同时运行两个彼此隔离的训练作业。ORAS5 配置相应固定为每个作业
+2 个 DataLoader worker；在 90 GiB cgroup 内存和 24 GiB GPU 上的双作业实测峰值约为
+75 GiB RAM、13 GiB 显存。队列会用跨进程锁串行执行训练后的完整 validation/test
+评估，避免两个大预测数组同时汇总。提高到 3 之前必须重新做内存峰值测试。
 
 阶段约束：
 
