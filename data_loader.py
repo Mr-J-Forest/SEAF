@@ -2210,11 +2210,15 @@ def create_data_loaders(
     use_pin_memory = bool(config.get('pin_memory', True))
     group_batches = bool(config.get('group_batches_by_time', False))
 
+    # 评估需要每个样本的真实索引用于溯源与物理量恢复，因此无论是否启用
+    # time-group 批采样，验证/测试（以及训练）loader 都应返回样本索引。
+    # 否则非 GTB 模型在训练后评估时会因缺少 batch_indices 而无法导出指标。
+    train_dataset.return_sample_index = True
+    val_dataset.return_sample_index = True
+    test_dataset.return_sample_index = True
+
     if group_batches:
         print("启用同时间窗口 batch sampler (Global Token Bank)")
-        train_dataset.return_sample_index = True
-        val_dataset.return_sample_index = True
-        test_dataset.return_sample_index = True
 
         train_sampler = TimeGroupedBatchSampler(train_dataset, batch_size, shuffle=True)
         val_sampler = TimeGroupedBatchSampler(val_dataset, batch_size, shuffle=False)
