@@ -21,6 +21,7 @@ def _make_minimal_trainer(skip_limit=30, batches=2):
     model = nn.Conv3d(2, 2, kernel_size=1)
     trainer.model = model
     trainer.forward_model = model
+    trainer.compile_active = False
     trainer.device = torch.device('cpu')
     trainer.amp_enabled = False
     trainer.amp_dtype = torch.bfloat16

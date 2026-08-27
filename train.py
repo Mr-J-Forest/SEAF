@@ -294,6 +294,10 @@ class OceanModelTrainer:
     海洋模型训练器
     """
 
+    # 类级默认值：供 __init__ 之外的构造路径（如测试的最小实例）保持可用。
+    amp_enabled = False
+    amp_dtype = torch.float16
+
     def __init__(self, config: dict = None):
         """
         初始化训练器
