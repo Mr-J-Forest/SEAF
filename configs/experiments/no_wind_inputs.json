@@ -1,4 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "input_variables": ["TEMP", "SALT", "SSHA"]
-}

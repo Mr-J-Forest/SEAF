@@ -16,7 +16,7 @@
   "speed": [
     {
       "name": "workers_0",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42],
       "overrides": {
         "num_workers": 0,
@@ -27,7 +27,7 @@
     },
     {
       "name": "workers_2",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42],
       "overrides": {
         "num_workers": 2,
@@ -38,7 +38,7 @@
     },
     {
       "name": "workers_4",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42],
       "overrides": {
         "num_workers": 4,
@@ -51,12 +51,12 @@
   "parallel_evaluation_probe": [
     {
       "name": "lane_a",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42]
     },
     {
       "name": "lane_b",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42]
     }
   ]

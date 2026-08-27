@@ -1,5 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "enable_climatology_anomaly": false,
-  "include_climatology_features": true
-}

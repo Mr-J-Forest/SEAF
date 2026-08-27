@@ -1,5 +1,0 @@
-{
-  "extends": "oras5_tsc_ap_residual.json",
-  "target_variables": ["SALT"],
-  "target_loss_weights": {"SALT": 1.0}
-}

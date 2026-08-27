@@ -1,4 +1,4 @@
-# TSC-Fusion 项目指南
+# APEX 项目指南
 
 设计与修复必须解决一般性根因，不得针对单个样本、单次运行或某个结果写特例。
 
@@ -36,7 +36,7 @@ nohup .venv/bin/python -u scripts/run_experiment_queue.py \
 | `--note` | 训练备注（必填） | `--note "stride4_batch16"` |
 | `--epochs` | 覆盖训练轮数 | `--epochs 100` |
 | `--lr` | 覆盖学习率 | `--lr 1e-4` |
-| `--batch_size` | 覆盖批次大小；time-group GTB 冻结为 151 | `--batch_size 151` |
+| `--batch_size` | 覆盖批次大小；ORAS5 默认 76 | `--batch_size 76` |
 
 查看进度：
 ```bash

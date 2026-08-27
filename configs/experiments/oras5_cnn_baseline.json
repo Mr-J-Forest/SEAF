@@ -1,8 +1,0 @@
-{
-  "extends": "../datasets/oras5_icdc_1deg_1979_2014.json",
-  "model_type": "cnn",
-  "enable_persistence_residual": false,
-  "enable_global_token_bank": false,
-  "group_batches_by_time": false,
-  "batch_size": 16
-}

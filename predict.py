@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TSC-Fusion 海洋预测脚本 - 统一配置版本
+APEX 海洋预测脚本 - 统一配置版本
 自动匹配模型结构和权重，生成可视化预测结果
 使用统一配置文件确保与训练脚本参数一致
 """
@@ -19,7 +19,7 @@ from typing import Tuple, Dict, List, Optional, Sequence
 
 # 导入统一配置
 from config import DEFAULT_CONFIG, load_config, merge_configs, save_config
-from convlstm_model import create_ocean_model
+from model_factory import create_ocean_model
 from data_loader import OceanDataset, TimeGroupedBatchSampler
 from font_config import setup_chinese_fonts
 from metrics_utils import compute_metric_report, resolve_variable_slices
@@ -85,7 +85,7 @@ def interleaved_batches(indices, batch_size):
 
 
 def balanced_group_sample_positions(group_sizes, total_samples):
-    """Allocate retained examples across complete GTB groups and their space."""
+    """Allocate retained examples across forecast origins and their windows."""
     sizes = [max(0, int(value)) for value in group_sizes]
     remaining = min(max(0, int(total_samples)), sum(sizes))
     output = []
@@ -309,18 +309,8 @@ class SmartOceanPredictor:
         grouped_sampler = TimeGroupedBatchSampler(
             test_dataset, inference_batch_size, shuffle=False
         )
-        if (
-            getattr(self.model, 'global_token_bank', None) is not None
-            and self.config.get('global_token_bank_scope') == 'time_group'
-            and grouped_sampler.max_group_size > inference_batch_size
-        ):
-            raise ValueError(
-                '预测时 time-group Global Token Bank 必须完整看到同一起报时次的空间窗；'
-                f'batch_size={inference_batch_size}, group_size={grouped_sampler.max_group_size}'
-            )
         all_batches = list(grouped_sampler)
-        # Every selected group stays complete for GTB. Retained examples are
-        # then balanced across temporal origins and spatial window order.
+        # Retain balanced examples across temporal origins and spatial order.
         needed_batches = min(len(all_batches), num_samples)
         selected_positions = np.linspace(
             0, len(all_batches) - 1, num=needed_batches, dtype=int
@@ -340,8 +330,6 @@ class SmartOceanPredictor:
                 remaining = num_samples - len(predictions)
                 if remaining <= 0:
                     break
-                # Keep the complete time group in the forward pass. Truncating
-                # before a GTB forward silently changes every retained sample.
                 outputs = self.model(batch_inputs.to(self.device, non_blocking=True)).cpu()
                 for local_idx in retained_positions[group_idx]:
                     sample_idx = int(batch_indices[local_idx])
@@ -454,8 +442,6 @@ class SmartOceanPredictor:
             override_stride_lon=stride_lon,
             override_stride_lat=stride_lat,
         )
-        bank_dataset = None
-
         try:
             all_lons = dense_dataset.lons.astype(np.float64)
             all_lats = dense_dataset.lats.astype(np.float64)
@@ -539,61 +525,6 @@ class SmartOceanPredictor:
 
             self.model.eval()
             with torch.no_grad():
-                global_bank_tokens = None
-                bank_stride_lon = None
-                bank_stride_lat = None
-                global_bank_indices = []
-                if (
-                    getattr(self.model, 'global_token_bank', None) is not None
-                    and hasattr(self.model, 'build_global_token_bank')
-                ):
-                    # The bank is a model input, not a rendering detail. Always
-                    # construct it on the canonical training grid so changing a
-                    # crop or overlap-tile stride cannot change the prediction.
-                    bank_stride_lon = float(self.config.get('train_stride_lon', 8.0))
-                    bank_stride_lat = float(self.config.get('train_stride_lat', 8.0))
-                    if (
-                        np.isclose(stride_lon, bank_stride_lon)
-                        and np.isclose(stride_lat, bank_stride_lat)
-                    ):
-                        bank_dataset = dense_dataset
-                    else:
-                        print(
-                            '  构建 canonical Global Token Bank 数据集: '
-                            f'经度步长={bank_stride_lon}°, 纬度步长={bank_stride_lat}°'
-                        )
-                        bank_dataset = OceanDataset(
-                            self.config['data_path'],
-                            self.config,
-                            mode='test',
-                            scalers=scalers,
-                            override_stride_lon=bank_stride_lon,
-                            override_stride_lat=bank_stride_lat,
-                        )
-                    global_bank_indices = [
-                        sample_idx
-                        for sample_idx, (start_idx, _) in enumerate(bank_dataset.sequences)
-                        if start_idx == sequence_start
-                    ]
-                    if not global_bank_indices:
-                        raise RuntimeError(
-                            'canonical Global Token Bank 没有匹配当前起报时次的窗口'
-                        )
-                    print(
-                        '  构建 canonical Global Token Bank '
-                        f'({len(global_bank_indices)} global windows, micro-batch={inference_batch_size})'
-                    )
-                    bank_parts = []
-                    for batch_indices in interleaved_batches(
-                        global_bank_indices, inference_batch_size
-                    ):
-                        bank_inputs = [bank_dataset[index][0] for index in batch_indices]
-                        bank_tensor = torch.stack(bank_inputs, dim=0).to(self.device)
-                        bank_parts.append(
-                            self.model.build_global_token_bank(bank_tensor).detach().cpu()
-                        )
-                    global_bank_tokens = torch.cat(bank_parts, dim=0).to(self.device)
-
                 for batch_idx, batch_indices in enumerate(inference_batches):
                     batch_inputs = []
                     batch_targets = []
@@ -603,13 +534,7 @@ class SmartOceanPredictor:
                         batch_targets.append(target_tensor)
 
                     inputs_tensor = torch.stack(batch_inputs, dim=0).to(self.device)
-                    if global_bank_tokens is None:
-                        outputs = self.model(inputs_tensor)
-                    else:
-                        outputs = self.model(
-                            inputs_tensor,
-                            global_bank_tokens=global_bank_tokens,
-                        )
+                    outputs = self.model(inputs_tensor)
                     if torch.isnan(outputs).any() or torch.isinf(outputs).any():
                         print(f"警告: batch {batch_idx} 输出包含 NaN/Inf，逐窗口过滤")
 
@@ -718,15 +643,6 @@ class SmartOceanPredictor:
                 'prediction_step': int(pred_step),
                 'valid_windows': int(valid_windows),
                 'candidate_windows': int(len(candidate_indices)),
-                'global_bank_windows': (
-                    int(global_bank_tokens.shape[0]) if global_bank_tokens is not None else 0
-                ),
-                'global_bank_scope': (
-                    'canonical_training_grid_at_origin'
-                    if global_bank_tokens is not None else None
-                ),
-                'global_bank_stride_lon': bank_stride_lon,
-                'global_bank_stride_lat': bank_stride_lat,
                 'inference_micro_batch_size': int(inference_batch_size),
                 'coverage_fraction': coverage_pct / 100.0,
                 'ocean_coverage_fraction': ocean_coverage_fraction,
@@ -739,12 +655,6 @@ class SmartOceanPredictor:
                 'inference_stride_lat': float(stride_lat),
             }
         finally:
-            if (
-                bank_dataset is not None
-                and bank_dataset is not dense_dataset
-                and getattr(bank_dataset, 'dataset', None) is not None
-            ):
-                bank_dataset.dataset.close()
             if getattr(dense_dataset, 'dataset', None) is not None:
                 dense_dataset.dataset.close()
             if ref_dataset is not None and getattr(ref_dataset, 'dataset', None) is not None:

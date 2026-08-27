@@ -1,6 +1,5 @@
 {
   "extends": "formal_base.json",
   "batch_size": 8,
-  "group_batches_by_time": false,
-  "enable_global_token_bank": false
+  "group_batches_by_time": false
 }

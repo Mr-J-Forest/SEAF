@@ -1,5 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "epochs": 8,
-  "learning_rate": 0.0003
-}

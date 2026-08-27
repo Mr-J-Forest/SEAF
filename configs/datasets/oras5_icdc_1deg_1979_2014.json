@@ -42,6 +42,8 @@
   "persistent_workers": true,
   "prefetch_factor": 2,
   "pin_memory": true,
+  "enable_positional_encoding": false,
+  "enable_time_encoding": false,
   "enable_climatology_anomaly": true,
   "anomaly_variables": [
     "TEMP",
@@ -55,15 +57,23 @@
     "QNET",
     "WFLUX"
   ],
-  "include_climatology_features": true,
+  "include_climatology_features": false,
   "climatology_feature_variables": ["TEMP", "SALT"],
   "climatology_baseline_variables": ["TEMP", "SALT"],
   "include_tendency_features": true,
   "tendency_feature_variables": ["TEMP", "SALT"],
+  "external_dynamic_variables": [
+    "UVEL",
+    "VVEL",
+    "SSHA",
+    "MLD",
+    "TAUX",
+    "TAUY",
+    "QNET",
+    "WFLUX"
+  ],
   "cache_preprocessed_dir": ".cache/preprocessed/oras5_1979_2014",
-  "tsc_variables": ["TEMP", "SALT"],
-  "enable_persistence_residual": true,
-  "persistence_residual_mode": "fixed_identity",
+  "enable_ap_residual": true,
   "use_gradient_loss": false,
   "target_loss_weights": {
     "TEMP": 0.5,

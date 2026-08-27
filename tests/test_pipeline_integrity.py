@@ -13,7 +13,7 @@ import xarray as xr
 from sklearn.preprocessing import StandardScaler
 
 from config import DEFAULT_CONFIG, load_config, validate_config
-from convlstm_model import create_ocean_model
+from model_factory import create_ocean_model
 from data_loader import (
     OceanDataset,
     TimeGroupedBatchSampler,
@@ -66,7 +66,7 @@ class PipelineIntegrityTests(unittest.TestCase):
         )
 
     def test_unknown_model_type_is_rejected_instead_of_becoming_convlstm(self):
-        config = self._small_tsc_config()
+        config = self._small_apex_config()
         config['model_type'] = 'misspelled_model'
         with self.assertRaisesRegex(ValueError, '未知 model_type'):
             validate_config(config)
@@ -81,7 +81,7 @@ class PipelineIntegrityTests(unittest.TestCase):
             'axiomocean_paper',
         ):
             with self.subTest(model_type=model_type):
-                config = self._small_tsc_config()
+                config = self._small_apex_config()
                 config.update({
                     'model_type': model_type,
                     'paper_hidden_dim': 8,
@@ -141,7 +141,7 @@ class PipelineIntegrityTests(unittest.TestCase):
             )
 
     @staticmethod
-    def _small_tsc_config():
+    def _small_apex_config():
         config = DEFAULT_CONFIG.copy()
         config.update({
             'sequence_length': 3,
@@ -150,28 +150,23 @@ class PipelineIntegrityTests(unittest.TestCase):
             'actual_output_channels': 3,
             'input_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
             'target_channel_slices': {'TEMP': [0, 1], 'SALT': [1, 3]},
-            'tsc_variables': ['TEMP', 'SALT'],
-            'tsc_hidden_dim': 8,
-            'tsc_output_dim': 4,
-            'tsc_attention_heads': 2,
-            'tsc_ffn_dim': 16,
-            'tsc_fusion_hidden_dim': 16,
-            'tsc_fusion_spectral_modes': [2, 2],
-            'tsc_fusion_ensemble_members': 2,
-            'tsc_fusion_transformer_heads': 4,
-            'tsc_fusion_transformer_ffn_dim': 32,
-            'global_token_bank_heads': 4,
-            'global_token_bank_ffn_dim': 32,
+            'model_type': 'apex',
+            'apex_hidden_dim': 16,
+            'apex_spectral_modes': [2, 2],
+            'apex_spectral_layers': 1,
+            'apex_ensemble_members': 2,
+            'enable_ap_residual': False,
             'dropout': 0.0,
         })
         return config
 
     @classmethod
     def _small_recent_baseline_config(cls, model_type):
-        config = cls._small_tsc_config()
+        config = cls._small_apex_config()
         config.update({
             'model_type': model_type,
             'input_variables': ['TEMP', 'SALT', 'FORCING'],
+            'external_dynamic_variables': ['FORCING'],
             'target_variables': ['TEMP', 'SALT'],
             'anomaly_variables': ['TEMP', 'SALT'],
             'climatology_feature_variables': ['TEMP', 'SALT'],
@@ -314,17 +309,13 @@ class PipelineIntegrityTests(unittest.TestCase):
     def test_oras5_ablation_configs_validate(self):
         experiment_dir = Path(__file__).resolve().parents[1] / 'configs' / 'experiments'
         names = (
-            'oras5_tsc_ap_residual.json',
+            'oras5_apex.json',
             'oras5_ablation_no_ap_residual.json',
             'oras5_ablation_direct_full_field.json',
             'oras5_ablation_no_tendency.json',
-            'oras5_ablation_thermohaline_only.json',
-            'oras5_ablation_no_tsc.json',
+            'oras5_ablation_no_external_dynamics.json',
             'oras5_ablation_no_spectral.json',
-            'oras5_ablation_no_3d.json',
             'oras5_ablation_no_ensemble.json',
-            'oras5_ablation_temp_only.json',
-            'oras5_ablation_salt_only.json',
         )
         for name in names:
             with self.subTest(config=name):
@@ -333,7 +324,7 @@ class PipelineIntegrityTests(unittest.TestCase):
                 validate_config(config)
 
         full = DEFAULT_CONFIG.copy()
-        full.update(load_config(experiment_dir / 'oras5_tsc_ap_residual.json'))
+        full.update(load_config(experiment_dir / 'oras5_apex.json'))
         no_tendency = DEFAULT_CONFIG.copy()
         no_tendency.update(load_config(experiment_dir / 'oras5_ablation_no_tendency.json'))
         self.assertTrue(full['include_tendency_features'])
@@ -709,8 +700,8 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertGreater(vector_loss.item(), 0.0)
         self.assertAlmostEqual(magnitude_loss.item(), 0.0, places=7)
 
-    def test_small_tsc_fusion_forward_and_backward(self):
-        config = self._small_tsc_config()
+    def test_small_apex_forward_and_backward(self):
+        config = self._small_apex_config()
         model = create_ocean_model(config)
         inputs = torch.randn(3, 3, 8, 5, 6, requires_grad=True)
         outputs = model(inputs)
@@ -719,53 +710,45 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertEqual(outputs.shape, (3, 2, 3, 5, 6))
         self.assertIsNotNone(inputs.grad)
 
-    def test_external_global_bank_makes_inference_partition_invariant(self):
-        config = self._small_tsc_config()
-        model = create_ocean_model(config).eval()
-        model.global_token_bank.gate.data.fill_(0.75)
-        inputs = torch.randn(6, 3, 8, 5, 6)
-
-        with torch.no_grad():
-            full_output = model(inputs)
-            bank = model.build_global_token_bank(inputs)
-            partitioned = torch.cat([
-                model(inputs[:2], global_bank_tokens=bank),
-                model(inputs[2:5], global_bank_tokens=bank),
-                model(inputs[5:], global_bank_tokens=bank),
-            ])
-
-        torch.testing.assert_close(partitioned, full_output, rtol=1e-5, atol=1e-6)
-
     def test_ablation_removes_disabled_parameters(self):
-        full = create_ocean_model(self._small_tsc_config())
+        full = create_ocean_model(self._small_apex_config())
 
-        no_tsc_config = self._small_tsc_config()
-        no_tsc_config['ablation_disable_tsc'] = True
-        no_tsc = create_ocean_model(no_tsc_config)
-        self.assertIsNone(no_tsc.thermohaline_memory)
-        self.assertLess(
-            sum(p.numel() for p in no_tsc.parameters()),
-            sum(p.numel() for p in full.parameters()),
-        )
+        no_spectral_config = self._small_apex_config()
+        no_spectral_config['ablation_disable_spectral'] = True
+        no_spectral = create_ocean_model(no_spectral_config)
+        self.assertFalse(any(
+            name.endswith(('weight_pos', 'weight_neg'))
+            for name, _ in no_spectral.named_parameters()
+        ))
+        self.assertTrue(any(
+            name.endswith(('weight_pos', 'weight_neg'))
+            for name, _ in full.named_parameters()
+        ))
 
-        no_ensemble_config = self._small_tsc_config()
+        no_ensemble_config = self._small_apex_config()
         no_ensemble_config['ablation_disable_ensemble'] = True
         no_ensemble = create_ocean_model(no_ensemble_config)
         self.assertEqual(len(no_ensemble.member_heads), 1)
         self.assertIsNone(no_ensemble.ensemble_gate)
 
-        no_persistence_config = self._small_tsc_config()
-        no_persistence_config['enable_persistence_residual'] = False
+        no_persistence_config = self._small_apex_config()
+        no_persistence_config['enable_ap_residual'] = False
         no_persistence = create_ocean_model(no_persistence_config)
         self.assertEqual(no_persistence.persistence_slices, [])
-        self.assertIsNone(no_persistence.persistence_scale)
+        self.assertIsNone(no_persistence.ap_scale)
+
+        for removed_name in (
+            'thermohaline_memory', 'structure_branch', 'fusion_transformer',
+            'global_token_bank', 'local_branch',
+        ):
+            self.assertFalse(hasattr(full, removed_name))
 
     def test_fixed_identity_persistence_starts_exactly_at_anomaly_persistence(self):
-        config = self._small_tsc_config()
+        config = self._small_apex_config()
         config.update({
             'actual_output_channels': 4,
             'target_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
-            'persistence_residual_mode': 'fixed_identity',
+            'enable_ap_residual': True,
             'enable_climatology_anomaly': True,
             'anomaly_variables': ['TEMP', 'SALT'],
         })
@@ -777,9 +760,23 @@ class PipelineIntegrityTests(unittest.TestCase):
 
         expected = inputs[:, -1, :4].unsqueeze(1).expand(-1, 2, -1, -1, -1)
         torch.testing.assert_close(outputs, expected, rtol=0, atol=0)
-        self.assertIsNone(model.persistence_proj)
-        self.assertFalse(model.persistence_scale.requires_grad)
-        self.assertEqual(float(model.persistence_scale), 1.0)
+        self.assertFalse(model.ap_scale.requires_grad)
+        self.assertEqual(float(model.ap_scale), 1.0)
+
+    def test_apex_residual_heads_receive_gradients_from_ap_initialization(self):
+        config = self._small_apex_config()
+        config.update({
+            'actual_output_channels': 4,
+            'target_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
+            'enable_ap_residual': True,
+        })
+        model = create_ocean_model(config).train()
+        inputs = torch.randn(2, 3, 8, 4, 5)
+        target = torch.randn(2, 2, 4, 4, 5)
+        torch.nn.functional.mse_loss(model(inputs), target).backward()
+        output_layer = model.member_heads[0][-1]
+        self.assertIsNotNone(output_layer.weight.grad)
+        self.assertGreater(float(output_layer.weight.grad.abs().sum()), 0.0)
 
     def test_ocean_window_can_require_a_full_water_column(self):
         values = np.ones((1, 2, 2, 2), dtype=np.float32)
@@ -830,18 +827,6 @@ class PipelineIntegrityTests(unittest.TestCase):
 
         np.testing.assert_allclose(region['climatology']['TEMP'][:, 0, 0], [2.0, 12.0])
         self.assertEqual(region['anomaly_data'], {})
-
-    def test_global_token_bank_requires_time_grouping(self):
-        config = DEFAULT_CONFIG.copy()
-        config['group_batches_by_time'] = False
-        with self.assertRaisesRegex(ValueError, 'group_batches_by_time'):
-            validate_config(config)
-
-    def test_time_group_global_bank_requires_canonical_split_grid(self):
-        config = DEFAULT_CONFIG.copy()
-        config['test_stride_lon'] = config['train_stride_lon'] * 2
-        with self.assertRaisesRegex(ValueError, 'canonical'):
-            validate_config(config)
 
     def test_checkpoint_rng_snapshot_restores_all_cpu_generators(self):
         set_seed(31415)

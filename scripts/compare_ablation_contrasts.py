@@ -202,7 +202,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--results-root', required=True, help='campaign result root')
     parser.add_argument('--stage', default='screen')
-    parser.add_argument('--contrasts', default='configs/ablation_contrasts.json')
+    parser.add_argument('--contrasts', default='configs/oras5_ablation_contrasts.json')
     parser.add_argument('--output', default=None)
     parser.add_argument('--strict', action='store_true')
     args = parser.parse_args()

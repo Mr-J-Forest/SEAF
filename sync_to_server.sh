@@ -2,16 +2,16 @@
 set -euo pipefail
 #==========================================
 # sync_to_server.sh
-# 将本地代码同步到远程服务器。
+# 将 APEX 本地代码同步到远程服务器。
 # 排除规则自动从 .gitignore 读取，保持一致。
 #
 # 用法: ./sync_to_server.sh
 #==========================================
 
-SERVER="${TSC_SERVER:-root@connect.westd.seetacloud.com}"
-PORT="${TSC_SERVER_PORT:-39323}"
-REMOTE_DIR="${TSC_REMOTE_DIR:-/root/TSC-Fusion}"
-SSH_BIN="${TSC_SSH_BIN:-ssh}"
+SERVER="${APEX_SERVER:-${TSC_SERVER:-root@connect.westd.seetacloud.com}}"
+PORT="${APEX_SERVER_PORT:-${TSC_SERVER_PORT:-39323}}"
+REMOTE_DIR="${APEX_REMOTE_DIR:-${TSC_REMOTE_DIR:-/root/TSC-Fusion}}"
+SSH_BIN="${APEX_SSH_BIN:-${TSC_SSH_BIN:-ssh}}"
 
 echo "=== 同步代码到服务器 $SERVER:$REMOTE_DIR ==="
 echo "由 Git 枚举已跟踪和未忽略的工作区文件..."
@@ -49,7 +49,8 @@ SOURCE_HASH="$({
   done
 } | git hash-object --stdin)"
 TRAINING_FILES=(
-  train.py config.py convlstm_model.py paper_reimplementation_models.py
+  train.py config.py apex_model.py model_factory.py recent_baseline_models.py
+  paper_reimplementation_models.py
   data_loader.py metrics_utils.py font_config.py requirements.txt
   scripts/run_experiment_queue.py scripts/aggregate_results.py
 )

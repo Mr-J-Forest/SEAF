@@ -1,8 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "target_variables": ["TEMP"],
-  "anomaly_variables": ["TEMP", "SALT"],
-  "climatology_feature_variables": ["TEMP", "SALT"],
-  "target_loss_weights": {"TEMP": 1.0},
-  "ablation_disable_tsc": true
-}

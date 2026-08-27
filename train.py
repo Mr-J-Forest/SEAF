@@ -1,5 +1,5 @@
 """
-TSC-Fusion 与基线模型的海洋温盐训练脚本
+APEX 与基线模型的海洋温盐训练脚本
 使用统一配置文件确保参数一致性
 """
 
@@ -38,7 +38,7 @@ from tqdm import tqdm
 
 # 导入统一配置
 from config import DEFAULT_CONFIG, load_config, merge_configs, validate_config
-from convlstm_model import create_ocean_model
+from model_factory import create_ocean_model
 from data_loader import create_data_loaders
 from font_config import setup_chinese_fonts
 from metrics_utils import (
@@ -1610,7 +1610,7 @@ def main():
     # 验证配置
     validate_config(config)
 
-    model_type = str(config.get('model_type', 'convlstm')).lower()
+    model_type = str(config.get('model_type', 'apex')).lower()
     print("海洋温盐预测模型训练")
     print("=" * 50)
     print("使用统一配置文件:")
@@ -1626,17 +1626,13 @@ def main():
     print(f"模型类型: {model_type}")
     print(f"  [PosEncode] 位置编码: {'开启' if config.get('enable_positional_encoding', False) else '关闭'}")
     print(f"  [TimeEncode] 时间编码: {'开启' if config.get('enable_time_encoding', False) else '关闭'}")
-    if model_type in {
-        'tsc_fusion', 'tscglobal', 'tsc_global_axiom_ensemble',
-        'tsc-spectrum-axiom-ensemble', 'tsc_spectrum_axiom_ensemble',
-    }:
-        print("  TSC-Fusion 组件状态:")
-        print(f"    [TSC] 热盐结构记忆: {'关闭(消融)' if config.get('ablation_disable_tsc', False) else '开启'}")
+    if model_type == 'apex':
+        print("  APEX 正式组件状态:")
+        print(f"    [AP residual] 固定恒等跳连: {'关闭(消融)' if not config.get('enable_ap_residual', True) else '开启'}")
         print(f"    [Spectral] 全局频谱分支: {'关闭(消融)' if config.get('ablation_disable_spectral', False) else '开启'}")
-        print(f"    [3D] 三维结构分支: {'关闭(消融)' if config.get('ablation_disable_3d', False) else '开启'}")
         print(f"    [Ensemble] 门控集成: {'关闭(消融)' if config.get('ablation_disable_ensemble', False) else '开启'}")
-        print(f"    [GTB] 跨窗口上下文: {'开启' if config.get('enable_global_token_bank', False) else '关闭'}")
-        print(f"    [FusionTransformer] 层数: {int(config.get('tsc_fusion_transformer_layers', 0))}")
+        print(f"    [Tendency] 因果差分输入: {'开启' if config.get('include_tendency_features', False) else '关闭(消融)'}")
+        print(f"    [Dynamics] 外部动力输入: {config.get('external_dynamic_variables', [])}")
     elif model_type in {
         'ofb_fourcastnet', 'ofb-fourcastnet',
         'ofb_climax', 'ofb-climax',
@@ -1648,9 +1644,10 @@ def main():
             f"{provenance.get('method_name', model_type)}"
         )
         print("  [Baseline] 本地 ORAS5 从头训练；不是官方权重或官方成绩")
-    print(f"  [Persistence] 持久性残差: {'开启' if config.get('enable_persistence_residual', True) else '关闭'}")
-    if config.get('enable_persistence_residual', True):
-        print(f"  [Persistence] 模式: {config.get('persistence_residual_mode', 'learned_scale')}")
+    if model_type != 'apex':
+        print(f"  [Persistence] 持久性残差: {'开启' if config.get('enable_persistence_residual', True) else '关闭'}")
+        if config.get('enable_persistence_residual', True):
+            print(f"  [Persistence] 模式: {config.get('persistence_residual_mode', 'fixed_identity')}")
     print("=" * 50)
 
     training_note = args.note.strip()

@@ -1,5 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "batch_size": 2,
-  "global_token_bank_scope": "batch"
-}

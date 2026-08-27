@@ -150,7 +150,7 @@ def main(
     project_root: Path | str | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--matrix", default="configs/experiment_matrix.json")
+    parser.add_argument("--matrix", default="configs/oras5_recent_baseline_matrix.json")
     parser.add_argument(
         "--stage", action="append", dest="stages", required=True,
         help="explicit experiment stage; repeat to run more than one",

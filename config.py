@@ -28,7 +28,7 @@ DATA_CONFIG = {
     # 2. 序列要求：每个样本需要 sequence_length + prediction_length 个连续时间步。
     #    carry_history 下验证/测试可使用分界前已观测历史，但预测目标不能越界。
     # 3. 空间维度：每个时间段包含所有空间位置的数据
-    # 4. 正式 GTB 协议：train/val/test 使用同一 canonical 空间网格
+    # 4. Train/validation/test 使用同一 canonical 空间网格。
     'train_ratio': 0.6,    # 训练集比例：前60%时间段
     'val_ratio': 0.2,      # 验证集比例：中间20%时间段
     'test_ratio': 0.2,     # 测试集比例：最后20%时间段
@@ -53,8 +53,7 @@ DATA_CONFIG = {
     # Train/val/test: 同一个 8° canonical 网格
     'train_stride_lon': 8.0,
     'train_stride_lat': 8.0,
-    # Val/Test 使用与训练相同的 canonical 网格。Global Token Bank 对
-    # token 的数量与空间采样敏感，因此正式协议不能在不同 split 改变 bank。
+    # Val/Test 使用与训练相同的 canonical 网格，保证评价空间采样一致。
     'val_stride_lon': 8.0,
     'val_stride_lat': 8.0,
     'test_stride_lon': 8.0,
@@ -69,7 +68,7 @@ DATA_CONFIG = {
     # Overlap-tile 融合参数
     'taper_ratio': 0.25,           # 边缘余弦衰减带占窗口尺寸比例（四周各25%）
     'min_blend_weight': 1e-3,      # 融合时边缘最低权重，避免除零/空洞
-    'inference_micro_batch_size': 32,  # 两阶段全局 bank 推理的局部编码批大小
+    'inference_micro_batch_size': 32,
 
     # 气候态 / anomaly 建模
     'anomaly_variables': ['TEMP', 'SALT'],       # 对这些变量减去训练期月气候态后再标准化
@@ -80,6 +79,8 @@ DATA_CONFIG = {
     # 显式物理量后向差分只使用当前及过去观测，并使用独立训练期 scaler。
     'include_tendency_features': False,
     'tendency_feature_variables': ['TEMP', 'SALT'],
+    # APEX 正式输入中的外部动力与表面强迫变量；数据集配置覆盖实际列表。
+    'external_dynamic_variables': ['SSHA', 'UWND', 'VWND'],
 
     # 预处理持久化缓存（避免每次训练重复滑窗搜索、气候态计算、标准化拟合）
     'cache_preprocessed': True,                  # 是否启用预处理缓存
@@ -88,40 +89,18 @@ DATA_CONFIG = {
 
 # ========== 模型相关参数 ==========
 MODEL_CONFIG = {
-    'model_type': 'tsc_fusion',           # 模型类型: 'convlstm' 或 'tsc_fusion'
+    'model_type': 'apex',
     'hidden_dims': [64, 96, 128, 128],  # 隐藏层维度
     'kernel_size': (3, 3),              # 卷积核大小
     'num_layers': 4,                    # 层数
     'dropout': 0.05,                     # Dropout；最终值由验证集协议确定
 
-    # ThermohalineMemory 只读取 TEMP/SALT 剖面；SSHA/风场仍进入其他主干分支。
-    # 不要在论文中宣称使用了未输入的派生变量。
-    'tsc_variables': ['TEMP', 'SALT'],
-    'tsc_num_prototypes': 8,
-    'tsc_hidden_dim': 32,
-    'tsc_output_dim': 16,
-    'tsc_attention_heads': 4,
-    'tsc_memory_layers': 1,
-    'tsc_ffn_dim': 64,
-    'tsc_fusion_hidden_dim': 64,
-    'tsc_fusion_spectral_modes': [8, 8],
-    'tsc_fusion_spectral_layers': 2,
-    'tsc_fusion_3d_layers': 2,
-    'tsc_fusion_ensemble_members': 4,
-    'tsc_fusion_transformer_heads': 8,
-    'tsc_fusion_transformer_layers': 1,
-    'tsc_fusion_transformer_ffn_dim': 256,
-    'tsc_fusion_persistence_init': 0.5,
-    'enable_persistence_residual': True,
-    # learned_scale 保留历史行为；fixed_identity 在 anomaly 空间提供严格 AP skip。
-    'persistence_residual_mode': 'learned_scale',
-    'enable_global_token_bank': True,
-    # time_group 要求训练/验证/测试时一个 batch 覆盖同一起报时次的全部窗口。
-    # 密集全图推理使用两阶段外部 bank，可在不改变结果的前提下 micro-batch。
-    'global_token_bank_scope': 'time_group',
-    'global_token_bank_heads': 4,
-    'global_token_bank_ffn_dim': 128,
-    'global_token_bank_dropout': 0.05,
+    'apex_hidden_dim': 64,
+    'apex_spectral_modes': [8, 8],
+    'apex_spectral_layers': 2,
+    'apex_ensemble_members': 4,
+    # 正式模型使用严格恒等 AP skip；该开关仅服务 no-AP 消融。
+    'enable_ap_residual': True,
 }
 
 # ========== 训练相关参数 ==========
@@ -136,7 +115,7 @@ TRAINING_CONFIG = {
     'persistent_workers': False,
     'prefetch_factor': 2,          # 仅 num_workers>0 时生效
     'pin_memory': True,            # 是否使用pin_memory
-    'group_batches_by_time': True, # 将同一历史起点的不同窗口组织到同一batch，供Global Token Bank使用
+    'group_batches_by_time': True, # 将同一起报时次的空间窗口组织到同一批次
     
     # 优化器参数
     'optimizer_type': 'adam',      # 可选 adam / adamw；基线按公开协议显式覆盖
@@ -276,6 +255,12 @@ def validate_config(config):
         elif not set(tendency_variables).issubset(set(config.get('input_variables', []))):
             errors.append("tendency_feature_variables 必须是 input_variables 的子集")
 
+    external_variables = config.get('external_dynamic_variables', [])
+    if not isinstance(external_variables, (list, tuple)):
+        errors.append("external_dynamic_variables 必须是列表")
+    elif not set(external_variables).issubset(set(config.get('input_variables', []))):
+        errors.append("external_dynamic_variables 必须是 input_variables 的子集")
+
     ocean_threshold = float(config.get('ocean_threshold', 1.0))
     if not 0.0 <= ocean_threshold <= 1.0:
         errors.append("ocean_threshold 必须位于[0, 1]")
@@ -345,21 +330,14 @@ def validate_config(config):
             errors.append("target_loss_weights 总和必须为正")
 
     normalized_model_type = str(config.get('model_type', '')).lower()
-    tsc_model_types = {
-        'tsc_fusion',
-        'tscglobal',
-        'tsc_global_axiom_ensemble',
-        'tsc-spectrum-axiom-ensemble',
-        'tsc_spectrum_axiom_ensemble',
-    }
+    apex_model_types = {'apex'}
     recent_baseline_types = {
         'ofb_fourcastnet', 'ofb-fourcastnet',
         'ofb_climax', 'ofb-climax',
         'ofb_swin', 'ofb-swin',
     }
     supported_model_types = {
-        'convlstm', 'cnn',
-        *tsc_model_types,
+        *apex_model_types,
         *recent_baseline_types,
         'tianhai_paper', 'tianhai-reimpl',
         'fuxi_ocean_paper', 'fuxi-ocean-reimpl',
@@ -369,8 +347,38 @@ def validate_config(config):
     if normalized_model_type not in supported_model_types:
         errors.append(f"未知 model_type: {config.get('model_type')!r}")
 
-    persistence_model_types = tsc_model_types | recent_baseline_types
-    if normalized_model_type in persistence_model_types:
+    if normalized_model_type in apex_model_types:
+        if (
+            config.get('enable_ap_residual', True)
+            and not set(config.get('target_variables', [])).issubset(
+                set(config.get('input_variables', []))
+            )
+        ):
+            errors.append("启用 AP residual 时 target_variables 必须是 input_variables 的子集")
+        if config.get('enable_ap_residual', True):
+            if not config.get('enable_climatology_anomaly', False):
+                errors.append("APEX AP residual 要求启用 climatology anomaly")
+            elif not set(config.get('target_variables', [])).issubset(
+                set(config.get('anomaly_variables', []))
+            ):
+                errors.append(
+                    "APEX AP residual 要求所有 target_variables 都属于 anomaly_variables"
+                )
+        if int(config.get('apex_hidden_dim', 0)) <= 0:
+            errors.append("apex_hidden_dim 必须为正")
+        spectral_modes = config.get('apex_spectral_modes', [8, 8])
+        if (
+            not isinstance(spectral_modes, (list, tuple))
+            or len(spectral_modes) != 2
+            or any(int(value) <= 0 for value in spectral_modes)
+        ):
+            errors.append("apex_spectral_modes 必须包含两个正整数")
+        if int(config.get('apex_spectral_layers', 0)) <= 0:
+            errors.append("apex_spectral_layers 必须为正")
+        if int(config.get('apex_ensemble_members', 0)) <= 0:
+            errors.append("apex_ensemble_members 必须为正")
+
+    if normalized_model_type in recent_baseline_types:
         if (
             config.get('enable_persistence_residual', True)
             and not set(config.get('target_variables', [])).issubset(
@@ -378,21 +386,10 @@ def validate_config(config):
             )
         ):
             errors.append("启用 persistence residual 时 target_variables 必须是 input_variables 的子集")
-        persistence_mode = config.get('persistence_residual_mode', 'learned_scale')
-        if persistence_mode not in {'learned_scale', 'fixed_identity'}:
-            errors.append(
-                "persistence_residual_mode 必须为 learned_scale 或 fixed_identity"
-            )
-        if (
-            normalized_model_type in recent_baseline_types
-            and config.get('enable_persistence_residual', True)
-            and persistence_mode != 'fixed_identity'
-        ):
+        persistence_mode = config.get('persistence_residual_mode', 'fixed_identity')
+        if persistence_mode != 'fixed_identity':
             errors.append("OceanForecastBench adapters 仅支持 fixed_identity persistence")
-        if (
-            config.get('enable_persistence_residual', True)
-            and persistence_mode == 'fixed_identity'
-        ):
+        if config.get('enable_persistence_residual', True):
             if not config.get('enable_climatology_anomaly', False):
                 errors.append("fixed_identity persistence 要求启用 climatology anomaly")
             elif not set(config.get('target_variables', [])).issubset(
@@ -464,51 +461,6 @@ def validate_config(config):
     ):
         errors.append("optimizer_betas 必须包含两个位于[0, 1)的数")
 
-    if normalized_model_type in tsc_model_types:
-        if not config.get('ablation_disable_tsc', False):
-            tsc_variables = list(config.get('tsc_variables', []))
-            if not tsc_variables:
-                errors.append("启用 ThermohalineMemory 时 tsc_variables 不能为空")
-            elif not set(tsc_variables).issubset(set(config.get('input_variables', []))):
-                errors.append("tsc_variables 必须是 input_variables 的子集")
-        if config.get('tsc_fusion_hidden_dim', 0) <= 0:
-            errors.append("tsc_fusion_hidden_dim 必须为正")
-        spectral_modes = config.get('tsc_fusion_spectral_modes', [8, 8])
-        if len(spectral_modes) != 2 or spectral_modes[0] <= 0 or spectral_modes[1] <= 0:
-            errors.append("tsc_fusion_spectral_modes 必须包含两个正整数")
-        if config.get('tsc_fusion_ensemble_members', 0) <= 0:
-            errors.append("tsc_fusion_ensemble_members 必须为正")
-        if config.get('tsc_fusion_transformer_layers', 0) > 0:
-            hidden = config.get('tsc_fusion_hidden_dim', 0)
-            heads = config.get('tsc_fusion_transformer_heads', 1)
-            if heads <= 0:
-                errors.append("tsc_fusion_transformer_heads 必须为正")
-            elif hidden % heads != 0:
-                errors.append("tsc_fusion_hidden_dim 必须能被 tsc_fusion_transformer_heads 整除")
-        if config.get('enable_global_token_bank', False):
-            if config.get('global_token_bank_scope', 'time_group') not in {'time_group', 'batch'}:
-                errors.append("global_token_bank_scope 必须为 time_group 或 batch")
-            hidden = config.get('tsc_fusion_hidden_dim', 0)
-            heads = config.get('global_token_bank_heads', 1)
-            if heads <= 0:
-                errors.append("global_token_bank_heads 必须为正")
-            elif hidden % heads != 0:
-                errors.append("tsc_fusion_hidden_dim 必须能被 global_token_bank_heads 整除")
-            if not config.get('group_batches_by_time', False):
-                errors.append("启用 Global Token Bank 时必须启用 group_batches_by_time")
-            if config.get('global_token_bank_scope', 'time_group') == 'time_group':
-                canonical_lon = float(config.get('train_stride_lon', 0))
-                canonical_lat = float(config.get('train_stride_lat', 0))
-                for split in ('val', 'test'):
-                    split_lon = float(config.get(f'{split}_stride_lon', 0))
-                    split_lat = float(config.get(f'{split}_stride_lat', 0))
-                    if split_lon != canonical_lon or split_lat != canonical_lat:
-                        errors.append(
-                            "time_group Global Token Bank 要求 train/val/test 使用相同的 "
-                            f"canonical 滑窗网格；{split}=({split_lon}, {split_lat})，"
-                            f"train=({canonical_lon}, {canonical_lat})"
-                        )
-    
     if errors:
         raise ValueError("配置验证失败:\n" + "\n".join(f"- {error}" for error in errors))
     

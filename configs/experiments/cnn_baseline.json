@@ -1,5 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "model_type": "cnn",
-  "enable_global_token_bank": false
-}

@@ -28,9 +28,9 @@
     }
   },
   "global_lr_calibrate": [
-    {"name": "lr_tsc_fusion_3e4", "config": "configs/experiments/oras5_tsc_ap_residual.json", "seeds": [42], "overrides": {"learning_rate": 0.0003}},
-    {"name": "lr_tsc_fusion_8e4", "config": "configs/experiments/oras5_tsc_ap_residual.json", "seeds": [42], "overrides": {"learning_rate": 0.0008}},
-    {"name": "lr_tsc_fusion_15e4", "config": "configs/experiments/oras5_tsc_ap_residual.json", "seeds": [42], "overrides": {"learning_rate": 0.0015}},
+    {"name": "lr_apex_3e4", "config": "configs/experiments/oras5_apex.json", "seeds": [42], "overrides": {"learning_rate": 0.0003}},
+    {"name": "lr_apex_8e4", "config": "configs/experiments/oras5_apex.json", "seeds": [42], "overrides": {"learning_rate": 0.0008}},
+    {"name": "lr_apex_15e4", "config": "configs/experiments/oras5_apex.json", "seeds": [42], "overrides": {"learning_rate": 0.0015}},
     {"name": "lr_ofb_fourcastnet_3e6", "config": "configs/experiments/oras5_ofb_fourcastnet_ap_residual.json", "seeds": [42], "overrides": {"learning_rate": 0.000003}},
     {"name": "lr_ofb_fourcastnet_1e5", "config": "configs/experiments/oras5_ofb_fourcastnet_ap_residual.json", "seeds": [42], "overrides": {"learning_rate": 0.00001}},
     {"name": "lr_ofb_fourcastnet_3e5", "config": "configs/experiments/oras5_ofb_fourcastnet_ap_residual.json", "seeds": [42], "overrides": {"learning_rate": 0.00003}},
@@ -43,8 +43,8 @@
   ],
   "screen": [
     {
-      "name": "tsc_fusion_ap_residual",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "name": "apex",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42]
     },
     {
@@ -69,8 +69,8 @@
   },
   "_final_test_template": [
     {
-      "name": "tsc_fusion_ap_residual",
-      "config": "configs/experiments/oras5_tsc_ap_residual.json",
+      "name": "apex",
+      "config": "configs/experiments/oras5_apex.json",
       "seeds": [42, 123, 3407],
       "overrides": {"post_training_evaluation": "test"}
     },

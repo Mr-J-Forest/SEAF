@@ -40,19 +40,10 @@ NO_TEST_STAGES = {
     'postfix_smoke',
 } | DIAGNOSTIC_STAGES | VALIDATION_SCREEN_STAGES | VALIDATION_CONFIRMATION_STAGES
 
-
-def max_expected_windows(value) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return max(int(count) for count in value.values())
-    return int(value)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--matrix', default='configs/experiment_matrix.json')
-    parser.add_argument('--contrasts', default='configs/ablation_contrasts.json')
+    parser.add_argument('--matrix', default='configs/oras5_ablation_matrix.json')
+    parser.add_argument('--contrasts', default='configs/oras5_ablation_contrasts.json')
     args = parser.parse_args()
 
     matrix_path = (PROJECT_ROOT / args.matrix).resolve()
@@ -132,29 +123,6 @@ def main() -> int:
                         "must identify the method/source and remain explicitly non-official"
                     )
 
-            if (
-                config.get('enable_global_token_bank', False)
-                and config.get('global_token_bank_scope') == 'time_group'
-            ):
-                if not config.get('group_batches_by_time', False):
-                    errors.append(f"{stage}/{job['name']}: time-group GTB requires grouped batches")
-                stride_pairs = {
-                    (
-                        float(config[f'{split}_stride_lon']),
-                        float(config[f'{split}_stride_lat']),
-                    )
-                    for split in ('train', 'val', 'test')
-                }
-                if len(stride_pairs) != 1:
-                    errors.append(f"{stage}/{job['name']}: time-group GTB requires one canonical grid")
-                expected = max_expected_windows(
-                    config.get('expected_canonical_windows_per_origin')
-                )
-                if expected is not None and int(config['batch_size']) < expected:
-                    errors.append(
-                        f"{stage}/{job['name']}: batch_size={config['batch_size']} "
-                        f"cannot hold expected GTB group={expected}"
-                    )
 
             run_id = f"{stage}__{job['name']}_seed{job['seed']}"
             run_ids.append(run_id)

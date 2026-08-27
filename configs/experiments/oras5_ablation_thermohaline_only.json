@@ -1,6 +1,0 @@
-{
-  "extends": "oras5_tsc_ap_residual.json",
-  "input_variables": ["TEMP", "SALT"],
-  "anomaly_variables": ["TEMP", "SALT"],
-  "tendency_feature_variables": ["TEMP", "SALT"]
-}

@@ -1,0 +1,7 @@
+{
+  "extends": "oras5_apex.json",
+  "input_variables": ["TEMP", "SALT"],
+  "anomaly_variables": ["TEMP", "SALT"],
+  "tendency_feature_variables": ["TEMP", "SALT"],
+  "external_dynamic_variables": []
+}

@@ -1,5 +1,5 @@
 {
-  "extends": "oras5_tsc_ap_residual.json",
+  "extends": "oras5_apex.json",
   "epochs": 1,
   "batch_size": 8,
   "sliding_enabled": false,
@@ -7,16 +7,9 @@
   "lat_range": [-10.5, 10.5],
   "expected_canonical_windows_per_origin": 1,
   "group_batches_by_time": false,
-  "enable_global_token_bank": false,
-  "tsc_num_prototypes": 4,
-  "tsc_hidden_dim": 16,
-  "tsc_output_dim": 8,
-  "tsc_fusion_hidden_dim": 32,
-  "tsc_fusion_spectral_modes": [4, 4],
-  "tsc_fusion_spectral_layers": 1,
-  "tsc_fusion_3d_layers": 1,
-  "tsc_fusion_ensemble_members": 2,
-  "tsc_fusion_transformer_heads": 4,
-  "tsc_fusion_transformer_ffn_dim": 128,
+  "apex_hidden_dim": 32,
+  "apex_spectral_modes": [4, 4],
+  "apex_spectral_layers": 1,
+  "apex_ensemble_members": 2,
   "post_training_evaluation": "validation"
 }

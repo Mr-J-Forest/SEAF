@@ -21,17 +21,13 @@
     }
   },
   "screen": [
-    {"name": "full", "config": "configs/experiments/oras5_tsc_ap_residual.json", "seeds": [42]},
+    {"name": "full", "config": "configs/experiments/oras5_apex.json", "seeds": [42]},
     {"name": "no_ap_residual", "config": "configs/experiments/oras5_ablation_no_ap_residual.json", "seeds": [42]},
     {"name": "direct_full_field", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42]},
     {"name": "no_tendency", "config": "configs/experiments/oras5_ablation_no_tendency.json", "seeds": [42]},
-    {"name": "thermohaline_only", "config": "configs/experiments/oras5_ablation_thermohaline_only.json", "seeds": [42]},
-    {"name": "no_tsc", "config": "configs/experiments/oras5_ablation_no_tsc.json", "seeds": [42]},
+    {"name": "no_external_dynamics", "config": "configs/experiments/oras5_ablation_no_external_dynamics.json", "seeds": [42]},
     {"name": "no_spectral", "config": "configs/experiments/oras5_ablation_no_spectral.json", "seeds": [42]},
-    {"name": "no_3d", "config": "configs/experiments/oras5_ablation_no_3d.json", "seeds": [42]},
-    {"name": "no_ensemble", "config": "configs/experiments/oras5_ablation_no_ensemble.json", "seeds": [42]},
-    {"name": "temp_only", "config": "configs/experiments/oras5_ablation_temp_only.json", "seeds": [42]},
-    {"name": "salt_only", "config": "configs/experiments/oras5_ablation_salt_only.json", "seeds": [42]}
+    {"name": "no_ensemble", "config": "configs/experiments/oras5_ablation_no_ensemble.json", "seeds": [42]}
   ],
   "confirm_validation": {
     "from_stage": "screen",

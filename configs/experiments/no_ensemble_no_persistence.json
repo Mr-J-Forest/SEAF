@@ -1,5 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "ablation_disable_ensemble": true,
-  "enable_persistence_residual": false
-}

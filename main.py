@@ -1,7 +1,4 @@
-"""
-TSC-Fusion 海洋预测模型主运行脚本
-提供统一的接口来训练模型和进行预测
-"""
+"""APEX ocean forecasting entry point."""
 
 import argparse
 import os
@@ -78,7 +75,7 @@ def test_data_loading(config_path: Optional[str] = None):
 
 def test_model(config_path: Optional[str] = None):
     try:
-        from convlstm_model import create_ocean_model
+        from model_factory import create_ocean_model
         from data_loader import OceanDataset
         from config import DEFAULT_CONFIG, load_config, merge_configs, validate_config
         import torch
@@ -140,7 +137,7 @@ def test_model(config_path: Optional[str] = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TSC-Fusion 海洋预测模型")
+    parser = argparse.ArgumentParser(description="APEX 海洋异常预测模型")
     parser.add_argument('--mode', type=str, choices=['train', 'test_data', 'test_model'],
                        default='test_data', help='运行模式')
     parser.add_argument('--config', type=str, help='配置文件路径（可选）')
@@ -148,7 +145,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("TSC-Fusion 海洋预测模型 - 温度盐度多步预报")
+    print("APEX 海洋异常预测模型 - 温度盐度多步预报")
     print("=" * 60)
 
     if args.mode == 'train':

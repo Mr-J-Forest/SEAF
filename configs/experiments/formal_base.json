@@ -10,7 +10,6 @@
   "allow_compile_fallback": false,
   "mixed_precision": true,
   "group_batches_by_time": true,
-  "global_token_bank_scope": "time_group",
   "scheduler_patience": 8,
   "early_stopping_patience": 25,
   "min_delta": 0.000001,

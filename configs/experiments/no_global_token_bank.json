@@ -1,5 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "enable_global_token_bank": false,
-  "group_batches_by_time": true
-}

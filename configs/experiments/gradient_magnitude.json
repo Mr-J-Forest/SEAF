@@ -1,4 +1,0 @@
-{
-  "extends": "formal_base.json",
-  "gradient_loss_mode": "magnitude"
-}

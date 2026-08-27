@@ -1,7 +1,6 @@
 {
   "extends": "../datasets/oras5_icdc_1deg_1979_2014.json",
   "model_type": "ofb_fourcastnet",
-  "enable_global_token_bank": false,
   "group_batches_by_time": false,
   "batch_size": 8,
   "optimizer_type": "adam",

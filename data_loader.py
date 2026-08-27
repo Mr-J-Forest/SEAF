@@ -1,6 +1,6 @@
 """
 海洋数据加载器
-处理 NetCDF 海洋数据，用于 TSC-Fusion 与基线模型训练和预测
+处理 NetCDF 海洋数据，用于 APEX 与基线模型训练和预测
 """
 
 import copy
@@ -2210,37 +2210,17 @@ def create_data_loaders(
     use_pin_memory = bool(config.get('pin_memory', True))
     group_batches = bool(config.get('group_batches_by_time', False))
 
-    # 评估需要每个样本的真实索引用于溯源与物理量恢复，因此无论是否启用
-    # time-group 批采样，验证/测试（以及训练）loader 都应返回样本索引。
-    # 否则非 GTB 模型在训练后评估时会因缺少 batch_indices 而无法导出指标。
+    # 评估需要真实样本索引用于溯源与物理量恢复，因此所有 loader 都返回索引。
     train_dataset.return_sample_index = True
     val_dataset.return_sample_index = True
     test_dataset.return_sample_index = True
 
     if group_batches:
-        print("启用同时间窗口 batch sampler (Global Token Bank)")
+        print("启用同起报时次 batch sampler")
 
         train_sampler = TimeGroupedBatchSampler(train_dataset, batch_size, shuffle=True)
         val_sampler = TimeGroupedBatchSampler(val_dataset, batch_size, shuffle=False)
         test_sampler = TimeGroupedBatchSampler(test_dataset, batch_size, shuffle=False)
-        if (
-            config.get('enable_global_token_bank', False)
-            and config.get('global_token_bank_scope', 'time_group') == 'time_group'
-        ):
-            group_sizes = {
-                'train': train_sampler.max_group_size,
-                'validation': val_sampler.max_group_size,
-                'test': test_sampler.max_group_size,
-            }
-            oversized = {
-                split: size for split, size in group_sizes.items() if size > batch_size
-            }
-            if oversized:
-                raise ValueError(
-                    'Global Token Bank 的 time_group 协议要求一个 batch 覆盖同一起报时次的全部窗口；'
-                    f'当前 batch_size={batch_size}，超限分组={oversized}'
-                )
-
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_sampler,
@@ -2339,7 +2319,7 @@ def get_data_info(data_path: str) -> Dict:
 
 if __name__ == "__main__":
     # 测试数据加载器
-    from convlstm_model import DEFAULT_CONFIG
+    from config import DEFAULT_CONFIG
 
     data_path = "Data/FullData_preprocessed.nc"
     config = DEFAULT_CONFIG.copy()
