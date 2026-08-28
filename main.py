@@ -1,4 +1,4 @@
-"""APEX ocean forecasting entry point."""
+"""SEAF ocean anomaly forecasting entry point."""
 
 import argparse
 import os
@@ -137,7 +137,7 @@ def test_model(config_path: Optional[str] = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="APEX 海洋异常预测模型")
+    parser = argparse.ArgumentParser(description="SEAF 海洋异常预测模型")
     parser.add_argument('--mode', type=str, choices=['train', 'test_data', 'test_model'],
                        default='test_data', help='运行模式')
     parser.add_argument('--config', type=str, help='配置文件路径（可选）')
@@ -145,7 +145,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("APEX 海洋异常预测模型 - 温度盐度多步预报")
+    print("SEAF 海洋异常预测模型 - 温度盐度多步预报")
     print("=" * 60)
 
     if args.mode == 'train':

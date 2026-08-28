@@ -2,7 +2,7 @@
   "_contrasts": "configs/oras5_ablation_contrasts.json",
   "_protocol": {
     "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
-    "task": "12-month history to 5-month TEMP/SALT forecast",
+    "task": "12-month history to 5-month TEMP/SALT anomaly forecast",
     "selection_rule": "all ablations use the frozen full-model hyperparameters and validation only",
     "test_policy": "test remains sealed; ablations are reported on validation"
   },
@@ -21,8 +21,7 @@
     }
   },
   "screen": [
-    {"name": "full", "config": "configs/experiments/oras5_apex.json", "seeds": [42]},
-    {"name": "no_ap_residual", "config": "configs/experiments/oras5_ablation_no_ap_residual.json", "seeds": [42]},
+    {"name": "full", "config": "configs/experiments/oras5_seaf.json", "seeds": [42]},
     {"name": "direct_full_field", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42]},
     {"name": "no_tendency", "config": "configs/experiments/oras5_ablation_no_tendency.json", "seeds": [42]},
     {"name": "no_external_dynamics", "config": "configs/experiments/oras5_ablation_no_external_dynamics.json", "seeds": [42]},

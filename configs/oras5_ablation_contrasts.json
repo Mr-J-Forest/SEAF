@@ -12,8 +12,7 @@
     "baseline_requirement": "Every evaluation reports climatology, persistence, anomaly persistence, and train-only damped anomaly persistence."
   },
   "contrasts": [
-    {"name": "ap_residual_learning", "module": "fixed_anomaly_persistence_skip", "candidate": "full", "reference": "no_ap_residual", "variables": ["TEMP", "SALT"]},
-    {"name": "anomaly_target_without_ap_skip", "module": "training_only_climatology_anomaly_target", "candidate": "no_ap_residual", "reference": "direct_full_field", "variables": ["TEMP", "SALT"]},
+    {"name": "anomaly_target", "module": "training_only_climatology_anomaly_target", "candidate": "full", "reference": "direct_full_field", "variables": ["TEMP", "SALT"]},
     {"name": "explicit_tendency_features", "module": "causal_one_step_tendency", "candidate": "full", "reference": "no_tendency", "variables": ["TEMP", "SALT"]},
     {"name": "external_dynamic_and_surface_inputs", "module": "UVEL_VVEL_SSHA_MLD_TAUX_TAUY_QNET_WFLUX", "candidate": "full", "reference": "no_external_dynamics", "variables": ["TEMP", "SALT"]},
     {"name": "spectral_branch", "module": "global_spectral_branch", "candidate": "full", "reference": "no_spectral", "variables": ["TEMP", "SALT"]},

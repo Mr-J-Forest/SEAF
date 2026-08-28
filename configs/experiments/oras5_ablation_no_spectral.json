@@ -1,4 +1,4 @@
 {
-  "extends": "oras5_apex.json",
+  "extends": "oras5_seaf.json",
   "ablation_disable_spectral": true
 }

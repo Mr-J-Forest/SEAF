@@ -1,5 +1,5 @@
 {
-  "extends": "oras5_apex.json",
+  "extends": "oras5_seaf.json",
   "epochs": 1,
   "batch_size": 8,
   "sliding_enabled": false,
@@ -7,9 +7,9 @@
   "lat_range": [-10.5, 10.5],
   "expected_canonical_windows_per_origin": 1,
   "group_batches_by_time": false,
-  "apex_hidden_dim": 32,
-  "apex_spectral_modes": [4, 4],
-  "apex_spectral_layers": 1,
-  "apex_ensemble_members": 2,
+  "seaf_hidden_dim": 32,
+  "seaf_spectral_modes": [4, 4],
+  "seaf_spectral_layers": 1,
+  "seaf_ensemble_members": 2,
   "post_training_evaluation": "validation"
 }

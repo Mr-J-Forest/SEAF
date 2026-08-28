@@ -79,7 +79,7 @@ DATA_CONFIG = {
     # 显式物理量后向差分只使用当前及过去观测，并使用独立训练期 scaler。
     'include_tendency_features': False,
     'tendency_feature_variables': ['TEMP', 'SALT'],
-    # APEX 正式输入中的外部动力与表面强迫变量；数据集配置覆盖实际列表。
+    # SEAF 正式输入中的外部动力与表面强迫变量；数据集配置覆盖实际列表。
     'external_dynamic_variables': ['SSHA', 'UWND', 'VWND'],
 
     # 预处理持久化缓存（避免每次训练重复滑窗搜索、气候态计算、标准化拟合）
@@ -89,18 +89,16 @@ DATA_CONFIG = {
 
 # ========== 模型相关参数 ==========
 MODEL_CONFIG = {
-    'model_type': 'apex',
+    'model_type': 'seaf',
     'hidden_dims': [64, 96, 128, 128],  # 隐藏层维度
     'kernel_size': (3, 3),              # 卷积核大小
     'num_layers': 4,                    # 层数
     'dropout': 0.05,                     # Dropout；最终值由验证集协议确定
 
-    'apex_hidden_dim': 64,
-    'apex_spectral_modes': [8, 8],
-    'apex_spectral_layers': 2,
-    'apex_ensemble_members': 4,
-    # 正式模型使用严格恒等 AP skip；该开关仅服务 no-AP 消融。
-    'enable_ap_residual': True,
+    'seaf_hidden_dim': 64,
+    'seaf_spectral_modes': [8, 8],
+    'seaf_spectral_layers': 2,
+    'seaf_ensemble_members': 4,
 }
 
 # ========== 训练相关参数 ==========
@@ -330,14 +328,14 @@ def validate_config(config):
             errors.append("target_loss_weights 总和必须为正")
 
     normalized_model_type = str(config.get('model_type', '')).lower()
-    apex_model_types = {'apex'}
+    seaf_model_types = {'seaf'}
     recent_baseline_types = {
         'ofb_fourcastnet', 'ofb-fourcastnet',
         'ofb_climax', 'ofb-climax',
         'ofb_swin', 'ofb-swin',
     }
     supported_model_types = {
-        *apex_model_types,
+        *seaf_model_types,
         *recent_baseline_types,
         'tianhai_paper', 'tianhai-reimpl',
         'fuxi_ocean_paper', 'fuxi-ocean-reimpl',
@@ -347,57 +345,39 @@ def validate_config(config):
     if normalized_model_type not in supported_model_types:
         errors.append(f"未知 model_type: {config.get('model_type')!r}")
 
-    if normalized_model_type in apex_model_types:
+    if normalized_model_type in seaf_model_types:
         if (
-            config.get('enable_ap_residual', True)
-            and not set(config.get('target_variables', [])).issubset(
-                set(config.get('input_variables', []))
-            )
+            not config.get('enable_climatology_anomaly', False)
+            and not config.get('ablation_direct_full_field', False)
         ):
-            errors.append("启用 AP residual 时 target_variables 必须是 input_variables 的子集")
-        if config.get('enable_ap_residual', True):
-            if not config.get('enable_climatology_anomaly', False):
-                errors.append("APEX AP residual 要求启用 climatology anomaly")
-            elif not set(config.get('target_variables', [])).issubset(
-                set(config.get('anomaly_variables', []))
-            ):
-                errors.append(
-                    "APEX AP residual 要求所有 target_variables 都属于 anomaly_variables"
-                )
-        if int(config.get('apex_hidden_dim', 0)) <= 0:
-            errors.append("apex_hidden_dim 必须为正")
-        spectral_modes = config.get('apex_spectral_modes', [8, 8])
+            errors.append("SEAF 直接异常场预测要求启用 climatology anomaly")
+        elif config.get('enable_climatology_anomaly', False) and not set(
+            config.get('target_variables', [])
+        ).issubset(
+            set(config.get('anomaly_variables', []))
+        ):
+            errors.append("SEAF 要求所有 target_variables 都属于 anomaly_variables")
+        if int(config.get('seaf_hidden_dim', 0)) <= 0:
+            errors.append("seaf_hidden_dim 必须为正")
+        spectral_modes = config.get('seaf_spectral_modes', [8, 8])
         if (
             not isinstance(spectral_modes, (list, tuple))
             or len(spectral_modes) != 2
             or any(int(value) <= 0 for value in spectral_modes)
         ):
-            errors.append("apex_spectral_modes 必须包含两个正整数")
-        if int(config.get('apex_spectral_layers', 0)) <= 0:
-            errors.append("apex_spectral_layers 必须为正")
-        if int(config.get('apex_ensemble_members', 0)) <= 0:
-            errors.append("apex_ensemble_members 必须为正")
+            errors.append("seaf_spectral_modes 必须包含两个正整数")
+        if int(config.get('seaf_spectral_layers', 0)) <= 0:
+            errors.append("seaf_spectral_layers 必须为正")
+        if int(config.get('seaf_ensemble_members', 0)) <= 0:
+            errors.append("seaf_ensemble_members 必须为正")
 
     if normalized_model_type in recent_baseline_types:
-        if (
-            config.get('enable_persistence_residual', True)
-            and not set(config.get('target_variables', [])).issubset(
-                set(config.get('input_variables', []))
-            )
+        if not config.get('enable_climatology_anomaly', False):
+            errors.append("OceanForecastBench adapters 直接异常场预测要求启用 anomaly")
+        elif not set(config.get('target_variables', [])).issubset(
+            set(config.get('anomaly_variables', []))
         ):
-            errors.append("启用 persistence residual 时 target_variables 必须是 input_variables 的子集")
-        persistence_mode = config.get('persistence_residual_mode', 'fixed_identity')
-        if persistence_mode != 'fixed_identity':
-            errors.append("OceanForecastBench adapters 仅支持 fixed_identity persistence")
-        if config.get('enable_persistence_residual', True):
-            if not config.get('enable_climatology_anomaly', False):
-                errors.append("fixed_identity persistence 要求启用 climatology anomaly")
-            elif not set(config.get('target_variables', [])).issubset(
-                set(config.get('anomaly_variables', []))
-            ):
-                errors.append(
-                    "fixed_identity persistence 要求所有 target_variables 都属于 anomaly_variables"
-                )
+            errors.append("OceanForecastBench adapters 要求 targets 属于 anomaly_variables")
 
     if normalized_model_type in recent_baseline_types:
         patch_size = int(config.get('baseline_patch_size', 0))

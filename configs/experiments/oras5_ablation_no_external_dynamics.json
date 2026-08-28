@@ -1,5 +1,5 @@
 {
-  "extends": "oras5_apex.json",
+  "extends": "oras5_seaf.json",
   "input_variables": ["TEMP", "SALT"],
   "anomaly_variables": ["TEMP", "SALT"],
   "tendency_feature_variables": ["TEMP", "SALT"],

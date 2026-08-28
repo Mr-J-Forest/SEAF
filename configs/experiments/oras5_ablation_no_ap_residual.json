@@ -1,4 +1,0 @@
-{
-  "extends": "oras5_apex.json",
-  "enable_ap_residual": false
-}

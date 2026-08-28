@@ -1,14 +1,14 @@
-"""Model factory for APEX and the retained comparison adapters."""
+"""Model factory for SEAF and the retained comparison adapters."""
 
 import torch.nn as nn
 
-from apex_model import APEXNet
+from seaf_model import SEAFNet
 
 
 def create_ocean_model(config: dict) -> nn.Module:
-    model_type = str(config.get("model_type", "apex")).lower()
-    if model_type == "apex":
-        return APEXNet(config)
+    model_type = str(config.get("model_type", "seaf")).lower()
+    if model_type == "seaf":
+        return SEAFNet(config)
 
     from recent_baseline_models import create_recent_baseline, is_recent_baseline
 

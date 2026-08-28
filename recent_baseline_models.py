@@ -140,8 +140,8 @@ def _drop_path_schedule(depth: int, maximum: float) -> list[float]:
     return torch.linspace(0.0, float(maximum), depth).tolist()
 
 
-class APResidualForecastModel(nn.Module):
-    """Shared strict anomaly-persistence skip for all recent baselines."""
+class AnomalyForecastModel(nn.Module):
+    """Shared direct anomaly-forecast contract for recent baselines."""
 
     baseline_kind = "oceanforecastbench_architecture_adapter"
 
@@ -159,64 +159,6 @@ class APResidualForecastModel(nn.Module):
         ) <= 0:
             raise ValueError("recent baseline 的 sequence/prediction/channel 维度必须为正")
 
-        self.enable_persistence_residual = bool(
-            config.get("enable_persistence_residual", False)
-        )
-        persistence_mode = str(config.get("persistence_residual_mode", "fixed_identity"))
-        if self.enable_persistence_residual and persistence_mode != "fixed_identity":
-            raise ValueError(
-                "OceanForecastBench adapters 只接受 fixed_identity persistence，"
-                "避免基线悄然改变 AP 定义"
-            )
-        self.persistence_pairs = (
-            self._resolve_persistence_pairs(config)
-            if self.enable_persistence_residual
-            else []
-        )
-
-    def _resolve_persistence_pairs(
-        self, config: dict
-    ) -> list[tuple[int, int, int, int]]:
-        input_slices = config.get("input_channel_slices", {})
-        target_slices = config.get("target_channel_slices", {})
-        target_variables = list(config.get("target_variables", []))
-        if not isinstance(input_slices, dict) or not isinstance(target_slices, dict):
-            raise ValueError("fixed AP skip 要求显式 input/target_channel_slices")
-
-        pairs = []
-        output_intervals = []
-        for variable in target_variables:
-            if variable not in input_slices or variable not in target_slices:
-                raise ValueError(f"fixed AP skip 无法映射目标变量 {variable!r}")
-            input_start, input_stop = _bounds(
-                input_slices[variable], name=f"input {variable}"
-            )
-            output_start, output_stop = _bounds(
-                target_slices[variable], name=f"target {variable}"
-            )
-            if input_stop - input_start != output_stop - output_start:
-                raise ValueError(
-                    f"fixed AP skip 要求 {variable} 输入/输出通道一一对应："
-                    f"{input_stop - input_start} != {output_stop - output_start}"
-                )
-            if input_stop > self.input_dim or output_stop > self.output_dim:
-                raise ValueError(f"fixed AP skip 的 {variable} slice 超出实际通道数")
-            pairs.append((input_start, input_stop, output_start, output_stop))
-            output_intervals.append((output_start, output_stop))
-
-        cursor = 0
-        for start, stop in sorted(output_intervals):
-            if start != cursor:
-                raise ValueError(
-                    "fixed AP skip 要求目标 slices 无间隙、无重叠并覆盖全部输出"
-                )
-            cursor = stop
-        if cursor != self.output_dim:
-            raise ValueError(
-                "fixed AP skip 未覆盖全部输出通道："
-                f"covered={cursor}, output_dim={self.output_dim}"
-            )
-        return pairs
 
     def _flatten_history(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 5:
@@ -229,30 +171,14 @@ class APResidualForecastModel(nn.Module):
             )
         return x.reshape(batch, steps * channels, height, width)
 
-    def _finish_forecast(
-        self, flat_residual: torch.Tensor, history: torch.Tensor
-    ) -> torch.Tensor:
-        batch, channels, height, width = flat_residual.shape
+    def _finish_forecast(self, flat_forecast: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = flat_forecast.shape
         expected = self.prediction_length * self.output_dim
         if channels != expected:
             raise ValueError(f"预测 head 输出 {channels} 通道，期望 {expected}")
-        residual = flat_residual.reshape(
+        return flat_forecast.reshape(
             batch, self.prediction_length, self.output_dim, height, width
         )
-        if not self.enable_persistence_residual:
-            return residual
-
-        persistence = residual.new_zeros((batch, self.output_dim, height, width))
-        current = history[:, -1]
-        for input_start, input_stop, output_start, output_stop in self.persistence_pairs:
-            persistence[:, output_start:output_stop] = current[:, input_start:input_stop]
-        return residual + persistence.unsqueeze(1)
-
-    def _zero_residual_head(self, head: nn.Linear) -> None:
-        if self.enable_persistence_residual:
-            nn.init.zeros_(head.weight)
-            if head.bias is not None:
-                nn.init.zeros_(head.bias)
 
 
 class AFNO2D(nn.Module):
@@ -380,7 +306,7 @@ class AFNOBlock(nn.Module):
         return x + self.drop_path(self.mlp(self.norm2(x)))
 
 
-class OceanForecastBenchFourCastNet(APResidualForecastModel):
+class OceanForecastBenchFourCastNet(AnomalyForecastModel):
     """FourCastNet/AFNO architecture adapter trained on the local ORAS5 task."""
 
     def __init__(self, config: dict):
@@ -425,10 +351,8 @@ class OceanForecastBenchFourCastNet(APResidualForecastModel):
             * self.patch_size
             * self.patch_size,
         )
-        self._zero_residual_head(self.head)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        history = x
         flat, height, width = _pad_to_patch(
             self._flatten_history(x), self.patch_size
         )
@@ -450,7 +374,7 @@ class OceanForecastBenchFourCastNet(APResidualForecastModel):
             height,
             width,
         )
-        return self._finish_forecast(field, history)
+        return self._finish_forecast(field)
 
 
 class TokenTransformerBlock(nn.Module):
@@ -491,7 +415,7 @@ class TokenTransformerBlock(nn.Module):
         return x + self.drop_path(self.mlp(self.norm2(x)))
 
 
-class OceanForecastBenchClimaX(APResidualForecastModel):
+class OceanForecastBenchClimaX(AnomalyForecastModel):
     """ClimaX variable-tokenization architecture adapter for ORAS5 histories."""
 
     def __init__(self, config: dict):
@@ -555,7 +479,6 @@ class OceanForecastBenchClimaX(APResidualForecastModel):
             * self.patch_size
             * self.patch_size,
         )
-        self._zero_residual_head(self.head)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 5:
@@ -605,7 +528,7 @@ class OceanForecastBenchClimaX(APResidualForecastModel):
             height,
             width,
         )
-        return self._finish_forecast(field, x)
+        return self._finish_forecast(field)
 
 
 def _window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
@@ -887,7 +810,7 @@ def _make_swin_stage(
     )
 
 
-class OceanForecastBenchSwin(APResidualForecastModel):
+class OceanForecastBenchSwin(AnomalyForecastModel):
     """Hierarchical shifted-window Swin adapter for the ORAS5 forecast task."""
 
     def __init__(self, config: dict):
@@ -954,7 +877,6 @@ class OceanForecastBenchSwin(APResidualForecastModel):
             * self.patch_size
             * self.patch_size,
         )
-        self._zero_residual_head(self.head)
 
     @staticmethod
     def _run_stage(stage: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
@@ -963,7 +885,6 @@ class OceanForecastBenchSwin(APResidualForecastModel):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        history = x
         flat, height, width = _pad_to_patch(
             self._flatten_history(x), self.patch_size
         )
@@ -982,7 +903,7 @@ class OceanForecastBenchSwin(APResidualForecastModel):
             height,
             width,
         )
-        return self._finish_forecast(field, history)
+        return self._finish_forecast(field)
 
 
 RECENT_BASELINE_REGISTRY = {

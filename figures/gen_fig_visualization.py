@@ -20,7 +20,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent
 RESULT_BASE = "D:/OceanProjects/7.0/outputs/results"
 
 MODEL_PAIRS = [
-    ("APEX",       "101", "103"),
+    ("SEAF",       "101", "103"),
     ("TianHai",    "73",  "78"),
     ("FuXi-Ocean", "75",  "80"),
 ]
@@ -35,7 +35,7 @@ plt.rcParams.update({
 })
 
 COLORS = {
-    "APEX": "#264653",
+    "SEAF": "#264653",
     "TianHai": "#E76F51",
     "FuXi-Ocean": "#2A9D8F",
 }
@@ -52,7 +52,7 @@ def load_model(model_index, device):
     model_dir = find_model_dir(model_index)
     with open(os.path.join(model_dir, "config.json")) as f:
         config = json.load(f)
-    config["model_type"] = config.get("model_type", "apex")
+    config["model_type"] = config.get("model_type", "seaf")
     model = create_ocean_model(config).to(device)
     ckpt = torch.load(os.path.join(model_dir, "best_model.pth"), map_location=device)
     if "model_state_dict" in ckpt:
@@ -185,12 +185,12 @@ def main():
     gs = GridSpec(3, 6, figure=fig1, wspace=0.25, hspace=0.35,
                   left=0.05, right=0.82, bottom=0.09, top=0.93)
 
-    apex = all_preds["APEX"]
+    seaf = all_preds["SEAF"]
     temp_im, temp_errim = None, None
     salt_im, salt_errim = None, None
 
     for vi, (vname, gt, unit) in enumerate([("TEMP", gt_temp, "°C"), ("SALT", gt_salt, "PSU")]):
-        pred = apex[vname.lower()]
+        pred = seaf[vname.lower()]
 
         # Global color scale across all selected depths
         gt_all = np.concatenate([gt[:, lead_idx, d, :, :].ravel() for d in sel_depths])
@@ -285,7 +285,7 @@ def main():
 
     # Panel a: TEMP depth RMSE
     ax_t = fig2.add_subplot(gs2[0, 0])
-    for name in ["TianHai", "FuXi-Ocean", "APEX"]:
+    for name in ["TianHai", "FuXi-Ocean", "SEAF"]:
         pred = all_preds[name]["temp"]
         rmse = rmse_depth_all(gt_temp, pred, lead_idx)
         ax_t.plot(rmse, levels, color=COLORS.get(name, "#333"),
@@ -299,7 +299,7 @@ def main():
 
     # Panel b: SALT depth RMSE
     ax_s = fig2.add_subplot(gs2[0, 1])
-    for name in ["TianHai", "FuXi-Ocean", "APEX"]:
+    for name in ["TianHai", "FuXi-Ocean", "SEAF"]:
         pred = all_preds[name]["salt"]
         rmse = rmse_depth_all(gt_salt, pred, lead_idx)
         ax_s.plot(rmse, levels, color=COLORS.get(name, "#333"),

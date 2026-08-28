@@ -66,7 +66,7 @@ class PipelineIntegrityTests(unittest.TestCase):
         )
 
     def test_unknown_model_type_is_rejected_instead_of_becoming_convlstm(self):
-        config = self._small_apex_config()
+        config = self._small_seaf_config()
         config['model_type'] = 'misspelled_model'
         with self.assertRaisesRegex(ValueError, '未知 model_type'):
             validate_config(config)
@@ -81,7 +81,7 @@ class PipelineIntegrityTests(unittest.TestCase):
             'axiomocean_paper',
         ):
             with self.subTest(model_type=model_type):
-                config = self._small_apex_config()
+                config = self._small_seaf_config()
                 config.update({
                     'model_type': model_type,
                     'paper_hidden_dim': 8,
@@ -93,7 +93,7 @@ class PipelineIntegrityTests(unittest.TestCase):
                     outputs = model(inputs)
                 self.assertEqual(outputs.shape, (2, 2, 3, 4, 4))
 
-    def test_recent_oceanforecastbench_adapters_start_at_exact_anomaly_persistence(self):
+    def test_recent_oceanforecastbench_adapters_predict_anomalies_directly(self):
         for model_type in ('ofb_fourcastnet', 'ofb_climax', 'ofb_swin'):
             with self.subTest(model_type=model_type):
                 config = self._small_recent_baseline_config(model_type)
@@ -102,14 +102,10 @@ class PipelineIntegrityTests(unittest.TestCase):
                 inputs = torch.randn((2, 3, 8, 5, 7))
                 with torch.no_grad():
                     outputs = model(inputs)
-                expected_current = torch.cat(
-                    (inputs[:, -1, 0:1], inputs[:, -1, 1:3]), dim=1
-                )
-                expected = expected_current.unsqueeze(1).expand(-1, 2, -1, -1, -1)
                 self.assertEqual(outputs.shape, (2, 2, 3, 5, 7))
-                torch.testing.assert_close(outputs, expected, rtol=0.0, atol=0.0)
+                self.assertFalse(hasattr(model, 'enable_persistence_residual'))
 
-    def test_recent_baseline_residual_heads_receive_gradients(self):
+    def test_recent_baseline_forecast_heads_receive_gradients(self):
         for model_type in ('ofb_fourcastnet', 'ofb_climax', 'ofb_swin'):
             with self.subTest(model_type=model_type):
                 model = create_ocean_model(
@@ -141,7 +137,7 @@ class PipelineIntegrityTests(unittest.TestCase):
             )
 
     @staticmethod
-    def _small_apex_config():
+    def _small_seaf_config():
         config = DEFAULT_CONFIG.copy()
         config.update({
             'sequence_length': 3,
@@ -150,19 +146,18 @@ class PipelineIntegrityTests(unittest.TestCase):
             'actual_output_channels': 3,
             'input_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
             'target_channel_slices': {'TEMP': [0, 1], 'SALT': [1, 3]},
-            'model_type': 'apex',
-            'apex_hidden_dim': 16,
-            'apex_spectral_modes': [2, 2],
-            'apex_spectral_layers': 1,
-            'apex_ensemble_members': 2,
-            'enable_ap_residual': False,
+            'model_type': 'seaf',
+            'seaf_hidden_dim': 16,
+            'seaf_spectral_modes': [2, 2],
+            'seaf_spectral_layers': 1,
+            'seaf_ensemble_members': 2,
             'dropout': 0.0,
         })
         return config
 
     @classmethod
     def _small_recent_baseline_config(cls, model_type):
-        config = cls._small_apex_config()
+        config = cls._small_seaf_config()
         config.update({
             'model_type': model_type,
             'input_variables': ['TEMP', 'SALT', 'FORCING'],
@@ -171,8 +166,6 @@ class PipelineIntegrityTests(unittest.TestCase):
             'anomaly_variables': ['TEMP', 'SALT'],
             'climatology_feature_variables': ['TEMP', 'SALT'],
             'enable_climatology_anomaly': True,
-            'enable_persistence_residual': True,
-            'persistence_residual_mode': 'fixed_identity',
             'input_channel_slices': {
                 'TEMP': [0, 1],
                 'SALT': [1, 3],
@@ -309,8 +302,7 @@ class PipelineIntegrityTests(unittest.TestCase):
     def test_oras5_ablation_configs_validate(self):
         experiment_dir = Path(__file__).resolve().parents[1] / 'configs' / 'experiments'
         names = (
-            'oras5_apex.json',
-            'oras5_ablation_no_ap_residual.json',
+            'oras5_seaf.json',
             'oras5_ablation_direct_full_field.json',
             'oras5_ablation_no_tendency.json',
             'oras5_ablation_no_external_dynamics.json',
@@ -324,7 +316,7 @@ class PipelineIntegrityTests(unittest.TestCase):
                 validate_config(config)
 
         full = DEFAULT_CONFIG.copy()
-        full.update(load_config(experiment_dir / 'oras5_apex.json'))
+        full.update(load_config(experiment_dir / 'oras5_seaf.json'))
         no_tendency = DEFAULT_CONFIG.copy()
         no_tendency.update(load_config(experiment_dir / 'oras5_ablation_no_tendency.json'))
         self.assertTrue(full['include_tendency_features'])
@@ -700,8 +692,8 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertGreater(vector_loss.item(), 0.0)
         self.assertAlmostEqual(magnitude_loss.item(), 0.0, places=7)
 
-    def test_small_apex_forward_and_backward(self):
-        config = self._small_apex_config()
+    def test_small_seaf_forward_and_backward(self):
+        config = self._small_seaf_config()
         model = create_ocean_model(config)
         inputs = torch.randn(3, 3, 8, 5, 6, requires_grad=True)
         outputs = model(inputs)
@@ -711,9 +703,9 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertIsNotNone(inputs.grad)
 
     def test_ablation_removes_disabled_parameters(self):
-        full = create_ocean_model(self._small_apex_config())
+        full = create_ocean_model(self._small_seaf_config())
 
-        no_spectral_config = self._small_apex_config()
+        no_spectral_config = self._small_seaf_config()
         no_spectral_config['ablation_disable_spectral'] = True
         no_spectral = create_ocean_model(no_spectral_config)
         self.assertFalse(any(
@@ -725,54 +717,23 @@ class PipelineIntegrityTests(unittest.TestCase):
             for name, _ in full.named_parameters()
         ))
 
-        no_ensemble_config = self._small_apex_config()
+        no_ensemble_config = self._small_seaf_config()
         no_ensemble_config['ablation_disable_ensemble'] = True
         no_ensemble = create_ocean_model(no_ensemble_config)
         self.assertEqual(len(no_ensemble.member_heads), 1)
         self.assertIsNone(no_ensemble.ensemble_gate)
 
-        no_persistence_config = self._small_apex_config()
-        no_persistence_config['enable_ap_residual'] = False
-        no_persistence = create_ocean_model(no_persistence_config)
-        self.assertEqual(no_persistence.persistence_slices, [])
-        self.assertIsNone(no_persistence.ap_scale)
-
         for removed_name in (
             'thermohaline_memory', 'structure_branch', 'fusion_transformer',
-            'global_token_bank', 'local_branch',
+            'global_token_bank', 'local_branch', 'ap_scale', 'persistence_slices',
         ):
             self.assertFalse(hasattr(full, removed_name))
 
-    def test_fixed_identity_persistence_starts_exactly_at_anomaly_persistence(self):
-        config = self._small_apex_config()
-        config.update({
-            'actual_output_channels': 4,
-            'target_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
-            'enable_ap_residual': True,
-            'enable_climatology_anomaly': True,
-            'anomaly_variables': ['TEMP', 'SALT'],
-        })
-        model = create_ocean_model(config).eval()
-        inputs = torch.randn(2, 3, 8, 4, 5)
-
-        with torch.no_grad():
-            outputs = model(inputs)
-
-        expected = inputs[:, -1, :4].unsqueeze(1).expand(-1, 2, -1, -1, -1)
-        torch.testing.assert_close(outputs, expected, rtol=0, atol=0)
-        self.assertFalse(model.ap_scale.requires_grad)
-        self.assertEqual(float(model.ap_scale), 1.0)
-
-    def test_apex_residual_heads_receive_gradients_from_ap_initialization(self):
-        config = self._small_apex_config()
-        config.update({
-            'actual_output_channels': 4,
-            'target_channel_slices': {'TEMP': [0, 2], 'SALT': [2, 4]},
-            'enable_ap_residual': True,
-        })
+    def test_seaf_direct_forecast_heads_receive_gradients(self):
+        config = self._small_seaf_config()
         model = create_ocean_model(config).train()
         inputs = torch.randn(2, 3, 8, 4, 5)
-        target = torch.randn(2, 2, 4, 4, 5)
+        target = torch.randn(2, 2, 3, 4, 5)
         torch.nn.functional.mse_loss(model(inputs), target).backward()
         output_layer = model.member_heads[0][-1]
         self.assertIsNotNone(output_layer.weight.grad)

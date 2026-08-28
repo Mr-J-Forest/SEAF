@@ -22,15 +22,14 @@
     "method_name": "FourCastNet (AFNO)",
     "benchmark": "OceanForecastBench (2025)",
     "official_code": false,
-    "training": "from_scratch_on_oras5_ap_residual",
+    "training": "from_scratch_on_oras5_direct_anomaly",
     "source_repository": "https://github.com/Ocean-Intelligent-Forecasting/OceanForecastBench",
     "source_commit": "3a53d973ebda9e27ec711cb1a831c1aa5d385032",
     "source_path": "baselines/fourcastnet/networks/afnonet.py",
     "source_license": "BSD-3-Clause",
     "adaptations": [
       "12-month multivariable history is flattened into the patch stem",
-      "the head predicts five TEMP/SALT anomaly-evolution residuals",
-      "a fixed anomaly-persistence skip is added in standardized anomaly space",
+      "the head directly predicts five future TEMP/SALT anomaly fields",
       "optimization uses the repository's common validation-only ReduceLROnPlateau protocol"
     ]
   }

@@ -1,6 +1,6 @@
 """
 海洋数据加载器
-处理 NetCDF 海洋数据，用于 APEX 与基线模型训练和预测
+处理 NetCDF 海洋数据，用于 SEAF 与基线模型训练和预测
 """
 
 import copy

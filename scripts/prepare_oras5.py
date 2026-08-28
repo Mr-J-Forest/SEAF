@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and convert the ICDC ORAS5 1-degree control member for APEX.
+"""Download and convert the ICDC ORAS5 1-degree control member for SEAF.
 
 The ICDC r1x1 archive has a documented interpolation-mask defect. This script
 always applies the corrected ICDC masks before writing a standard
@@ -219,7 +219,7 @@ def _request(
     range_start: int | None = None,
     range_end: int | None = None,
 ):
-    headers = {"User-Agent": "APEX-ORAS5-preparer/1.0"}
+    headers = {"User-Agent": "SEAF-ORAS5-preparer/1.0"}
     if range_start is not None:
         end = "" if range_end is None else str(range_end)
         headers["Range"] = f"bytes={range_start}-{end}"
@@ -530,7 +530,7 @@ def _create_output(
         variable.source_variable = spec.source_name
         variable.corrected_mask = spec.mask_file
 
-    dataset.title = "ORAS5 monthly control member prepared for APEX"
+    dataset.title = "ORAS5 monthly control member prepared for SEAF"
     dataset.source = "ECMWF ORAS5 via the ICDC r1x1 opa0 archive"
     dataset.source_doi = ORAS5_DOI
     dataset.license = "CC-BY-4.0"

@@ -1,6 +1,6 @@
-"""APEX: anomaly-persistence residual forecasting for joint ocean fields."""
+"""SEAF: spectral-ensemble forecasting of joint ocean anomalies."""
 
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -143,8 +143,8 @@ class NonSpectralControlEncoder(nn.Module):
         return self.net(x)
 
 
-class APEXNet(nn.Module):
-    """Formal APEX model: AP skip, spectral encoder, and ensemble gate."""
+class SEAFNet(nn.Module):
+    """Formal SEAF model: spectral encoder and spatial ensemble gate."""
 
     def __init__(self, config: dict) -> None:
         super().__init__()
@@ -166,10 +166,10 @@ class APEXNet(nn.Module):
             )
         )
 
-        hidden_dim = int(config.get("apex_hidden_dim", 64))
+        hidden_dim = int(config.get("seaf_hidden_dim", 64))
         dropout = float(config.get("dropout", 0.05))
-        spectral_modes = list(config.get("apex_spectral_modes", [8, 8]))
-        spectral_layers = int(config.get("apex_spectral_layers", 2))
+        spectral_modes = list(config.get("seaf_spectral_modes", [8, 8]))
+        spectral_layers = int(config.get("seaf_spectral_layers", 2))
         flattened_channels = self.sequence_length * self.input_dim
 
         self.disable_spectral = bool(config.get("ablation_disable_spectral", False))
@@ -194,7 +194,7 @@ class APEXNet(nn.Module):
         member_count = (
             1
             if self.disable_ensemble
-            else int(config.get("apex_ensemble_members", 4))
+            else int(config.get("seaf_ensemble_members", 4))
         )
         output_channels = self.prediction_length * self.output_dim
         self.member_heads = nn.ModuleList(
@@ -214,65 +214,6 @@ class APEXNet(nn.Module):
             nn.Softmax(dim=1),
         )
 
-        self.enable_ap_residual = bool(config.get("enable_ap_residual", True))
-        self.persistence_slices = (
-            self._resolve_target_input_slices(config) if self.enable_ap_residual else []
-        )
-        if self.enable_ap_residual and not self.persistence_slices:
-            raise ValueError(
-                "APEX AP residual requires every target variable in the input schema"
-            )
-        persistence_channels = sum(
-            stop - start for start, stop in self.persistence_slices
-        )
-        if self.enable_ap_residual and persistence_channels != self.output_dim:
-            raise ValueError(
-                "APEX fixed AP skip requires input and output target channels to match: "
-                f"{persistence_channels} != {self.output_dim}"
-            )
-        if self.enable_ap_residual:
-            self.register_buffer("ap_scale", torch.tensor(1.0, dtype=torch.float32))
-            self._zero_initialize_residual_heads()
-        else:
-            self.register_parameter("ap_scale", None)
-
-    def _zero_initialize_residual_heads(self) -> None:
-        for head in self.member_heads:
-            output_layer = head[-1]
-            nn.init.zeros_(output_layer.weight)
-            if output_layer.bias is not None:
-                nn.init.zeros_(output_layer.bias)
-
-    def _resolve_target_input_slices(self, config: dict) -> List[Tuple[int, int]]:
-        raw_slices = config.get("input_channel_slices", {})
-        selected: List[Tuple[int, int]] = []
-        if not isinstance(raw_slices, dict):
-            return selected
-        for name in self.target_variables:
-            bounds = raw_slices.get(name)
-            if isinstance(bounds, slice):
-                start, stop = bounds.start, bounds.stop
-            elif isinstance(bounds, (list, tuple)) and len(bounds) >= 2:
-                start, stop = int(bounds[0]), int(bounds[1])
-            else:
-                continue
-            if start is None or stop is None:
-                continue
-            start = max(0, int(start))
-            stop = min(self.input_dim, int(stop))
-            if stop > start:
-                selected.append((start, stop))
-        return selected
-
-    def _ap_base(self, x: torch.Tensor) -> Optional[torch.Tensor]:
-        if not self.persistence_slices:
-            return None
-        current = x[:, -1]
-        return torch.cat(
-            [current[:, start:stop] for start, stop in self.persistence_slices],
-            dim=1,
-        )
-
     def forward(
         self, x: torch.Tensor, targets: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -280,7 +221,7 @@ class APEXNet(nn.Module):
         batch, sequence, channels, height, width = x.shape
         if sequence != self.sequence_length or channels != self.input_dim:
             raise ValueError(
-                "APEX input shape does not match the configured history: "
+                "SEAF input shape does not match the configured history: "
                 f"got (T={sequence}, C={channels}), expected "
                 f"(T={self.sequence_length}, C={self.input_dim})"
             )
@@ -301,12 +242,8 @@ class APEXNet(nn.Module):
             dim=1,
         )
         if self.ensemble_gate is None:
-            residual = members[:, 0]
+            forecast = members[:, 0]
         else:
             weights = self.ensemble_gate(features).unsqueeze(2).unsqueeze(3)
-            residual = (members * weights).sum(dim=1)
-
-        ap_base = self._ap_base(x)
-        if ap_base is not None and self.ap_scale is not None:
-            residual = residual + self.ap_scale * ap_base.unsqueeze(1)
-        return residual
+            forecast = (members * weights).sum(dim=1)
+        return forecast

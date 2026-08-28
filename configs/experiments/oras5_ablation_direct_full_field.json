@@ -1,5 +1,5 @@
 {
-  "extends": "oras5_apex.json",
+  "extends": "oras5_seaf.json",
   "enable_climatology_anomaly": false,
-  "enable_ap_residual": false
+  "ablation_direct_full_field": true
 }
