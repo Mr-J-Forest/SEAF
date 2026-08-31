@@ -97,6 +97,140 @@ def is_complete(run_dir: Path, expected_source_hash: str | None = None) -> bool:
         return False
 
 
+def _evaluation_filename(split: str) -> str:
+    if split == "test":
+        return "evaluation_results.json"
+    if split == "validation":
+        return "validation_results.json"
+    raise ValueError(f"unsupported deferred evaluation split: {split}")
+
+
+def _needs_deferred_evaluation(run_dir: Path, split: str) -> bool:
+    """Return whether a completed training-only run still needs scoring."""
+    if split not in {"validation", "test"}:
+        return False
+    evaluation_path = run_dir / _evaluation_filename(split)
+    if evaluation_path.is_file() or not (run_dir / "best_model.pth").is_file():
+        return False
+    try:
+        with (run_dir / "run_summary.json").open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        summary.get("status") == "completed"
+        and summary.get("evaluation_scope") == "none"
+    )
+
+
+def _finalize_deferred_evaluation(run_dir: Path, split: str) -> None:
+    """Attach an evaluation-only report to the original training summary."""
+    evaluation_path = run_dir / _evaluation_filename(split)
+    summary_path = run_dir / "run_summary.json"
+    with evaluation_path.open("r", encoding="utf-8") as handle:
+        evaluation = json.load(handle)
+    with summary_path.open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+
+    summary["evaluation_scope"] = split
+    summary["evaluation_file"] = evaluation_path.name
+    summary["deferred_evaluation"] = True
+    summary["deferred_evaluation_completed_at"] = datetime.now().isoformat()
+    summary["primary_metrics"] = {
+        "evaluation_loss": evaluation.get("evaluation_loss"),
+        "evaluation_data_loss": evaluation.get("evaluation_data_loss"),
+        "rmse_TEMP": evaluation.get("physical_rmse_TEMP"),
+        "rmse_SALT": evaluation.get("physical_rmse_SALT"),
+    }
+    atomic_json_dump(summary_path, summary)
+
+
+def _run_deferred_evaluations(
+    state: dict,
+    state_path: Path,
+    project_root: Path,
+    python_executable: str,
+    environment: dict,
+    continue_on_error: bool,
+) -> int:
+    """Evaluate frozen checkpoints only after all training jobs have finished."""
+    candidates = [
+        record for record in state.get("jobs", [])
+        if record.get("deferred_evaluation_scope") in {"validation", "test"}
+        and record.get("status") in {"completed", "pending_evaluation"}
+    ]
+    if not candidates:
+        return 0
+
+    failures = 0
+    print(
+        f"[DEFERRED-EVAL] training complete; evaluating {len(candidates)} frozen runs",
+        flush=True,
+    )
+    for record in candidates:
+        split = record["deferred_evaluation_scope"]
+        result_dir = Path(record["result_dir"])
+        config_path = Path(str(record["config"]))
+        if not config_path.is_absolute():
+            config_path = project_root / config_path
+        command = [
+            python_executable,
+            "-u",
+            str(project_root / "scripts" / "eval_best_only.py"),
+            "--config",
+            str(config_path.resolve()),
+            "--result_dir",
+            str(result_dir.resolve()),
+            "--overrides_json",
+            json.dumps(record.get("overrides", {}), sort_keys=True, separators=(",", ":")),
+            "--split",
+            split,
+        ]
+        record["evaluation_command"] = command
+        record["evaluation_status"] = "running"
+        atomic_json_dump(state_path, state)
+        log_path = Path(record["log"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"\n=== deferred evaluation start {datetime.now().isoformat()} ===\n"
+            )
+            log_handle.flush()
+            completed = subprocess.run(
+                command,
+                cwd=project_root,
+                env=environment,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+        evaluation_path = result_dir / _evaluation_filename(split)
+        if completed.returncode == 0 and evaluation_path.is_file():
+            _finalize_deferred_evaluation(result_dir, split)
+            record["status"] = "completed"
+            record["evaluation_status"] = "completed"
+            record["evaluation_returncode"] = 0
+            record["evaluation_finished_at"] = datetime.now().isoformat()
+            print(
+                f"[DEFERRED-EVAL] DONE {record['run_id']} ({split})",
+                flush=True,
+            )
+        else:
+            record["evaluation_status"] = "failed"
+            record["evaluation_returncode"] = completed.returncode
+            record["status"] = "failed"
+            failures += 1
+            print(
+                f"[DEFERRED-EVAL] FAILED {record['run_id']}; see {record['log']}",
+                flush=True,
+            )
+        atomic_json_dump(state_path, state)
+        if failures and not continue_on_error:
+            break
+    return failures
+
+
 def resolve_stage_experiments(matrix: dict, stage: str, stack: tuple[str, ...] = ()) -> list[dict]:
     """Resolve a concrete list or a declarative stage derived from another stage."""
     if stage in stack:
@@ -164,10 +298,26 @@ def main(
     )
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument(
+        "--defer-post-training-evaluation",
+        action="store_true",
+        help=(
+            "skip heavy post-training scoring during training; score all frozen "
+            "checkpoints sequentially after the training queue drains"
+        ),
+    )
+    parser.add_argument(
         "--max-parallel",
         type=int,
         default=1,
         help="maximum number of independent training jobs to run concurrently",
+    )
+    parser.add_argument(
+        "--allow-runtime-parallel-change",
+        action="store_true",
+        help=(
+            "allow a resumed campaign to change only its runtime concurrency; "
+            "the scientific matrix and source provenance remain unchanged"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -207,6 +357,7 @@ def main(
             "stages": stages,
             "only": sorted(only) if only else None,
             "max_parallel": args.max_parallel,
+            "defer_post_training_evaluation": args.defer_post_training_evaluation,
         }
         if manifest_path.is_file():
             existing = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -228,10 +379,24 @@ def main(
                     f"campaign {args.campaign!r} belongs to experiment selection "
                     f"{existing.get('only')}, not {sorted(only) if only else None}"
                 )
-            if int(existing.get("max_parallel", 1)) != args.max_parallel:
+            if (
+                int(existing.get("max_parallel", 1)) != args.max_parallel
+                and not args.allow_runtime_parallel_change
+            ):
                 raise RuntimeError(
                     f"campaign {args.campaign!r} belongs to max_parallel "
                     f"{existing.get('max_parallel', 1)}, not {args.max_parallel}"
+                )
+            if int(existing.get("max_parallel", 1)) != args.max_parallel:
+                print(
+                    "[QUEUE] runtime max_parallel override: "
+                    f"{existing.get('max_parallel', 1)} -> {args.max_parallel}; "
+                    "matrix/source provenance unchanged",
+                    flush=True,
+                )
+            if bool(existing.get("defer_post_training_evaluation", False)) != args.defer_post_training_evaluation:
+                raise RuntimeError(
+                    f"campaign {args.campaign!r} has a different deferred-evaluation setting"
                 )
         else:
             atomic_json_dump(manifest_path, manifest)
@@ -252,6 +417,7 @@ def main(
         "matrix": str(matrix_path),
         "max_parallel": args.max_parallel,
         "post_training_evaluation_lock": str(evaluation_lock_path),
+        "defer_post_training_evaluation": args.defer_post_training_evaluation,
         "updated_at": datetime.now().isoformat(),
         "jobs": [],
     }
@@ -263,8 +429,34 @@ def main(
         run_dir = result_root / job["stage"] / job["name"] / f"seed_{job['seed']}"
         log_path = log_dir / f"{run_id}.log"
         record = dict(job, run_id=run_id, result_dir=str(run_dir), log=str(log_path))
+        requested_scope = str(
+            (job.get("overrides") or {}).get("post_training_evaluation", "validation")
+        )
+        if requested_scope not in {"none", "validation", "test"}:
+            raise ValueError(
+                f"unsupported post_training_evaluation for {run_id}: {requested_scope}"
+            )
+        deferred_scope = (
+            requested_scope
+            if args.defer_post_training_evaluation
+            and requested_scope in {"validation", "test"}
+            else None
+        )
+        if deferred_scope:
+            record["deferred_evaluation_scope"] = deferred_scope
+            record["requested_post_training_evaluation"] = requested_scope
 
         if is_complete(run_dir, expected_source_hash=source_hash if args.campaign else None):
+            if deferred_scope and _needs_deferred_evaluation(run_dir, deferred_scope):
+                record["status"] = "pending_evaluation"
+                state["jobs"].append(record)
+                state["updated_at"] = datetime.now().isoformat()
+                atomic_json_dump(state_path, state)
+                print(
+                    f"[{position}/{len(jobs)}] DEFER evaluation {run_id}",
+                    flush=True,
+                )
+                continue
             record["status"] = "skipped_completed"
             state["jobs"].append(record)
             state["updated_at"] = datetime.now().isoformat()
@@ -275,6 +467,10 @@ def main(
         config_path = (project_root / job["config"]).resolve()
         if not config_path.is_file():
             raise FileNotFoundError(config_path)
+
+        training_overrides = dict(job.get("overrides") or {})
+        if deferred_scope:
+            training_overrides["post_training_evaluation"] = "none"
 
         command = [
             args.python,
@@ -287,10 +483,10 @@ def main(
             "--note",
             run_id,
         ]
-        if job.get("overrides"):
+        if training_overrides:
             command.extend([
                 "--overrides_json",
-                json.dumps(job["overrides"], sort_keys=True, separators=(",", ":")),
+                json.dumps(training_overrides, sort_keys=True, separators=(",", ":")),
             ])
         checkpoint = run_dir / "latest_checkpoint.pth"
         if checkpoint.is_file():
@@ -440,6 +636,16 @@ def main(
                 process.terminate()
             item["log_handle"].close()
         raise
+
+    if args.defer_post_training_evaluation:
+        failures += _run_deferred_evaluations(
+            state,
+            state_path,
+            project_root,
+            args.python,
+            environment,
+            args.continue_on_error,
+        )
 
     return 1 if failures else 0
 

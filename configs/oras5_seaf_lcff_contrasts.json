@@ -1,0 +1,24 @@
+{
+  "protocol": {
+    "comparison_stage": "confirm_validation",
+    "primary_metric": "mse",
+    "paired_unit": "forecast_origin",
+    "moving_block_length": 5,
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260826,
+    "screening_fdr": 0.10,
+    "confirmation_fdr": 0.05,
+    "positive_score": "log(reference_mse / candidate_mse); positive favors candidate",
+    "meaningful_reduction_fraction": 0.01,
+    "baseline_requirement": "Every validation evaluation reports climatology, persistence, anomaly persistence, and train-only damped anomaly persistence."
+  },
+  "contrasts": [
+    {
+      "name": "lead_conditioned_forcing_fusion",
+      "module": "dedicated_forcing_encoder_plus_lead_specific_hypothesis_aggregation",
+      "candidate": "seaf_lcff",
+      "reference": "seaf_no_lcff",
+      "variables": ["TEMP", "SALT"]
+    }
+  ]
+}

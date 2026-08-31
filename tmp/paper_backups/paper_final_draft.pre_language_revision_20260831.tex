@@ -1,0 +1,468 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{colortbl}
+\usepackage{float}
+\usepackage{placeins}
+\usepackage[caption=false,font=footnotesize]{subfig}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{../assets/}{../figures/}}
+
+\definecolor{seafblue}{RGB}{238,245,252}
+\definecolor{seafgreen}{RGB}{239,248,242}
+\definecolor{seafwarm}{RGB}{253,242,240}
+
+\setlength{\textfloatsep}{9pt plus 2pt minus 2pt}
+\setlength{\floatsep}{8pt plus 2pt minus 2pt}
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+\setlength{\dbltextfloatsep}{10pt plus 2pt minus 2pt}
+\setlength{\dblfloatsep}{8pt plus 2pt minus 2pt}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+\raggedbottom
+
+\title{SEAF: Learning Ocean Anomaly Evolution Beyond Anomaly Persistence}
+
+\author{
+\IEEEauthorblockN{Shengxiang Yang\textsuperscript{1},
+Zhibo Zhou\textsuperscript{1},
+Xiaoyi Zhang\textsuperscript{1},
+Yuchen Liu\textsuperscript{1}, and
+Shiming Lin\textsuperscript{1,2,3}}
+\IEEEauthorblockA{\textsuperscript{1}School of Informatics, Xiamen University, Xiamen, China}
+\IEEEauthorblockA{\textsuperscript{2}School of Information Engineering, Changji University, Changji, China}
+\IEEEauthorblockA{\textsuperscript{3}Key Laboratory of Southeast Coast Marine Information Intelligent Perception and Application, MNR, Zhangzhou, China\\
+Corresponding author: xmulsm@xmu.edu.cn}
+}
+
+\maketitle
+
+\begin{abstract}
+Ocean temperature and salinity anomalies describe departures from the expected seasonal state, but their evolution remains difficult to predict across space, depth, and lead time. We study the question: \emph{Can a data-driven model learn predictable ocean anomaly evolution beyond anomaly persistence?} We formulate joint five-month TEMP/SALT forecasting as direct anomaly prediction. A compact model, SEAF, combines a low-mode spatial spectral encoder, multiple anomaly hypotheses, a spatial mixture gate, causal tendency channels, and external dynamical or forcing inputs. Anomaly persistence (AP) and damped AP (DAP) are used only as external evaluation references; the network contains no AP skip. On a held-out ORAS5 test aggregation over three seeds and 36 strict-pass runs, SEAF obtains TEMP RMSE $0.5110\pm0.0023$, SALT RMSE $0.0823\pm0.0004$, Macro $\mathrm{SS}_{\mathrm{AP}}=0.2078\pm0.0077$, and Macro $\mathrm{SS}_{\mathrm{DAP}}=0.0370\pm0.0091$. A paired validation contrast attributes the main gain to the target formulation: direct anomaly prediction reduces geometric MSE by $58.39\%$ relative to a strict direct full-field objective (bootstrap $q=0.00055$). The formal architecture is not claimed to be universally strongest: larger FourCastNet, ClimaX, and Swin adapters achieve higher aggregate test AP skill in this protocol. The evidence therefore supports anomaly-centered formulation, persistence-aware evaluation, and modest benefits from multi-hypothesis and physically motivated inputs, while leaving the spectral branch and spatial gate as exploratory components.
+\end{abstract}
+
+\renewcommand{\UrlFont}{\small\tt}
+Code repository: \url{https://github.com/Mr-J-Forest/SEAF}\\
+Data availability statement: Experiments use the ECMWF ORAS5/ICDC monthly reanalysis subset (1979--2014); the public product is available through the Copernicus Climate Data Store (DOI: 10.24381/cds.67e8eeb7)~\cite{copernicus2021oras5}. The exact local file, preprocessing protocol, run manifests, and quality assertions are recorded in the accompanying audit artifacts.
+
+\begin{IEEEkeywords}
+Ocean prediction, anomaly forecasting, persistence evaluation, Fourier spectral modeling, temperature and salinity.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Temperature and salinity jointly describe the thermohaline state of the ocean. Their evolution affects stratification, circulation, air--sea exchange, and downstream scientific and operational applications. Forecasting the joint field from a history of gridded ocean states and external drivers is difficult because useful information is distributed across variables and spatial scales, while the target contains a strong seasonal background and substantial persistence.
+
+The central scientific question of this work is:
+\begin{quote}
+\emph{Can a data-driven model learn predictable ocean anomaly evolution beyond anomaly persistence?}
+\end{quote}
+This question is narrower than asking whether a neural network can reconstruct a low-error physical field. Let $Y_t$ denote a joint TEMP/SALT field and let $C_t$ be a training-only monthly climatology. The transient anomaly is
+\begin{equation}
+A_t=Y_t-C_t.
+\label{eq:intro_anomaly}
+\end{equation}
+The standard full-field objective learns $X_{t-J+1:t}\mapsto Y_{t+h}$. Because $C_{t+h}$ is smooth and seasonally regular, a low full-field error can be obtained without accurately modeling how $A_t$ changes. We therefore train the neural model to predict the future anomaly directly:
+\begin{equation}
+\widehat{A}_{t+h}=f_{\theta}(X'_{t-J+1:t},h),\qquad
+\widehat{Y}_{t+h}=C_{t+h}+\widehat{A}_{t+h}.
+\label{eq:intro_direct}
+\end{equation}
+Here $X'$ contains the transformed history, causal tendency information, and external dynamics. This is a change in prediction target, not a persistence shortcut.
+
+The separation from persistence is essential. An anomaly-persistence forecast is
+\begin{equation}
+\widehat{Y}^{\mathrm{AP}}_{t+h}=C_{t+h}+A_t,
+\label{eq:intro_ap}
+\end{equation}
+and a damped anomaly-persistence forecast is
+\begin{equation}
+\widehat{Y}^{\mathrm{DAP}}_{t+h}=C_{t+h}+\rho_h A_t,
+\label{eq:intro_dap}
+\end{equation}
+where $\rho_h$ is estimated from training histories. AP and DAP are evaluation references only. Neither is added to the SEAF forward path, and a zero anomaly output corresponds to the climatological background rather than to AP.
+
+SEAF provides a compact test bed for this formulation. The model uses a low-mode spatial spectral branch to supply nonlocal mixing, multiple decoder heads to represent alternative anomaly-evolution hypotheses, and a spatial gate to combine them. Causal tendencies expose recent directions of change, while external dynamical and surface-forcing variables provide possible drivers. These modules are hypotheses about useful information and inductive bias; their contribution is tested rather than assumed.
+
+Our contributions are fourfold:
+\begin{enumerate}
+    \item We make direct joint anomaly prediction the primary task definition and quantify it against matched direct full-field objectives using paired, multi-seed validation contrasts.
+    \item We provide a compact multi-hypothesis anomaly decoder with controlled comparisons against a single head and a uniform ensemble, while treating the spectral mixer and learned gate as empirically testable design choices.
+    \item We evaluate causal tendency and external-dynamics inputs as physically motivated information groups, rather than presenting them as separate prediction targets.
+    \item We use an AP-centered protocol with CLIM, PERS, AP, and DAP references, reporting lead-wise, depth-wise, variable-wise, and regional evidence together with audited uncertainty and explicit limitations.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Persistence and Anomaly Prediction}
+Persistence and climatology are strong references in slowly varying geophysical systems. Predictability studies often compare forecasts with persistence-like references and damp anomalies using estimated temporal correlations~\cite{jacox2019dampedpersistence}. Earlier spatiotemporal ocean models also report gains relative to persistence, particularly at short leads~\cite{xiaoSpatiotemporalDeepLearning2019}. SEAF retains AP as a post-hoc reference while learning the future anomaly directly. This separation tests whether a model predicts information beyond retaining the latest anomaly.
+
+\subsection{Spectral and Spatiotemporal Forecasting}
+Fourier-domain operators provide large spatial receptive fields through a small number of learned modes. FourCastNet introduced an adaptive Fourier neural operator for global weather forecasting~\cite{pathak2022fourcastnet}; related systems use cascaded or three-dimensional neural designs for medium-range prediction~\cite{chen2023fuxi,bi2023accurate}. Recurrent predictive-learning baselines provide a complementary reference: ConvLSTM preserves local spatial structure while modeling recurrence~\cite{shiConvolutionalLSTMNetwork2015}, and PredRNN extends this idea with spatiotemporal memory~\cite{wangPredRNNRecurrentNeural2017}. Recent SST work combines ConvLSTM with deformable attention~\cite{shiSeaSurfaceTemperature2024}. SEAF uses a smaller spatial low-mode mixer and does not claim that Fourier processing alone recovers ocean dynamics.
+
+\subsection{Data-Driven Ocean Models and Physical Inputs}
+Data-driven ocean models complement numerical solvers by learning nonlinear dependencies from observations and prescribed drivers~\cite{boninoMachineLearningMethods2024,zhaoDeepLearningOcean2024}. Recent systems span eddy-resolving forecasting~\cite{cuiWenHaiForecastingEddying2025}, end-to-end global forecasting~\cite{elAouniGLONETMercatorEndtoEnd2024}, and three-dimensional or sub-daily ocean prediction~\cite{huangFuXiOceanGlobalOcean2025,wuAxiomOceanForecastingThreeDimensional2026}. Multi-member forecasts are a long-standing strategy for representing forecast uncertainty~\cite{molteni1996ecmwf}, and recent work studies data-driven ocean ensembles~\cite{huangFuXiONSDataDrivenEnsemble2026}. In SEAF, decoder members are alternative deterministic anomaly hypotheses rather than independent physical simulations.
+
+Temporal differences and external drivers can expose directions of change that a static state does not make explicit. Multi-factor SST forecasting incorporates physical variables such as currents~\cite{yangMultiFactorDeepLearning2025}, while neural ocean-model corrections emphasize state-dependent forcing and air--sea heat exchange~\cite{stortoCorrectionSeaSurface2025}. We use these ideas as input groups and quantify their marginal value under a fixed anomaly target. Long-lead ENSO prediction further illustrates how data-driven models can extract useful precursors from ocean--atmosphere fields~\cite{hamDeepLearningMultiyear2019}.
+
+\section{Data and Problem Definition}
+
+\subsection{ORAS5 Dataset and Grid}
+We use the monthly ORAS5 ocean reanalysis described by the ECMWF OCEAN5 system~\cite{zuo2019ocean5} and distributed through the Copernicus Climate Data Store~\cite{copernicus2021oras5}. The local experiment file covers January 1979--December 2014, yielding 432 monthly time steps on a $1^\circ$ grid with 180 latitudes, 360 longitudes, and 20 selected depth levels:
+\[
+\begin{gathered}
+\{0,5,10,20,30,50,75\},\\
+\{100,125,150,200,250,300,400\},\\
+\{500,600,700,800,900,1000\}\ \mathrm{m}.
+\end{gathered}
+\]
+The target is TEMP and SALT at every selected level. Inputs additionally contain UVEL, VVEL, SSHA, MLD, TAUX, TAUY, QNET, and WFLUX. Depth profiles are folded into the channel axis; the formal model predicts a joint tensor through one shared forward pass.
+
+The canonical sampler uses $22\times33$ spatial windows with an $8^\circ$ stride and retains 76 pure-ocean windows per forecast origin. The ocean validity mask is defined from TEMP at 1000~m, and errors are aggregated only over valid target points. The audit record reports finite fractions of 0.6473 for the surface-forcing group and 0.5957 for the depth-resolved TEMP/SALT fields; no configured variable is absent and no time slice is entirely missing.
+
+\subsection{Forecast Task and Splits}
+Each sample maps a 12-month history to the following five monthly targets. Chronological segments contain 320 training origins (1979--01 to 2006--12), 44 validation origins (2007--01 to 2010--12), and 44 test origins (2011--01 to 2014--12). The resulting validation and test segments each contain 3,344 origin--window samples. History may cross the segment boundary at the first validation or test origin, but target months remain strictly inside their assigned segment.
+
+For every variable, periodic monthly climatology and normalization statistics are fitted on the training segment only. The same transformations are applied to validation and test. Causal tendency channels use one-step past differences, and variable-specific validity masks are retained. The model target is the transformed future anomaly; physical-space evaluation adds the future training-only climatology back to the inverse-transformed output.
+
+\subsection{Reference Forecasts and Skill}
+The evaluator constructs four deterministic references with the same target layout:
+\begin{align}
+\widehat{Y}^{\mathrm{CLIM}}_{t+h}&=C_{t+h},\\
+\widehat{Y}^{\mathrm{PERS}}_{t+h}&=Y_t,\\
+\widehat{Y}^{\mathrm{AP}}_{t+h}&=C_{t+h}+(Y_t-C_t),\\
+\widehat{Y}^{\mathrm{DAP}}_{t+h}&=C_{t+h}+\rho_h(Y_t-C_t).
+\label{eq:references}
+\end{align}
+The damped coefficients are estimated from training histories for the relevant target variable, lead, and depth channel. Model skill relative to AP is
+\begin{equation}
+\mathrm{SS}_{\mathrm{AP}}=1-\frac{\mathrm{MSE}_{\mathrm{model}}}{\mathrm{MSE}_{\mathrm{AP}}},
+\label{eq:ssap}
+\end{equation}
+and $\mathrm{SS}_{\mathrm{DAP}}$ is defined analogously. A positive score means that the model improves on the corresponding reference for the same valid target points; it does not imply positive skill at every lead or depth.
+
+\section{SEAF: Direct Anomaly Forecasting}
+
+\subsection{Architecture Overview}
+Figure~\ref{fig:architecture} shows the formal model. The input history is augmented with causal tendencies and external dynamics, flattened along the channel dimension, and projected by a shared convolutional encoder. Two low-mode spatial spectral stages provide global mixing. Four decoder members then produce alternative joint anomaly forecasts, and a spatial gate forms their location-dependent weighted combination. Finally, the future climatology is restored for physical-space output. AP and DAP appear only in the separate evaluation ribbon.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth,trim=3 3 3 3,clip]{seaf_architecture}
+\caption{SEAF under the direct-anomaly protocol. The neural path combines anomaly history, causal tendency, and external dynamics to predict joint TEMP/SALT anomalies; training-only climatology is restored afterward. AP and DAP remain evaluator-only references and are not an input, skip connection, or loss branch.}
+\label{fig:architecture}
+\end{figure*}
+
+\subsection{Direct Anomaly Target}
+Let $X^+$ denote the history after input augmentation and let $A_{t+h}$ denote the future anomaly in physical space. SEAF predicts
+\begin{equation}
+\widehat{A}_{t+h}=f_{\theta}(X^+,h),\qquad
+\widehat{Y}_{t+h}=C_{t+h}+\widehat{A}_{t+h}.
+\label{eq:seaf_target}
+\end{equation}
+The network never receives $A_t$ through a fixed additive forecast path. Therefore the central comparison is between direct anomaly prediction and a matched direct full-field objective, rather than between two implementations of an AP residual.
+
+\subsection{Input Information Groups}
+The tendency group contains causal one-step differences,
+\begin{equation}
+\Delta V_t=V_t-V_{t-1},
+\label{eq:tendency}
+\end{equation}
+for the relevant TEMP/SALT profiles. The external group contains UVEL, VVEL, SSHA, MLD, TAUX, TAUY, QNET, and WFLUX. These inputs are not future targets and are subject to the same training-only preprocessing as the base fields. Removing either group leaves the target, decoder, and optimization protocol unchanged.
+
+\subsection{Low-Mode Spatial Spectral Mixer}
+The history and channel axes are flattened into
+\begin{equation}
+X^{\mathrm{flat}}\in\mathbb{R}^{B\times(JC^+)\times H\times W},
+\end{equation}
+where $C^+$ includes the retained input groups. A Conv2D--GroupNorm--GELU block produces a shared feature map. Each spectral stage computes a real two-dimensional FFT,
+\begin{equation}
+\widehat{U}=\mathrm{rFFT2}(U),
+\end{equation}
+retains an $8\times8$ low-frequency rectangle, applies learned complex diagonal weights to the positive and negative bands, and sets the remaining modes to zero before the inverse transform:
+\begin{equation}
+U'=U+\psi\left(\mathrm{iFFT2}\left(\mathcal{M}_{\mathrm{low}}(\widehat{U})\right)\right).
+\label{eq:spectral}
+\end{equation}
+The formal model uses two such spatial stages with pointwise convolutional blocks between them. The FFT is spatial, not temporal; temporal order is carried by the flattened history channels and the causal tendency inputs.
+
+\subsection{Multiple Hypotheses and Spatial Gate}
+The shared feature map is sent to $M=4$ parallel decoder heads. Each head contains a Conv2D--GroupNorm--GELU block followed by a $1\times1$ projection to the $K C_y$ joint target channels. The resulting members are
+\begin{equation}
+\widehat{A}_m=\mathcal{D}_{m,\theta}(F),\qquad m=1,\ldots,M.
+\end{equation}
+A separate pointwise gate produces member logits $g_{m,i,j}$ and normalized weights
+\begin{equation}
+G_{m,i,j}=\frac{\exp(g_{m,i,j})}{\sum_{r=1}^{M}\exp(g_{r,i,j})}.
+\end{equation}
+The joint forecast is
+\begin{equation}
+\widehat{A}_{i,j}=\sum_{m=1}^{M}G_{m,i,j}\widehat{A}_{m,i,j}.
+\label{eq:ensemble}
+\end{equation}
+The members are alternative learned hypotheses, not independent physical simulations. The uniform-ensemble control replaces the learned weights with $1/M$, and the single-head control uses one decoder member without a gate.
+
+\subsection{Objective}
+The full model is optimized with a target-variable-weighted mean squared error in the transformed anomaly space:
+\begin{equation}
+\mathcal{L}_{\mathrm{MSE}}=\sum_{v\in\{\mathrm{TEMP},\mathrm{SALT}\}}\lambda_v\,
+\mathrm{MSE}(\widehat{A}_v,A_v),\qquad \sum_v\lambda_v=1.
+\label{eq:loss}
+\end{equation}
+The reported formal results use this MSE objective. A Sobel-gradient sensitivity objective exists in the implementation but is not part of the reported full configuration. Checkpoints are selected by validation weighted MSE, with finite-value checks, gradient clipping, and mixed precision when supported.
+
+\section{Experimental Protocol}
+
+\subsection{Campaign and Reproducibility}
+The completed formal campaign contains 12 learned configurations, three seeds (42, 123, and 3407), 30 training epochs per run, and 36 training--evaluation runs for each split. Both validation and test audits report 36/36 valid runs, zero missing or duplicate experiment--seed pairs, zero quality failures, and \texttt{strict\_pass=true}. All values in the tables are means $\pm$ sample standard deviations over the three seeds.
+
+\subsection{Learned Baselines}
+The deterministic comparison group is CLIM, PERS, AP, and DAP from Eq.~\eqref{eq:references}; these references are computed for every model and never trained. Learned baselines use the same direct-anomaly target as SEAF unless explicitly labeled ``direct full field.'' The matched local CNN control removes the spectral--ensemble design while retaining the input contract. FourCastNet, ClimaX, and Swin adapters follow the pinned OceanForecastBench baseline implementations~\cite{han2026oceanforecastbench,oceanforecastbenchCode2025}; they are retrained from scratch under the present data contract and are not copied scores from their source papers. Their parameter counts are not matched to SEAF, so their results are informative comparisons rather than a claim of architectural dominance.
+
+\subsection{Formal Ablations}
+The controlled variants are:
+\begin{enumerate}
+    \item \textbf{Full}: direct anomaly target, two spectral stages, four members, and learned spatial gate;
+    \item \textbf{No spectral}: matched non-spectral encoder;
+    \item \textbf{Uniform ensemble}: four members with uniform rather than learned spatial weights;
+    \item \textbf{Single head}: one anomaly decoder head and no gate;
+    \item \textbf{No tendency}: causal tendency channels removed;
+    \item \textbf{No external}: external dynamics and forcing channels removed.
+\end{enumerate}
+Direct full-field strict and tuned controls change only the prediction target and training configuration specified in their manifest. No variant contains an AP skip.
+
+\subsection{Metrics and Paired Contrasts}
+We report physical-space RMSE for TEMP and SALT, Macro $\mathrm{SS}_{\mathrm{AP}}$, and Macro $\mathrm{SS}_{\mathrm{DAP}}$. Macro scores give TEMP and SALT equal weight after their variable-specific MSE skills are computed. Lead-wise and depth-wise scores use the same valid-point masks as the aggregate evaluator.
+
+For validation contrasts, the paired unit is forecast origin. We use moving blocks of length five, 10,000 bootstrap replicates, bootstrap seed 20260826, and Benjamini--Hochberg false-discovery screening. The primary contrast statistic is the log MSE ratio, $\log(\mathrm{MSE}_{\mathrm{reference}}/\mathrm{MSE}_{\mathrm{candidate}})$; positive values favor the candidate. The reported geometric MSE reduction is $1-\exp(-\overline{\log(\mathrm{MSE}_{\mathrm{reference}}/\mathrm{MSE}_{\mathrm{candidate}})})$ as implemented in the audit script. Thus paired reductions and seed-averaged Macro $\mathrm{SS}_{\mathrm{AP}}$ answer related but not identical questions.
+
+\FloatBarrier
+\section{Results}
+
+\subsection{Held-Out Test Comparison}
+Table~\ref{tab:test_main} reports the frozen test aggregation. SEAF obtains positive aggregate AP and DAP skill, with physical RMSEs of 0.5110 for TEMP and 0.0823 for SALT. The local CNN is close to SEAF and has slightly higher Macro AP skill. The three larger adapters have higher aggregate AP skill than SEAF in this protocol: ClimaX reaches 0.3053, Swin 0.2941, and FourCastNet 0.2822. This result is important for positioning the contribution: SEAF is a formulation-centered model and is not presented as the strongest SOTA architecture.
+
+The direct full-field controls are substantially worse under the anomaly-centered evaluation. The strict control obtains Macro $\mathrm{SS}_{\mathrm{AP}}=-1.1479$ and Macro $\mathrm{SS}_{\mathrm{DAP}}=-1.5958$; the tuned control remains negative at $-1.1189$ and $-1.5629$. These controls support the claim that the target definition matters more than simply optimizing a full physical field under the same broad inputs.
+
+\begin{table}[H]
+\centering
+\caption{Held-out test comparison over three seeds. Arrows indicate the preferred direction; bold marks the best learned result. Blue identifies the focal SEAF row and warm shading identifies full-field target controls.}
+\label{tab:test_main}
+\scriptsize
+\setlength{\tabcolsep}{3.2pt}
+\renewcommand{\arraystretch}{1.08}
+\textit{(a) Physical-space error and model size}\\[2pt]
+\begin{tabular}{lccc}
+\toprule
+Method & Params (M) & TEMP RMSE $\downarrow$ & SALT RMSE $\downarrow$\\
+\midrule
+\rowcolor{seafblue} SEAF (full) & 1.12 & $0.5110\!\pm\!0.0023$ & $0.0823\!\pm\!0.0004$\\
+Local CNN & 1.00 & $0.5087\!\pm\!0.0021$ & $0.0822\!\pm\!0.0008$\\
+FourCastNet adapter & 20.05 & $0.4928\!\pm\!0.0020$ & $0.0799\!\pm\!0.0001$\\
+ClimaX adapter & 61.62 & $\mathbf{0.4891\!\pm\!0.0025}$ & $\mathbf{0.0784\!\pm\!0.0004}$\\
+Swin adapter & 35.72 & $0.4961\!\pm\!0.0011$ & $0.0786\!\pm\!0.0000$\\
+\addlinespace[2pt]
+\rowcolor{seafwarm} Full field, strict & 1.12 & $0.8684\!\pm\!0.0265$ & $0.1228\!\pm\!0.0024$\\
+\rowcolor{seafwarm} Full field, tuned & 1.12 & $0.8720\!\pm\!0.0279$ & $0.1200\!\pm\!0.0052$\\
+\bottomrule
+\end{tabular}\\[5pt]
+\textit{(b) Persistence-relative skill}\\[2pt]
+\begin{tabular}{lcc}
+\toprule
+Method & Macro SS$_{\rm AP}$ $\uparrow$ & Macro SS$_{\rm DAP}$ $\uparrow$\\
+\midrule
+\rowcolor{seafblue} SEAF (full) & $0.2078\!\pm\!0.0077$ & $0.0370\!\pm\!0.0091$\\
+Local CNN & $0.2131\!\pm\!0.0120$ & $0.0434\!\pm\!0.0140$\\
+FourCastNet adapter & $0.2822\!\pm\!0.0048$ & $0.1217\!\pm\!0.0056$\\
+ClimaX adapter & $\mathbf{0.3053\!\pm\!0.0037}$ & $\mathbf{0.1485\!\pm\!0.0040}$\\
+Swin adapter & $0.2941\!\pm\!0.0011$ & $0.1340\!\pm\!0.0007$\\
+\addlinespace[2pt]
+\rowcolor{seafwarm} Full field, strict & $-1.1479\!\pm\!0.0740$ & $-1.5958\!\pm\!0.0921$\\
+\rowcolor{seafwarm} Full field, tuned & $-1.1189\!\pm\!0.1527$ & $-1.5629\!\pm\!0.1845$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Target Formulation Is the Main Effect}
+The paired validation audit gives the strongest evidence in the study. Relative to direct full-field strict, direct anomaly prediction reduces the equal-variable geometric MSE by $58.39\%$ (95\% CI: $56.71$--$59.91\%$, $p=0.0002$, $q=0.00055$). The comparison remains $58.45\%$ (95\% CI: $56.04$--$61.18\%$, $p=0.0002$, $q=0.00055$) against the tuned full-field challenge. For the strict comparison, the reductions are $61.82\%$ for TEMP and $54.64\%$ for SALT, both with bootstrap probability of candidate improvement equal to 1.0 in the audit. The result directly supports the first transition in the paper's main line: full-field forecasting $\rightarrow$ direct anomaly forecasting.
+
+\begin{table}[H]
+\centering
+\caption{Paired validation target-formulation contrasts. Positive reduction means that direct-anomaly SEAF has lower geometric MSE.}
+\label{tab:target_contrast}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{lccc}
+\toprule
+Reference objective & Reduction $\uparrow$ & 95\% CI & $q$\\
+\midrule
+Full field (strict) & $\mathbf{58.39\%}$ & $[56.71,59.91]$ & 0.00055\\
+Full field (tuned) & $\mathbf{58.45\%}$ & $[56.04,61.18]$ & 0.00055\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The validation summary is consistent with the paired contrast. Full SEAF reaches Macro $\mathrm{SS}_{\mathrm{AP}}=0.2554\pm0.0031$ and Macro $\mathrm{SS}_{\mathrm{DAP}}=0.0917\pm0.0035$, whereas both full-field controls are negative under both references. The complete 12-configuration validation screen is retained in Appendix Table~\ref{tab:validation_full}; the final model comparison remains the held-out test table. This finding should not be read as evidence that every anomaly architecture is superior to every full-field architecture: the learned adapters in Table~\ref{tab:test_main} also use the anomaly target and obtain higher test AP skill than SEAF.
+
+\subsection{Ablation Evidence}
+Table~\ref{tab:ablation} combines held-out test skill with the paired validation contrast that corresponds to each variant. Multiple hypotheses provide a $1.20\%$ geometric MSE reduction relative to a single head ($p=0.0004$, $q=0.00088$). The full input contract also improves over removing tendency channels by $1.54\%$ ($p=0.0012$, $q=0.00220$) and over removing external dynamics/forcing by $1.00\%$ ($p=0.0026$, $q=0.00409$). These are modest effects relative to the target change, but they are supported by the paired analysis.
+
+The spectral and gate contrasts are deliberately reported as uncertain. The full model versus no spectral branch yields an estimated $0.52\%$ reduction, but its 95\% CI includes zero ($p=0.355$, $q=0.391$). The learned spatial gate is slightly worse than uniform averaging by $0.12\%$ in the paired estimate, also with a CI containing zero ($p=0.741$, $q=0.741$). We therefore retain these modules as compact design choices and analysis targets, not as statistically established sources of improvement.
+
+\begin{table}[H]
+\centering
+\caption{Formal ablations. Test skills are means $\pm$ standard deviations over three seeds. Paired reduction is the validation geometric MSE reduction of Full relative to each variant; bold $q$ values denote supported effects.}
+\label{tab:ablation}
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{lcccc}
+\toprule
+Variant & SS$_{\rm AP}$ $\uparrow$ & SS$_{\rm DAP}$ $\uparrow$ & Reduction $\uparrow$ & $q$\\
+\midrule
+\rowcolor{seafblue} Full SEAF & $0.2078\!\pm\!0.0077$ & $0.0370\!\pm\!0.0091$ & -- & --\\
+\addlinespace[2pt]
+\multicolumn{5}{l}{\itshape Architecture and decoder controls}\\
+No spectral & $0.2110\!\pm\!0.0087$ & $0.0408\!\pm\!0.0104$ & $+0.52\%$ & 0.391\\
+Uniform ensemble & $0.2107\!\pm\!0.0089$ & $0.0409\!\pm\!0.0101$ & $-0.12\%$ & 0.741\\
+Single head & $0.1958\!\pm\!0.0063$ & $0.0231\!\pm\!0.0078$ & $+1.20\%$ & $\mathbf{0.00088}$\\
+\addlinespace[2pt]
+\multicolumn{5}{l}{\itshape Physical information controls}\\
+No tendency & $0.1941\!\pm\!0.0039$ & $0.0213\!\pm\!0.0053$ & $+1.54\%$ & $\mathbf{0.00220}$\\
+No external & $0.2019\!\pm\!0.0041$ & $0.0301\!\pm\!0.0040$ & $+1.00\%$ & $\mathbf{0.00409}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Lead- and Depth-Resolved Skill}
+The aggregate test score hides a short-lead transition. Table~\ref{tab:stratified}(a) shows that SEAF does not beat AP at lead one for either variable: TEMP and SALT skills are $-0.1436$ and $-0.1298$. Skill becomes positive at lead two and increases through lead five, reaching $0.3592$ for TEMP and $0.3195$ for SALT. Thus the result supports learning nontrivial anomaly evolution at medium leads, not uniform dominance over persistence at every horizon.
+
+Depth resolution reveals a complementary limitation (Table~\ref{tab:stratified}(b)). At the surface, TEMP and SALT AP skills are $0.3076$ and $0.3201$; at 50~m they are $0.3345$ and $0.2704$; at 200~m they remain positive at $0.2132$ and $0.2108$. At 1000~m, both become negative ($-0.5596$ for TEMP and $-0.5547$ for SALT). A positive aggregate score therefore does not imply uniform full-column skill.
+
+\begin{table}[H]
+\centering
+\caption{Stratified SEAF test AP skill. Values are mean $\pm$ standard deviation over three seeds; depth panel reports selected levels.}
+\label{tab:stratified}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.08}
+\textit{(a) Forecast lead}\\[2pt]
+\begin{tabular}{ccc}
+\toprule
+Lead (month) & TEMP SS$_{\rm AP}$ $\uparrow$ & SALT SS$_{\rm AP}$ $\uparrow$\\
+\midrule
+1 & $-0.1436\!\pm\!0.0305$ & $-0.1298\!\pm\!0.0132$\\
+2 & $0.2250\!\pm\!0.0092$ & $0.2049\!\pm\!0.0088$\\
+3 & $0.3123\!\pm\!0.0068$ & $0.2780\!\pm\!0.0076$\\
+4 & $0.3463\!\pm\!0.0043$ & $0.3060\!\pm\!0.0059$\\
+5 & $0.3592\!\pm\!0.0035$ & $0.3195\!\pm\!0.0045$\\
+\bottomrule
+\end{tabular}\\[5pt]
+\textit{(b) Selected depth}\\[2pt]
+\begin{tabular}{ccc}
+\toprule
+Depth (m) & TEMP SS$_{\rm AP}$ $\uparrow$ & SALT SS$_{\rm AP}$ $\uparrow$\\
+\midrule
+0 & $0.3076\!\pm\!0.0086$ & $0.3201\!\pm\!0.0074$\\
+50 & $0.3345\!\pm\!0.0086$ & $0.2704\!\pm\!0.0084$\\
+200 & $0.2132\!\pm\!0.0192$ & $0.2108\!\pm\!0.0090$\\
+1000 & $-0.5596\!\pm\!0.0388$ & $-0.5547\!\pm\!0.0091$\\
+\bottomrule
+\end{tabular}
+\end{table}
+\FloatBarrier
+
+\subsection{Qualitative Regional Forecast Analysis}
+We inspect the strict test window \texttt{sample\_0\_strict} using the completed prediction-evidence archive. Figure~\ref{fig:regional_maps} places the TEMP and SALT surface forecasts next to truth, DirectFullField, AP, and the corresponding errors at leads 1, 3, and 5. Figure~\ref{fig:regional_metrics} reports the paired regional RMSE and AP skill curves. These images are illustrative and do not replace the complete test aggregation.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{fig_regional_metric_comparison}
+\caption{Regional error and persistence-relative skill for \texttt{sample\_0\_strict}. Upper panels show physical RMSE; lower panels show $\mathrm{SS}_{\mathrm{AP}}$ at leads 1--5.}
+\label{fig:regional_metrics}
+\end{figure}
+
+For this window, SEAF TEMP regional RMSE is 0.374, 0.517, 0.531, 0.489, and 0.475 at leads 1--5, compared with 0.608, 0.716, 0.766, 0.740, and 0.744 for DirectFullField. TEMP AP skill becomes positive at leads 4--5, matching the global lead-wise transition. SALT is more favorable: SEAF regional RMSE remains between 0.065 and 0.072, compared with 0.124--0.144 for DirectFullField, and regional SALT AP skill rises from approximately 0.004 at lead one to 0.636 at lead five. The maps show where these differences occur, while the curves summarize their evolution with lead.
+
+\begin{figure*}[!t]
+\centering
+\subfloat[TEMP surface forecast.]{\includegraphics[width=0.482\textwidth]{fig_regional_temp_surface}\label{fig:regional_temp}}
+\hfill
+\subfloat[SALT surface forecast.]{\includegraphics[width=0.482\textwidth]{fig_regional_salt_surface}\label{fig:regional_salt}}
+\caption{Regional surface forecasts for \texttt{sample\_0\_strict}. Rows show truth, SEAF, DirectFullField, AP, and forecast errors at leads 1, 3, and 5. The example is used for visual diagnosis only; aggregate claims use all audited test samples.}
+\label{fig:regional_maps}
+\end{figure*}
+\FloatBarrier
+
+\section{Discussion}
+
+\subsection{What the Evidence Supports}
+The results support a three-stage interpretation. First, full-field forecasting can obscure the anomaly problem because the model is asked to fit both a strong seasonal background and the transient signal. Second, direct anomaly prediction provides a materially better target for the matched SEAF backbone: the paired validation reduction is about 58\% against both full-field controls, and the held-out full model has positive aggregate AP skill. Third, AP remains a strict external test: positive AP skill is the evidence that a model improves on retaining the latest anomaly, but it is conditional on lead, depth, variable, and region.
+
+Within this formulation, multiple anomaly hypotheses, causal tendency channels, and external dynamics have supported but modest paired effects. The spatial spectral branch and learned gate remain plausible mechanisms, but the current paired results do not establish statistically significant gains over their controls. This ranking of claims is intentional and follows the evidence rather than the number of modules in the diagram.
+
+\subsection{Position Relative to Learned Baselines}
+The adapter baselines show that direct anomaly prediction is not exclusive to SEAF. ClimaX, Swin, and FourCastNet obtain higher test Macro $\mathrm{SS}_{\mathrm{AP}}$ than the compact SEAF model, although they use substantially more parameters and are not parameter-matched. The appropriate conclusion is therefore not that SEAF is universally superior. Rather, SEAF supplies a transparent formulation and evaluation scaffold in which the anomaly target, physical information groups, and persistence reference can be tested separately. Future work can apply the same scaffold to larger architectures.
+
+\subsection{Limitations}
+Several limitations bound the claims. The data are a single monthly reanalysis product, so reanalysis biases and representativeness errors are not separated from model error. The prediction horizon is five months and the spatial sampler uses fixed windows; global spherical geometry and cross-window consistency are not explicitly modeled. The objective does not impose conservation, equation-of-state, or dynamical-balance constraints. Deep-column skill deteriorates relative to AP, especially near 1000~m. Regional figures are qualitative examples, not independent statistical tests. Finally, the formal comparison uses three seeds and one fixed protocol; larger seed sets, independent ocean products, matched-parameter baselines, and transfer to observations are needed before making broader claims about operational utility.
+
+\section{Conclusion}
+
+We presented SEAF as a direct anomaly forecaster for joint ocean temperature and salinity. The main contribution is the problem formulation and its evaluation: remove the training-only climatological background from the learned target, predict future anomalies directly, and then ask whether the forecast exceeds AP and DAP references. The formal model uses a compact spectral--ensemble backbone with causal tendencies and external dynamics, but AP is not a network component.
+
+The audited results support this ordering of conclusions. The direct anomaly target yields a $58.39\%$ paired validation geometric-MSE reduction against a strict direct full-field objective, and SEAF attains positive aggregate AP skill on the held-out test set. Multiple hypotheses and the two physical information groups provide smaller supported gains, whereas the spectral branch and spatial gate remain exploratory. Larger learned adapters achieve higher aggregate test skill, so SEAF should be understood as a transparent anomaly-centered formulation and evaluation framework rather than a claim of universal architectural superiority.
+
+\appendices
+\section{Complete Validation Screen}
+Table~\ref{tab:validation_full} preserves the complete audited validation aggregation used for checkpoint and protocol inspection. It is separated from the held-out test comparison so that the main Results section remains focused on final evaluation and claim-specific contrasts.
+
+\begin{table}[H]
+\centering
+\caption{Complete validation-screen Macro AP and DAP skill. Values are mean $\pm$ standard deviation over seeds 42, 123, and 3407.}
+\label{tab:validation_full}
+\scriptsize
+\setlength{\tabcolsep}{2.8pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{lcc}
+\toprule
+Method & Macro SS$_{\rm AP}$ $\uparrow$ & Macro SS$_{\rm DAP}$ $\uparrow$\\
+\midrule
+\rowcolor{seafblue} SEAF (full) & $0.2554\!\pm\!0.0031$ & $0.0917\!\pm\!0.0035$\\
+Local CNN & $0.2516\!\pm\!0.0039$ & $0.0865\!\pm\!0.0045$\\
+No spectral & $0.2522\!\pm\!0.0089$ & $0.0873\!\pm\!0.0104$\\
+Uniform ensemble & $0.2564\!\pm\!0.0049$ & $0.0930\!\pm\!0.0061$\\
+Single head & $0.2443\!\pm\!0.0018$ & $0.0788\!\pm\!0.0026$\\
+No tendency & $0.2424\!\pm\!0.0050$ & $0.0761\!\pm\!0.0061$\\
+No external & $0.2464\!\pm\!0.0036$ & $0.0807\!\pm\!0.0043$\\
+\addlinespace[2pt]
+FourCastNet adapter & $0.2899\!\pm\!0.0023$ & $0.1287\!\pm\!0.0025$\\
+ClimaX adapter & $0.3253\!\pm\!0.0086$ & $0.1705\!\pm\!0.0099$\\
+Swin adapter & $0.3075\!\pm\!0.0049$ & $0.1490\!\pm\!0.0061$\\
+\addlinespace[2pt]
+\rowcolor{seafwarm} Direct full field, strict & $-0.9377\!\pm\!0.0571$ & $-1.3324\!\pm\!0.0687$\\
+\rowcolor{seafwarm} Direct full field, tuned & $-0.9543\!\pm\!0.1244$ & $-1.3559\!\pm\!0.1522$\\
+\bottomrule
+\end{tabular}
+\end{table}
+\FloatBarrier
+
+\section*{Acknowledgment}
+The authors thank the maintainers of the open-source scientific software and the ECMWF/ICDC data services used in this study.
+
+\bibliographystyle{IEEEtran}
+\bibliography{../reference}
+
+\end{document}

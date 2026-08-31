@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_seaf_h192.json",
+  "model_display_name": "SEAF",
+  "seaf_hidden_dim": 256
+}

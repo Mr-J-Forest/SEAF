@@ -1,0 +1,18 @@
+{
+  "row": 10,
+  "directions": [
+    {"label": "180", "verdict": "pass", "expected": "down", "observed": "full back-of-head view with lowered/downward orientation", "reason": "the down anchor is unmistakable and matches the approved cardinal"},
+    {"label": "202.5", "verdict": "pass", "expected": "down-left", "observed": "slight screen-left profile with gaze still lowered", "reason": "nose and face plane point left while the pose leaves the back view smoothly"},
+    {"label": "225", "verdict": "pass", "expected": "down-left", "observed": "clear screen-left three-quarter/down profile", "reason": "leftward axis and downward eye/chin placement are both visible"},
+    {"label": "247.5", "verdict": "pass", "expected": "down-left", "observed": "strong screen-left profile with lowered gaze", "reason": "the pose remains on the left/down arc without reversal"},
+    {"label": "270", "verdict": "pass", "expected": "left", "observed": "unmistakable screen-left profile", "reason": "nose tip and face plane point toward the viewer's left edge"},
+    {"label": "292.5", "verdict": "pass", "expected": "up-left", "observed": "screen-left profile with gaze raised from the horizontal", "reason": "leftward face is retained while the vertical axis turns upward"},
+    {"label": "315", "verdict": "pass", "expected": "up-left", "observed": "screen-left three-quarter/up profile", "reason": "the pose advances toward the near-up endpoint while remaining left-facing"},
+    {"label": "337.5", "verdict": "warning", "expected": "up-left", "observed": "near-frontal up pose with a subtle leftward eye/head cue", "reason": "the left component is intentionally subtle one step before 000, but the ordered loop remains coherent and the up cue is clear"}
+  ],
+  "registration": "pass",
+  "edge_check": "pass",
+  "continuity_review": "pass",
+  "reviewed_by": "parent",
+  "note": "The complete coherent row was reviewed at normal display size after deterministic registration; the final seven poses stay on the screen-left arc."
+}

@@ -1,0 +1,9 @@
+{
+  "extends": "oras5_seaf_capacity_control.json",
+  "model_display_name": "SEAF",
+  "use_temporal_depth_mixer": true,
+  "use_local_path": false,
+  "use_spectral_path": true,
+  "router_type": "spatial",
+  "use_forcing_encoder": false
+}

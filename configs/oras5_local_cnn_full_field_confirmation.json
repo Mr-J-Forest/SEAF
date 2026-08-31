@@ -1,0 +1,36 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "paper_model_name": "LocalCNN",
+    "purpose": "validation-only target-formulation control for the LocalCNN backbone",
+    "task": "12-month history to 5-month joint TEMP/SALT forecast",
+    "reference": "inherit the audited LocalCNN anomaly configuration and change only target prediction space",
+    "target_formulation_control": "direct anomaly versus direct full-field; input anomaly processing remains enabled",
+    "comparison_stage": "confirm_validation",
+    "selection_split": "validation",
+    "test_access": "forbidden",
+    "training_budget": "exactly 30 epochs per run",
+    "seeds": [42, 123, 3407]
+  },
+  "_stage_overrides": {
+    "confirm_validation": {
+      "epochs": 30,
+      "scheduler_patience": 8,
+      "early_stopping_patience": 25,
+      "post_training_evaluation": "validation",
+      "save_last": false,
+      "num_workers": 4,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "compile_model": false,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "confirm_validation": [
+    {
+      "name": "local_cnn_full_field",
+      "config": "configs/experiments/oras5_baseline_local_cnn_full_field.json",
+      "seeds": [42, 123, 3407]
+    }
+  ]
+}

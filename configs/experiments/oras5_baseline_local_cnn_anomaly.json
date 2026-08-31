@@ -1,0 +1,11 @@
+{
+  "extends": "oras5_seaf.json",
+  "ablation_disable_spectral": true,
+  "ablation_disable_ensemble": true,
+  "baseline_provenance": {
+    "kind": "internal_control",
+    "method_name": "Local anomaly CNN",
+    "official_code": true,
+    "training": "from_scratch_on_oras5_direct_anomaly"
+  }
+}

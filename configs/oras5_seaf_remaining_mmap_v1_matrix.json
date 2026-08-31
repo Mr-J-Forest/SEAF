@@ -1,0 +1,84 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
+    "task": "12-month anomaly-centered history to 5-month joint TEMP/SALT forecast",
+    "reference_campaign": "91dddd20f847d89a05949e3ddcac87fa39f8de942_seaf_confirm_all36_30ep_v1_mps",
+    "retained_reference_runs": [
+      "confirm_validation__full_seed42",
+      "confirm_validation__full_seed123",
+      "confirm_validation__full_seed3407",
+      "confirm_validation__direct_full_field_strict_seed42",
+      "confirm_validation__direct_full_field_strict_seed123",
+      "confirm_validation__direct_full_field_strict_seed3407",
+      "confirm_validation__direct_full_field_tuned_seed42",
+      "confirm_validation__direct_full_field_tuned_seed123",
+      "confirm_validation__direct_full_field_tuned_seed3407"
+    ],
+    "expected_jobs": 27,
+    "result_policy": "retain 9 completed 30-epoch runs from the reference campaign and train only the remaining 27 jobs with a numerically validated mmap loader",
+    "loader_change": "storage-only preassembly; model tensors and first-epoch losses must match the legacy loader before launch"
+  },
+  "_stage_overrides": {
+    "confirm_validation": {
+      "epochs": 30,
+      "scheduler_patience": 8,
+      "early_stopping_patience": 25,
+      "post_training_evaluation": "validation",
+      "save_last": false,
+      "num_workers": 4,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "compile_model": false,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014",
+      "preassembled_mmap_dir": "/root/autodl-tmp/TSC-Fusion/.cache/preassembled_mmap_v1"
+    }
+  },
+  "confirm_validation": [
+    {
+      "name": "no_tendency",
+      "config": "configs/experiments/oras5_ablation_no_tendency.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "no_external_dynamics",
+      "config": "configs/experiments/oras5_ablation_no_external_dynamics.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "no_spectral",
+      "config": "configs/experiments/oras5_ablation_no_spectral.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "uniform_ensemble",
+      "config": "configs/experiments/oras5_ablation_uniform_ensemble.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "single_head",
+      "config": "configs/experiments/oras5_ablation_single_head.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "local_cnn",
+      "config": "configs/experiments/oras5_baseline_local_cnn_anomaly.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "ofb_fourcastnet_anomaly",
+      "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "ofb_climax_anomaly",
+      "config": "configs/experiments/oras5_ofb_climax_anomaly.json",
+      "seeds": [42, 123, 3407]
+    },
+    {
+      "name": "ofb_swin_anomaly",
+      "config": "configs/experiments/oras5_ofb_swin_anomaly.json",
+      "seeds": [42, 123, 3407]
+    }
+  ]
+}

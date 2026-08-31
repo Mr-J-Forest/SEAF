@@ -1,0 +1,10 @@
+{
+  "extends": "oras5_seaf.json",
+  "model_display_name": "SEAF",
+  "seaf_hidden_dim": 112,
+  "use_temporal_depth_mixer": false,
+  "use_local_path": false,
+  "use_spectral_path": true,
+  "router_type": "spatial",
+  "use_forcing_encoder": false
+}

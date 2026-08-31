@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_baseline_local_cnn_anomaly.json",
+  "enable_target_climatology_anomaly": false,
+  "ablation_direct_full_field": true
+}

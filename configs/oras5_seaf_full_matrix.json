@@ -1,0 +1,102 @@
+{
+  "_contrasts": "configs/oras5_full_contrasts.json",
+  "_protocol": {
+    "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
+    "task": "12-month anomaly-centered history to 5-month joint TEMP/SALT forecast",
+    "reference": "AP and DAP are evaluation-only; no learned model contains a persistence skip",
+    "selection_rule": "learning rates and checkpoints use validation only; final test is eval-only after freezing",
+    "learning_rate_selection": "coarse_grid_tail_median; supplemental boundary refinement skipped by explicit user decision",
+    "comparison_stage": "confirm_validation",
+    "expected_confirmation_experiments": [
+      "full",
+      "direct_full_field_strict",
+      "direct_full_field_tuned",
+      "no_tendency",
+      "no_external_dynamics",
+      "no_spectral",
+      "uniform_ensemble",
+      "single_head",
+      "local_cnn",
+      "ofb_fourcastnet_anomaly",
+      "ofb_climax_anomaly",
+      "ofb_swin_anomaly"
+    ]
+  },
+  "_stage_overrides": {
+    "global_lr_calibrate": {
+      "epochs": 30,
+      "scheduler_patience": 6,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "none",
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    },
+    "global_lr_refine": {
+      "epochs": 30,
+      "scheduler_patience": 6,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "none",
+      "save_last": false,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    },
+    "smoke": {
+      "epochs": 2,
+      "scheduler_patience": 2,
+      "early_stopping_patience": 2,
+      "post_training_evaluation": "none",
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    },
+    "confirm_validation": {
+      "epochs": 80,
+      "scheduler_patience": 8,
+      "early_stopping_patience": 25,
+      "post_training_evaluation": "validation",
+      "save_last": false,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "global_lr_calibrate": [
+    {"name": "lr_seaf_3e4", "config": "configs/experiments/oras5_seaf.json", "seeds": [42], "overrides": {"learning_rate": 0.0003}},
+    {"name": "lr_seaf_8e4", "config": "configs/experiments/oras5_seaf.json", "seeds": [42], "overrides": {"learning_rate": 0.0008}},
+    {"name": "lr_seaf_15e4", "config": "configs/experiments/oras5_seaf.json", "seeds": [42], "overrides": {"learning_rate": 0.0015}},
+    {"name": "lr_direct_full_field_tuned_3e4", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42], "overrides": {"learning_rate": 0.0003}},
+    {"name": "lr_direct_full_field_tuned_8e4", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42], "overrides": {"learning_rate": 0.0008}},
+    {"name": "lr_direct_full_field_tuned_15e4", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42], "overrides": {"learning_rate": 0.0015}},
+    {"name": "lr_ofb_fourcastnet_3e6", "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.000003}},
+    {"name": "lr_ofb_fourcastnet_1e5", "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00001}},
+    {"name": "lr_ofb_fourcastnet_3e5", "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00003}},
+    {"name": "lr_ofb_climax_15e4", "config": "configs/experiments/oras5_ofb_climax_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00015}},
+    {"name": "lr_ofb_climax_5e4", "config": "configs/experiments/oras5_ofb_climax_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.0005}},
+    {"name": "lr_ofb_climax_1e3", "config": "configs/experiments/oras5_ofb_climax_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.001}},
+    {"name": "lr_ofb_swin_15e5", "config": "configs/experiments/oras5_ofb_swin_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.000015}},
+    {"name": "lr_ofb_swin_5e5", "config": "configs/experiments/oras5_ofb_swin_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00005}},
+    {"name": "lr_ofb_swin_15e4", "config": "configs/experiments/oras5_ofb_swin_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00015}}
+  ],
+  "global_lr_refine": [
+    {"name": "lr_seaf_4e4", "config": "configs/experiments/oras5_seaf.json", "seeds": [42], "overrides": {"learning_rate": 0.0004}},
+    {"name": "lr_seaf_6e4", "config": "configs/experiments/oras5_seaf.json", "seeds": [42], "overrides": {"learning_rate": 0.0006}},
+    {"name": "lr_ofb_fourcastnet_5e6", "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.000005}},
+    {"name": "lr_ofb_fourcastnet_8e6", "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.000008}},
+    {"name": "lr_ofb_climax_25e4", "config": "configs/experiments/oras5_ofb_climax_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00025}},
+    {"name": "lr_ofb_climax_4e4", "config": "configs/experiments/oras5_ofb_climax_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.0004}},
+    {"name": "lr_ofb_swin_25e5", "config": "configs/experiments/oras5_ofb_swin_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.000025}},
+    {"name": "lr_ofb_swin_4e5", "config": "configs/experiments/oras5_ofb_swin_anomaly.json", "seeds": [42], "overrides": {"learning_rate": 0.00004}}
+  ],
+  "smoke": [
+    {"name": "full", "config": "configs/experiments/oras5_seaf.json", "seeds": [42]},
+    {"name": "direct_full_field_strict", "config": "configs/experiments/oras5_ablation_direct_full_field.json", "seeds": [42]},
+    {"name": "direct_full_field_tuned", "config": "configs/experiments/oras5_baseline_direct_full_field_tuned.json", "seeds": [42]},
+    {"name": "no_tendency", "config": "configs/experiments/oras5_ablation_no_tendency.json", "seeds": [42]},
+    {"name": "no_external_dynamics", "config": "configs/experiments/oras5_ablation_no_external_dynamics.json", "seeds": [42]},
+    {"name": "no_spectral", "config": "configs/experiments/oras5_ablation_no_spectral.json", "seeds": [42]},
+    {"name": "uniform_ensemble", "config": "configs/experiments/oras5_ablation_uniform_ensemble.json", "seeds": [42]},
+    {"name": "single_head", "config": "configs/experiments/oras5_ablation_single_head.json", "seeds": [42]},
+    {"name": "local_cnn", "config": "configs/experiments/oras5_baseline_local_cnn_anomaly.json", "seeds": [42]},
+    {"name": "ofb_fourcastnet_anomaly", "config": "configs/experiments/oras5_ofb_fourcastnet_anomaly.json", "seeds": [42]},
+    {"name": "ofb_climax_anomaly", "config": "configs/experiments/oras5_ofb_climax_anomaly.json", "seeds": [42]},
+    {"name": "ofb_swin_anomaly", "config": "configs/experiments/oras5_ofb_swin_anomaly.json", "seeds": [42]}
+  ],
+  "confirm_validation": {
+    "from_stage": "smoke",
+    "seeds": [42, 123, 3407]
+  }
+}

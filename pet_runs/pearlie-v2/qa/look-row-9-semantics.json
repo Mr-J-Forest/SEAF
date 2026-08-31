@@ -1,0 +1,18 @@
+{
+  "row": 9,
+  "directions": [
+    {"label": "000", "verdict": "pass", "expected": "up", "observed": "frontal face with eyes and nose lifted above head center", "reason": "upward gaze is distinct from Pearlie's neutral idle frame"},
+    {"label": "022.5", "verdict": "pass", "expected": "up-right", "observed": "slightly right-turned face with raised gaze", "reason": "screen-right cue begins while the upward axis remains visible"},
+    {"label": "045", "verdict": "pass", "expected": "up-right", "observed": "three-quarter screen-right face with upward eye line", "reason": "both axes are visible and continue smoothly from 022.5"},
+    {"label": "067.5", "verdict": "pass", "expected": "up-right", "observed": "near-profile screen-right face with gaze still above the horizontal", "reason": "rightward head turn advances without crossing into the left half"},
+    {"label": "090", "verdict": "pass", "expected": "right", "observed": "unmistakable screen-right profile", "reason": "nose tip and face plane point toward the viewer's right edge"},
+    {"label": "112.5", "verdict": "pass", "expected": "down-right", "observed": "screen-right profile with gaze lowered from 090", "reason": "rightward axis is retained and the eye line begins the downward arc"},
+    {"label": "135", "verdict": "pass", "expected": "down-right", "observed": "screen-right-facing profile with lower gaze and chin", "reason": "pose remains on the right-hand arc while descending toward 180"},
+    {"label": "157.5", "verdict": "pass", "expected": "down-right", "observed": "right-facing final intermediate approaching the down anchor", "reason": "no premature left-facing turn; the row boundary flows into 180"}
+  ],
+  "registration": "pass",
+  "edge_check": "pass",
+  "continuity_review": "pass",
+  "reviewed_by": "parent",
+  "note": "The complete coherent row was reviewed at normal display size after deterministic registration; all poses stay in the intended clockwise right-hand arc."
+}

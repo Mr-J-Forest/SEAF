@@ -12,10 +12,12 @@
     "baseline_requirement": "Every evaluation reports climatology, persistence, anomaly persistence, and train-only damped anomaly persistence."
   },
   "contrasts": [
-    {"name": "anomaly_target", "module": "training_only_climatology_anomaly_target", "candidate": "full", "reference": "direct_full_field", "variables": ["TEMP", "SALT"]},
+    {"name": "anomaly_target_strict", "module": "target_prediction_space_only", "candidate": "full", "reference": "direct_full_field_strict", "variables": ["TEMP", "SALT"]},
     {"name": "explicit_tendency_features", "module": "causal_one_step_tendency", "candidate": "full", "reference": "no_tendency", "variables": ["TEMP", "SALT"]},
     {"name": "external_dynamic_and_surface_inputs", "module": "UVEL_VVEL_SSHA_MLD_TAUX_TAUY_QNET_WFLUX", "candidate": "full", "reference": "no_external_dynamics", "variables": ["TEMP", "SALT"]},
     {"name": "spectral_branch", "module": "global_spectral_branch", "candidate": "full", "reference": "no_spectral", "variables": ["TEMP", "SALT"]},
-    {"name": "ensemble_gate", "module": "gated_ensemble", "candidate": "full", "reference": "no_ensemble", "variables": ["TEMP", "SALT"]}
+    {"name": "spatial_gate", "module": "learned_spatial_gate_vs_uniform_average", "candidate": "full", "reference": "uniform_ensemble", "variables": ["TEMP", "SALT"]},
+    {"name": "multiple_hypotheses", "module": "multi_member_ensemble_vs_single_head", "candidate": "full", "reference": "single_head", "variables": ["TEMP", "SALT"]},
+    {"name": "compact_local_cnn_control", "module": "spectral_ensemble_architecture", "candidate": "full", "reference": "local_cnn", "variables": ["TEMP", "SALT"]}
   ]
 }

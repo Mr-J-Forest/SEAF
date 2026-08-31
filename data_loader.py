@@ -52,8 +52,15 @@ class OceanDataset(Dataset):
         self.sequence_length = config['sequence_length']
         self.prediction_length = config['prediction_length']
         self.enable_climatology_anomaly = config.get('enable_climatology_anomaly', False)
+        self.enable_target_climatology_anomaly = config.get(
+            'enable_target_climatology_anomaly',
+            self.enable_climatology_anomaly,
+        )
         self.climatology_period = max(1, int(config.get('climatology_period', 12)))
         self.anomaly_variables = set(config.get('anomaly_variables', self.target_variables))
+        self.target_anomaly_variables = set(
+            config.get('target_anomaly_variables', self.target_variables)
+        )
         self.include_climatology_features = config.get('include_climatology_features', False)
         self.climatology_feature_variables = list(
             config.get('climatology_feature_variables', self.target_variables)
@@ -89,33 +96,39 @@ class OceanDataset(Dataset):
         # 在 _load_data 中从 NetCDF 动态解析，允许 ORAS5 等数据源增加物理输入。
         self.available_variables = []
         self.coord_variables = ['LONGITUDE', 'LATITUDE', 'LEVEL', 'TIME']
+        self.preassembled_mmap_dir = config.get('preassembled_mmap_dir')
+        self._preassembled_mmap_enabled = False
 
-        # 加载和预处理数据
-        self._load_data()
+        if not self._try_load_preassembled_mmap():
+            # 加载和预处理数据
+            self._load_data()
 
-        # 尝试从缓存加载预处理结果
-        loaded_from_cache = self._try_load_from_cache()
+            # 尝试从缓存加载预处理结果
+            loaded_from_cache = self._try_load_from_cache()
 
-        if loaded_from_cache:
-            print(f"[{self.mode.upper()}] 从缓存加载预处理数据成功，跳过滑窗搜索/气候态/标准化")
-            # 关闭 NetCDF，已不再需要
-            if hasattr(self, 'dataset') and self.dataset is not None:
-                self.dataset.close()
-                self.dataset = None
-        else:
-            self._find_sliding_regions()  # 查找有效的滑动区域
-            self._preprocess_data()
-            # 预处理完成后关闭 NetCDF
-            if hasattr(self, 'dataset') and self.dataset is not None:
-                self.dataset.close()
-                self.dataset = None
-            self._save_cache()
+            if loaded_from_cache:
+                print(f"[{self.mode.upper()}] 从缓存加载预处理数据成功，跳过滑窗搜索/气候态/标准化")
+                # 关闭 NetCDF，已不再需要
+                if hasattr(self, 'dataset') and self.dataset is not None:
+                    self.dataset.close()
+                    self.dataset = None
+            else:
+                self._find_sliding_regions()  # 查找有效的滑动区域
+                self._preprocess_data()
+                # 预处理完成后关闭 NetCDF
+                if hasattr(self, 'dataset') and self.dataset is not None:
+                    self.dataset.close()
+                    self.dataset = None
+                self._save_cache()
 
         self._split_data()
         self._create_sequences()
         self.input_channel_slices = {}
         self.target_channel_slices = {}
-        self._initialize_channel_schema()
+        if getattr(self, '_preassembled_mmap_enabled', False):
+            self._initialize_preassembled_channel_schema()
+        else:
+            self._initialize_channel_schema()
         self._validate_channel_schema()
 
     def can_share_preprocessed_with_mode(self, mode: str) -> bool:
@@ -210,21 +223,214 @@ class OceanDataset(Dataset):
         print(f"时间序列长度: {len(self.times)}")
         print(f"空间维度: 经度{len(self.lons)} x 纬度{len(self.lats)} x 深度{len(self.levels)}")
 
+    _PREASSEMBLED_MMAP_FORMAT_VERSION = 1
+
+    def _try_load_preassembled_mmap(self) -> bool:
+        """Load a read-only, channel-preassembled time-axis cache when requested."""
+        if not self.preassembled_mmap_dir:
+            return False
+
+        cache_dir = os.path.realpath(str(self.preassembled_mmap_dir))
+        manifest_path = os.path.join(cache_dir, 'manifest.json')
+        success_path = os.path.join(cache_dir, '_SUCCESS')
+        state_path = os.path.join(cache_dir, 'state.pkl')
+        if not all(os.path.isfile(path) for path in (manifest_path, success_path, state_path)):
+            raise FileNotFoundError(
+                f'预组装 mmap 缓存不完整: {cache_dir}'
+            )
+
+        with open(manifest_path, 'r', encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        if int(manifest.get('format_version', -1)) != self._PREASSEMBLED_MMAP_FORMAT_VERSION:
+            raise ValueError(
+                '预组装 mmap 格式版本不匹配: '
+                f"{manifest.get('format_version')} != {self._PREASSEMBLED_MMAP_FORMAT_VERSION}"
+            )
+
+        data_stat = os.stat(self.data_path)
+        expected_identity = manifest.get('data_identity', {})
+        actual_identity = {
+            'size': int(data_stat.st_size),
+            'mtime_ns': int(data_stat.st_mtime_ns),
+        }
+        if expected_identity != actual_identity:
+            raise ValueError(
+                f'预组装 mmap 与当前数据文件不一致: '
+                f'expected={expected_identity}, actual={actual_identity}'
+            )
+        if int(manifest.get('sequence_length', -1)) != int(self.sequence_length):
+            raise ValueError('预组装 mmap 的 sequence_length 与当前配置不一致')
+        if int(manifest.get('prediction_length', -1)) != int(self.prediction_length):
+            raise ValueError('预组装 mmap 的 prediction_length 与当前配置不一致')
+
+        input_path = os.path.join(cache_dir, manifest['input_file'])
+        fullfield_target_path = os.path.join(cache_dir, manifest['fullfield_target_file'])
+        climatology_path = os.path.join(cache_dir, manifest['target_climatology_file'])
+        for path in (input_path, fullfield_target_path, climatology_path):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f'预组装 mmap 缺少数组: {path}')
+
+        # Copy-on-write mappings are writable from PyTorch's perspective while
+        # never persisting accidental tensor mutations back to the shared cache.
+        self._mmap_inputs = np.load(input_path, mmap_mode='c', allow_pickle=False)
+        self._mmap_fullfield_targets = np.load(
+            fullfield_target_path, mmap_mode='c', allow_pickle=False
+        )
+        self._mmap_target_climatology = np.load(
+            climatology_path, mmap_mode='c', allow_pickle=False
+        )
+        expected_shapes = {
+            'inputs': tuple(manifest['input_shape']),
+            'fullfield_targets': tuple(manifest['fullfield_target_shape']),
+            'target_climatology': tuple(manifest['target_climatology_shape']),
+        }
+        actual_shapes = {
+            'inputs': tuple(self._mmap_inputs.shape),
+            'fullfield_targets': tuple(self._mmap_fullfield_targets.shape),
+            'target_climatology': tuple(self._mmap_target_climatology.shape),
+        }
+        if actual_shapes != expected_shapes:
+            raise ValueError(
+                f'预组装 mmap shape 不匹配: expected={expected_shapes}, actual={actual_shapes}'
+            )
+
+        with open(state_path, 'rb') as handle:
+            state = pickle.load(handle)
+        self.scalers = state['scalers']
+        self.damped_persistence_coefficients = state['damped_persistence_coefficients']
+
+        self.available_variables = list(manifest['available_variables'])
+        self.lons = np.asarray(manifest['lons'], dtype=np.float32)
+        self.lats = np.asarray(manifest['lats'], dtype=np.float32)
+        self.levels = np.asarray(manifest['levels'], dtype=np.float32)
+        self.times = np.asarray(manifest['times'])
+        self.time_period_indices = np.asarray(
+            manifest['time_period_indices'], dtype=np.int64
+        )
+        self.dataset = None
+
+        target_slices = {
+            name: slice(int(bounds[0]), int(bounds[1]))
+            for name, bounds in manifest['target_channel_slices'].items()
+        }
+        self._preassembled_target_source_slices = target_slices
+        self._preassembled_fullfield_scaler_names = dict(
+            manifest['fullfield_target_scalers']
+        )
+        input_slices = {
+            name: slice(int(bounds[0]), int(bounds[1]))
+            for name, bounds in manifest['input_channel_slices'].items()
+        }
+        self._preassembled_manifest_input_slices = input_slices
+        actual_input_variables = list(self.input_variables)
+        if self.include_climatology_features:
+            actual_input_variables.extend(
+                self._climatology_feature_name(name)
+                for name in self.climatology_feature_variables
+            )
+        if self.include_tendency_features:
+            actual_input_variables.extend(
+                self._tendency_feature_name(name)
+                for name in self.tendency_feature_variables
+            )
+        if self.config.get('enable_positional_encoding', False):
+            actual_input_variables.append('SPATIAL_ENCODING')
+        if self.config.get('enable_time_encoding', False):
+            actual_input_variables.append('TIME_ENCODING')
+
+        missing_inputs = [name for name in actual_input_variables if name not in input_slices]
+        missing_targets = [name for name in self.target_variables if name not in target_slices]
+        if missing_inputs or missing_targets:
+            raise ValueError(
+                '预组装 mmap 不覆盖当前配置通道: '
+                f'inputs={missing_inputs}, targets={missing_targets}'
+            )
+        selected_channels = []
+        for name in actual_input_variables:
+            source_slice = input_slices[name]
+            selected_channels.extend(range(source_slice.start, source_slice.stop))
+        self.actual_input_variables = actual_input_variables
+        if selected_channels == list(range(selected_channels[0], selected_channels[-1] + 1)):
+            self._preassembled_input_selection = slice(
+                selected_channels[0], selected_channels[-1] + 1
+            )
+        else:
+            self._preassembled_input_selection = np.asarray(
+                selected_channels, dtype=np.int64
+            )
+        selected_targets = []
+        for name in self.target_variables:
+            source_slice = target_slices[name]
+            selected_targets.extend(range(source_slice.start, source_slice.stop))
+        if selected_targets == list(range(selected_targets[0], selected_targets[-1] + 1)):
+            self._preassembled_target_selection = slice(
+                selected_targets[0], selected_targets[-1] + 1
+            )
+        else:
+            self._preassembled_target_selection = np.asarray(
+                selected_targets, dtype=np.int64
+            )
+
+        self.all_regions_data = []
+        for region_idx, region_meta in enumerate(manifest['regions']):
+            climatology = {}
+            for variable, source_slice in target_slices.items():
+                climatology[variable] = self._mmap_target_climatology[
+                    region_idx, :, source_slice, :, :
+                ]
+            self.all_regions_data.append({
+                'lon_range': region_meta['lon_range'],
+                'lat_range': region_meta['lat_range'],
+                'region_type': region_meta.get('region_type', 'sliding'),
+                'coords': {
+                    'lons': np.asarray(region_meta['lons'], dtype=np.float32),
+                    'lats': np.asarray(region_meta['lats'], dtype=np.float32),
+                    'levels': self.levels,
+                    'times': self.times,
+                },
+                'climatology': climatology,
+            })
+
+        self._preassembled_mmap_enabled = True
+        print(
+            f'[{self.mode.upper()}] 使用只读预组装 mmap: {cache_dir}; '
+            f'regions={len(self.all_regions_data)}, channels={len(selected_channels)}'
+        )
+        return True
+
+    def _initialize_preassembled_channel_schema(self):
+        """Initialize output channel slices without materializing mmap arrays."""
+        offset = 0
+        manifest_slices = self._preassembled_manifest_input_slices
+        for variable in self.actual_input_variables:
+            source_slice = manifest_slices[variable]
+            length = int(source_slice.stop - source_slice.start)
+            self.input_channel_slices[variable] = slice(offset, offset + length)
+            offset += length
+
+        offset = 0
+        for variable in self.target_variables:
+            source_slice = self._preassembled_target_source_slices[variable]
+            length = int(source_slice.stop - source_slice.start)
+            self.target_channel_slices[variable] = slice(offset, offset + length)
+            offset += length
+
     # ========== 预处理缓存持久化 ==========
 
     # v5 introduced terminal anchors; v6 shares mode-independent payloads;
-    # v7 adds train-scaled causal physical tendency features.
-    _CACHE_FORMAT_VERSION = 7
+    # v7 adds train-scaled causal physical tendency features; v8 separates
+    # input and target anomaly spaces for the strict target ablation.
+    _CACHE_FORMAT_VERSION = 8
     _WINDOW_GRID_POLICY = 'regular_plus_terminal_anchor_v1'
     _CACHE_CONFIG_KEYS = frozenset({
         'lon_range', 'lat_range', 'depth_range',
         'ocean_threshold', 'ocean_coverage_depth', 'ocean_mask_variable',
         'input_variables',
-        'anomaly_variables', 'climatology_period',
+        'anomaly_variables', 'target_anomaly_variables', 'climatology_period',
         'include_climatology_features', 'climatology_feature_variables',
         'tendency_feature_variables',
         'climatology_baseline_variables',
-        'enable_climatology_anomaly',
+        'enable_climatology_anomaly', 'enable_target_climatology_anomaly',
     })
 
     def _compute_cache_key(self) -> str:
@@ -246,6 +452,7 @@ class OceanDataset(Dataset):
         required_variables = set(self.config.get('input_variables', []))
         required_variables.update(self.config.get('target_variables', []))
         required_variables.update(self.config.get('anomaly_variables', []))
+        required_variables.update(self.config.get('target_anomaly_variables', []))
         required_variables.update(self.config.get('climatology_feature_variables', []))
         required_variables.update(self.config.get('climatology_baseline_variables', []))
         required_variables.update(self.config.get('tendency_feature_variables', []))
@@ -337,6 +544,9 @@ class OceanDataset(Dataset):
                 ):
                     continue
                 norm_dict[f'norm_{var_name}'] = arr
+            for var_name, arr in region.get('normalized_target_data', {}).items():
+                if self._target_scaler_name(var_name) != var_name:
+                    norm_dict[f'targetnorm_{var_name}'] = arr
             # coords
             for coord_name in ('lons', 'lats', 'levels', 'times'):
                 val = region.get('coords', {}).get(coord_name)
@@ -424,9 +634,13 @@ class OceanDataset(Dataset):
                     raise FileNotFoundError(f'缓存缺少区域文件: {norm_path}')
                 with np.load(norm_path, allow_pickle=False) as loaded:
                     norm_data = {}
+                    target_norm_data = {}
                     coords = {}
                     for key in loaded.files:
-                        if key.startswith('norm_'):
+                        if key.startswith('targetnorm_'):
+                            var_name = key[11:]
+                            target_norm_data[var_name] = loaded[key]
+                        elif key.startswith('norm_'):
                             var_name = key[5:]
                             norm_data[var_name] = loaded[key]
                         elif key.startswith('coord_'):
@@ -444,7 +658,18 @@ class OceanDataset(Dataset):
                     raise ValueError(
                         f'缓存区域 {idx} 缺少目标变量: {missing_targets}'
                     )
+                missing_separate_targets = [
+                    name for name in self.target_variables
+                    if self._target_scaler_name(name) != name
+                    and name not in target_norm_data
+                ]
+                if missing_separate_targets:
+                    raise ValueError(
+                        f'缓存区域 {idx} 缺少独立目标空间变量: '
+                        f'{missing_separate_targets}'
+                    )
                 region['normalized_data'] = norm_data
+                region['normalized_target_data'] = target_norm_data
                 region['coords'] = coords
 
                 # 加载 climatology
@@ -761,6 +986,27 @@ class OceanDataset(Dataset):
     def _is_anomaly_variable(self, variable: str) -> bool:
         return self.enable_climatology_anomaly and variable in self.anomaly_variables
 
+    def _is_target_anomaly_variable(self, variable: str) -> bool:
+        enabled = getattr(
+            self,
+            'enable_target_climatology_anomaly',
+            getattr(self, 'enable_climatology_anomaly', False),
+        )
+        variables = getattr(
+            self,
+            'target_anomaly_variables',
+            set(getattr(self, 'target_variables', [])),
+        )
+        return (
+            enabled
+            and variable in variables
+        )
+
+    def _target_scaler_name(self, variable: str) -> str:
+        if self._is_target_anomaly_variable(variable) == self._is_anomaly_variable(variable):
+            return variable
+        return f'TARGET_{variable}'
+
     @staticmethod
     def _climatology_feature_name(variable: str) -> str:
         return f"CLIMATOLOGY_{variable}"
@@ -796,6 +1042,14 @@ class OceanDataset(Dataset):
         )
         if self.enable_climatology_anomaly:
             variables.update(self.anomaly_variables)
+        if getattr(
+            self,
+            'enable_target_climatology_anomaly',
+            self.enable_climatology_anomaly,
+        ):
+            variables.update(getattr(
+                self, 'target_anomaly_variables', set(self.target_variables)
+            ))
         if self.include_climatology_features:
             variables.update(self.climatology_feature_variables)
 
@@ -822,7 +1076,7 @@ class OceanDataset(Dataset):
 
             region['climatology'][var] = climatology
 
-            if self._is_anomaly_variable(var):
+            if self._is_anomaly_variable(var) or self._is_target_anomaly_variable(var):
                 periods = self.time_period_indices[:data.shape[0]]
                 region['anomaly_data'][var] = (data - climatology[periods]).astype(np.float32)
 
@@ -896,6 +1150,13 @@ class OceanDataset(Dataset):
                 return anomaly_data
         return region['data'].get(variable)
 
+    def _get_target_source_data(self, region: Dict, variable: str) -> Optional[np.ndarray]:
+        if self._is_target_anomaly_variable(variable):
+            anomaly_data = region.get('anomaly_data', {}).get(variable)
+            if anomaly_data is not None:
+                return anomaly_data
+        return region['data'].get(variable)
+
     def _merge_and_normalize_data(self):
         """
         合并所有区域数据并进行标准化
@@ -942,6 +1203,26 @@ class OceanDataset(Dataset):
                 self.scalers[var] = scaler
                 print(f"变量 {var} 全局标准化参数: 均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}")
 
+            for var in self.target_variables:
+                scaler_name = self._target_scaler_name(var)
+                if scaler_name == var:
+                    continue
+                scaler = StandardScaler()
+                fitted = False
+                for region in self.all_regions_data:
+                    source_data = self._get_target_source_data(region, var)
+                    if source_data is None:
+                        continue
+                    scaler.partial_fit(source_data[:train_end_idx].reshape(-1, 1))
+                    fitted = True
+                if not fitted:
+                    raise ValueError(f'目标变量 {var!r} 缺少可拟合数据')
+                self.scalers[scaler_name] = scaler
+                print(
+                    f"目标变量 {scaler_name} 全局标准化参数: "
+                    f"均值={scaler.mean_[0]:.4f}, 标准差={scaler.scale_[0]:.4f}"
+                )
+
             if self.include_climatology_features:
                 for var in self.climatology_feature_variables:
                     feature_name = self._climatology_feature_name(var)
@@ -984,6 +1265,21 @@ class OceanDataset(Dataset):
                     data_2d = source_data.reshape(-1, 1)
                     data_normalized = self.scalers[var].transform(data_2d)
                     region['normalized_data'][var] = data_normalized.reshape(original_shape)
+
+            region['normalized_target_data'] = {}
+            for var in self.target_variables:
+                scaler_name = self._target_scaler_name(var)
+                if scaler_name == var:
+                    if var in region['normalized_data']:
+                        region['normalized_target_data'][var] = region['normalized_data'][var]
+                    continue
+                source_data = self._get_target_source_data(region, var)
+                scaler = self.scalers.get(scaler_name)
+                if source_data is None or scaler is None:
+                    continue
+                original_shape = source_data.shape
+                transformed = scaler.transform(source_data.reshape(-1, 1))
+                region['normalized_target_data'][var] = transformed.reshape(original_shape)
 
             if self.include_climatology_features:
                 for var in self.climatology_feature_variables:
@@ -1578,12 +1874,18 @@ class OceanDataset(Dataset):
         Returns:
             输入序列和目标序列的元组
         """
+        if getattr(self, '_preassembled_mmap_enabled', False):
+            return self._get_preassembled_item(idx)
+
         # 解析序列信息：(时间起始索引, 区域索引)
         start_idx, region_idx = self.sequences[idx]
 
         # 获取对应区域的数据
         region_info = self.all_regions_data[region_idx]
         normalized_data = region_info['normalized_data']
+        normalized_target_data = (
+            region_info.get('normalized_target_data') or normalized_data
+        )
 
         # 更新输入变量列表（第一次调用时）
         if not hasattr(self, 'actual_input_variables'):
@@ -1640,22 +1942,21 @@ class OceanDataset(Dataset):
         # 构建目标序列
         target_sequence = []
         for var in self.target_variables:
-            if var in normalized_data:
-                var_data = normalized_data[var][start_idx + self.sequence_length:start_idx + self.sequence_length + self.prediction_length]
+            if var in normalized_target_data:
+                var_data = normalized_target_data[var][start_idx + self.sequence_length:start_idx + self.sequence_length + self.prediction_length]
                 target_sequence.append(var_data)
 
-        # 转换为numpy数组并调整维度
-        # 数据形状: (seq_len, level, lat, lon) -> 需要转换为 (seq_len, lat, lon, level * channels)
+        # 统一为 channel-first，避免先转置到 channel-last、拼接后再转回去。
+        # 预处理缓存中的物理变量约定为 (time, channels, height, width)。
         input_arrays = []
         input_channel_lengths = []
         for var_data in input_sequence:
-            if var_data.ndim == 4:  # (seq_len, level, lat, lon)
-                # 重排维度: (seq_len, level, lat, lon) -> (seq_len, lat, lon, level)
-                var_data = var_data.transpose(0, 2, 3, 1)
-            elif var_data.ndim == 3:  # 如果是3D数据，添加深度维度
-                var_data = var_data[:, :, :, np.newaxis]
-            input_arrays.append(var_data)
-            input_channel_lengths.append(var_data.shape[-1])
+            if var_data.ndim == 3:  # (seq_len, lat, lon)
+                var_data = var_data[:, np.newaxis, :, :]
+            elif var_data.ndim != 4:
+                raise ValueError(f'输入变量样本维度必须为 3 或 4，实际为 {var_data.shape}')
+            input_arrays.append(np.asarray(var_data, dtype=np.float32))
+            input_channel_lengths.append(var_data.shape[1])
 
         if not self.input_channel_slices:
             channel_offset = 0
@@ -1666,13 +1967,12 @@ class OceanDataset(Dataset):
         target_arrays = []
         target_channel_lengths = []
         for var_data in target_sequence:
-            if var_data.ndim == 4:  # (pred_len, level, lat, lon)
-                # 重排维度: (pred_len, level, lat, lon) -> (pred_len, lat, lon, level)
-                var_data = var_data.transpose(0, 2, 3, 1)
-            elif var_data.ndim == 3:  # 如果是3D数据，添加深度维度
-                var_data = var_data[:, :, :, np.newaxis]
-            target_arrays.append(var_data)
-            target_channel_lengths.append(var_data.shape[-1])
+            if var_data.ndim == 3:  # (pred_len, lat, lon)
+                var_data = var_data[:, np.newaxis, :, :]
+            elif var_data.ndim != 4:
+                raise ValueError(f'目标变量样本维度必须为 3 或 4，实际为 {var_data.shape}')
+            target_arrays.append(np.asarray(var_data, dtype=np.float32))
+            target_channel_lengths.append(var_data.shape[1])
 
         if not self.target_channel_slices:
             channel_offset = 0
@@ -1680,20 +1980,35 @@ class OceanDataset(Dataset):
                 self.target_channel_slices[var_name] = slice(channel_offset, channel_offset + channel_len)
                 channel_offset += channel_len
 
-        # 在深度维度上连接不同变量
-        input_seq = np.concatenate(
-            [arr.astype(np.float32, copy=False) for arr in input_arrays],
-            axis=-1
-        )  # (seq_len, lat, lon, total_channels)
-        target_seq = np.concatenate(
-            [arr.astype(np.float32, copy=False) for arr in target_arrays],
-            axis=-1
-        )  # (pred_len, lat, lon, total_channels)
+        # 在 channel 维连接不同变量；from_numpy 避免再次复制完整样本。
+        input_seq = np.ascontiguousarray(np.concatenate(input_arrays, axis=1))
+        target_seq = np.ascontiguousarray(np.concatenate(target_arrays, axis=1))
 
-        # 转换为PyTorch张量并调整维度顺序 (seq_len, channels, height, width)
-        input_tensor = torch.FloatTensor(input_seq).permute(0, 3, 1, 2)
-        target_tensor = torch.FloatTensor(target_seq).permute(0, 3, 1, 2)
+        # 数据已经是 (time, channels, height, width)，无需再 permute。
+        input_tensor = torch.from_numpy(input_seq)
+        target_tensor = torch.from_numpy(target_seq)
 
+        if self.return_sample_index:
+            return input_tensor, target_tensor, idx
+        return input_tensor, target_tensor
+
+    def _get_preassembled_item(self, idx: int) -> Tuple[torch.Tensor, ...]:
+        """Slice one sample from the shared time-axis mmap cache."""
+        start_idx, region_idx = self.sequences[idx]
+        input_values = self._mmap_inputs[
+            region_idx, start_idx:start_idx + self.sequence_length
+        ][:, self._preassembled_input_selection, :, :]
+        target_start = start_idx + self.sequence_length
+        target_source = (
+            self._mmap_inputs
+            if self.enable_target_climatology_anomaly
+            else self._mmap_fullfield_targets
+        )
+        target_values = target_source[
+            region_idx, target_start:target_start + self.prediction_length
+        ][:, self._preassembled_target_selection, :, :]
+        input_tensor = torch.from_numpy(np.asarray(input_values, dtype=np.float32))
+        target_tensor = torch.from_numpy(np.asarray(target_values, dtype=np.float32))
         if self.return_sample_index:
             return input_tensor, target_tensor, idx
         return input_tensor, target_tensor
@@ -1758,6 +2073,30 @@ class OceanDataset(Dataset):
             return None
         return self._series_to_channel_first(climatology[period_indices])
 
+    def _preassembled_raw_target_channels(
+        self,
+        region_idx: int,
+        variable: str,
+        start_idx: int,
+        length: int,
+    ) -> np.ndarray:
+        """Restore a short physical target slice from the full-field mmap."""
+        source_slice = self._preassembled_target_source_slices[variable]
+        normalized = np.asarray(
+            self._mmap_fullfield_targets[
+                region_idx,
+                start_idx:start_idx + length,
+                source_slice,
+                :, :,
+            ],
+            dtype=np.float32,
+        )
+        scaler_name = self._preassembled_fullfield_scaler_names[variable]
+        scaler = self.scalers[scaler_name]
+        return scaler.inverse_transform(
+            normalized.reshape(-1, 1)
+        ).reshape(normalized.shape).astype(np.float32, copy=False)
+
     def inverse_transform_targets(
         self,
         data: np.ndarray,
@@ -1788,14 +2127,14 @@ class OceanDataset(Dataset):
             if ch_slice.stop <= ch_slice.start:
                 continue
 
-            scaler = self.scalers.get(var_name)
+            scaler = self.scalers.get(self._target_scaler_name(var_name))
             if scaler is None:
                 raise ValueError(f'目标变量 {var_name!r} 缺少训练期 scaler')
             var_block = restored[:, :, ch_slice, :, :]
             original_shape = var_block.shape
             var_block = scaler.inverse_transform(var_block.reshape(-1, 1)).reshape(original_shape)
 
-            if self._is_anomaly_variable(var_name):
+            if self._is_target_anomaly_variable(var_name):
                 for out_idx, sample_idx in enumerate(sample_indices):
                     start_idx, region_idx = self.sequences[int(sample_idx)]
                     target_start = start_idx + self.sequence_length
@@ -1842,7 +2181,7 @@ class OceanDataset(Dataset):
                 continue
 
             var_block = transformed[:, :, ch_slice, :, :]
-            if self._is_anomaly_variable(var_name):
+            if self._is_target_anomaly_variable(var_name):
                 for out_idx, sample_idx in enumerate(sample_indices):
                     start_idx, region_idx = self.sequences[int(sample_idx)]
                     target_start = start_idx + self.sequence_length
@@ -1859,7 +2198,7 @@ class OceanDataset(Dataset):
                         )
                     var_block[out_idx] = var_block[out_idx] - clim
 
-            scaler = self.scalers.get(var_name)
+            scaler = self.scalers.get(self._target_scaler_name(var_name))
             if scaler is None:
                 raise ValueError(f'目标变量 {var_name!r} 缺少训练期 scaler')
             original_shape = var_block.shape
@@ -1920,7 +2259,7 @@ class OceanDataset(Dataset):
             damped_anomaly_persistence_parts = []
 
             for var_name in self.target_variables:
-                raw_data = region['data'][var_name]
+                raw_data = region.get('data', {}).get(var_name)
                 future_clim = self._target_climatology_channels(
                     region,
                     var_name,
@@ -1928,6 +2267,10 @@ class OceanDataset(Dataset):
                     self.prediction_length
                 )
                 if future_clim is None:
+                    if raw_data is None:
+                        raise ValueError(
+                            f'样本 {sample_idx} 的 {var_name} 缺少气候态和原始数据'
+                        )
                     train_end_idx = int(len(self.times) * self.train_ratio)
                     fallback = np.nanmean(raw_data[:train_end_idx], axis=0).astype(np.float32)
                     fallback = np.nan_to_num(fallback, nan=0.0)
@@ -1937,7 +2280,16 @@ class OceanDataset(Dataset):
                         axis=0
                     )
 
-                last_raw = self._series_to_channel_first(raw_data[last_hist_idx:last_hist_idx + 1])[0]
+                if raw_data is None and getattr(self, '_preassembled_mmap_enabled', False):
+                    last_raw = self._preassembled_raw_target_channels(
+                        region_idx, var_name, last_hist_idx, 1
+                    )[0]
+                elif raw_data is not None:
+                    last_raw = self._series_to_channel_first(
+                        raw_data[last_hist_idx:last_hist_idx + 1]
+                    )[0]
+                else:
+                    raise ValueError(f'样本 {sample_idx} 的 {var_name} 缺少原始数据')
                 persistence = np.repeat(last_raw[np.newaxis, ...], self.prediction_length, axis=0)
 
                 hist_clim = self._target_climatology_channels(

@@ -1,0 +1,50 @@
+Create one horizontal look-direction strip for Codex pet `pearlie`, atlas row 10.
+
+Use the attached canonical base, completed standard contact sheet, layout guide, and approved four-cardinal strip for identity, scale, registration, spacing, direction semantics, and cross-row continuity. Read `qa/look-mechanics.md` and follow its pet-specific movement and eye/prop mechanics. The approved cardinal strip and completed coherent row 9 are authoritative. Use the cardinals for direction meaning and row 9 for cross-row identity, scale, registration, and continuity.
+
+COHERENT SYNTHESIS LOCK: produce one unified eight-pose row. Do not paste, tile, or independently restyle individual cells. Every final cell must be drawn together with the same face construction, body proportions, line/render quality, lighting, materials, scale, baseline, and registration.
+
+Output exactly 8 complete full-body frames in this exact left-to-right order: 180, 202.5, 225, 247.5, 270, 292.5, 315, 337.5. Degrees are clockwise: 000 is up, 090 right, 180 down, and 270 left. Neutral/front is not part of this row.
+
+DIRECTION TARGETS — use these to shape the coherent row, not as pixel-level landmark gates:
+
+1. `180`: vertical DOWN; no horizontal requirement.
+2. `202.5`: horizontal SCREEN-LEFT and vertical DOWN.
+3. `225`: horizontal SCREEN-LEFT and vertical DOWN.
+4. `247.5`: horizontal SCREEN-LEFT and vertical DOWN.
+5. `270`: horizontal SCREEN-LEFT; no vertical requirement.
+6. `292.5`: horizontal SCREEN-LEFT and vertical UP.
+7. `315`: horizontal SCREEN-LEFT and vertical UP.
+8. `337.5`: horizontal SCREEN-LEFT and vertical UP.
+
+REPAIR DIRECTION LOCK: row 10 uses only the arc `180 down -> 270 screen-left -> 000 up`. The approved `180` anchor is a frontal low-eye/down pose, not a back view. The second, third, and fourth poses (`202.5`, `225`, `247.5`) must remain screen-left-facing while their gaze rises from down toward horizontal; their nose tip, eye centers, and visible face plane must stay on the viewer's left side. The fifth pose (`270`) is the unmistakable screen-left anchor. Do not use the `090 screen-right` family anywhere in poses `202.5` through `270`; the right-facing turn begins only after `270` and must still remain screen-left for `292.5`, `315`, and `337.5` as the gaze rises toward `000`. The separate two-anchor reference shows `180` frontal/down on the left and `270` screen-left on the right; use those silhouettes and face planes as hard constraints.
+
+HARD VISUAL REPAIR: the enlarged two-pose reference is the primary direction evidence for this row: its left pose is the approved `180 down` back view and its right pose is the approved `270 screen-left` profile, with the nose protruding toward the viewer's left edge. For every generated pose from `202.5` through `337.5`, keep the face plane and nose on the viewer's left side; do not produce a right-facing profile. `202.5`, `225`, and `247.5` are left-facing/downward intermediates, `270` is the strongest left profile, and `292.5`, `315`, and `337.5` remain left-facing while the gaze rises toward `000`. The attached row-9 strip is continuity evidence only: copy its scale, baseline, and identity, never its right-facing direction.
+
+DIRECTION-FIRST REFERENCE LOCK: ignore any right-facing gaze that may appear in the row-9 continuity reference. Use the enlarged two-pose reference as the only horizontal-direction authority. Draw the ordered silhouettes as: `180` back-of-head/down; `202.5` slight screen-left three-quarter/down; `225` clear screen-left three-quarter/down; `247.5` strong screen-left three-quarter/down; `270` unmistakable screen-left profile; `292.5` screen-left three-quarter/up; `315` screen-left three-quarter/up; `337.5` near-frontal but still with the nose and eye centers slightly left of head center, looking up. In every pose after `180`, the nose must protrude toward the viewer's LEFT edge and the hair must trail toward the RIGHT side of the image. A pose whose nose protrudes right is invalid for this row.
+
+SOURCE GEOMETRY LOCK: output exactly eight separate connected pose groups in one horizontal strip. Leave a clear chroma-only gap between every neighboring silhouette, including the final two groups; hair, sleeves, hands, shoes, and dress hems must never touch or overlap a neighbor. Keep generous chroma-only margins at the left and right canvas edges. Each group must be a complete unclipped full-body sprite, with one group per ordered direction and no collage, duplicate, or merged pair. The row must still have eight groups after the blue background is removed.
+
+VISIBLE DIRECTION SCAFFOLD: the attached eight-slot scaffold is a construction reference made from the approved anchors in this order: slot 1 is `180` frontal/down with low eyes, slots 2-7 are the `270` screen-left profile family, and slot 8 is the `000` up family. Redraw a fresh coherent row from it; do not tile or paste the scaffold. Use the six left-profile middle slots to interpolate the left/down through left/up arc, so every middle pose has its nose and face plane toward the viewer's left. Keep the same eight-slot spacing and a clear blue gap around each scaffold position.
+
+WHOLE-ROW EDIT REPAIR: the attached previous row-10 draft is an edit target for slot positions, scale, baseline, and eight-group spacing only. Redraw the complete row as one coherent family, correcting every horizontal face orientation. Use the approved `270` screen-left profile as the exact face-plane reference: in slots `202.5` through `337.5`, the nose tip must protrude toward the viewer's LEFT edge and the hair mass must trail RIGHT; none of these slots may show a nose protruding right. Preserve the draft's clean separation but do not copy any wrong-facing face.
+
+FINAL DIRECTION-ONLY STRATEGY: no old row-10 draft or row-9 continuity strip is attached for this pass. Use the attached eight-slot scaffold and the separate approved `270` profile solely for direction and spacing, and use the attached canonical base for Pearlie's identity. The first scaffold slot is the approved frontal `180` down pose with visibly lowered eyes; do not turn it into a back view. Redraw exactly eight new separated full-body poses. The required screen-left arc is non-negotiable: slots `202.5`, `225`, `247.5`, `270`, `292.5`, `315`, and `337.5` all have the nose tip and face plane toward the viewer's LEFT edge; the last slot is only near-frontal because it approaches `000`, but it still keeps a slight leftward gaze. Never output a right-facing profile in any of these seven slots. Preserve compact pixel-art proportions, planted lower body, and generous gaps.
+
+Cardinals must be unmistakable. Intermediate poses should broadly occupy the intended quadrant and advance naturally through the ordered loop. Minor pupil, nose, eyelid, or aiming-feature deviations are acceptable when the overall direction, continuity, identity, and motion remain coherent. Do not deform the character merely to make every intermediate axis independently obvious.
+
+SCREEN-COORDINATE LOCK: screen-left means the viewer's left image edge, never the character's own left. The row should travel naturally through the left half of the loop. Near-vertical 202.5 and 337.5 may have subtle horizontal cues; prioritize a coherent arc over exact pupil or nose placement.
+
+HARD LAYOUT AND CONTINUITY CONTRACT — DETERMINISTIC REGISTRATION: draw exactly eight separated pose groups in left-to-right direction order. Keep enough chroma-only space between neighboring poses that each complete pose can be detected without cutting through foreground. Approximate the guide's equal spacing, but do not distort a pose merely to hit an exact source-canvas coordinate; deterministic assembly will crop the eight ordered groups, then apply one shared scale and baseline.
+
+Use the same body height, head size, baseline, and planted-body position across the generated family. Never overlap neighboring poses, merge two poses into one connected group, crop foreground at the outer canvas edge, or resize one pose independently.
+
+Keep the feet, base, or lower torso planted at the same coordinates across all eight frames. Express direction through the eyes, face, head, upper body, and physically appropriate prop movement, not by moving, rotating, or rescaling the entire sprite.
+
+Place one centered pose in each invisible equal-width slot on flat pure user-selected #0000FF. Change only the natural parts needed to express gaze: eyes, eyelids, head, face, neck, upper body, appendages, and constrained prop follow-through. Keep identity, silhouette, materials, palette, markings, and props consistent.
+
+ROW-BOUNDARY LOCK: 180 must continue directly from row 9's 157.5, matching its body size, baseline, planted anchor, expression, and construction. 337.5 must be one even 22.5-degree step before 000: nearly up-facing while remaining on the overall left-hand arc. Do not distort pupils, nose, or body geometry merely to exaggerate the subtle horizontal component.
+
+PRE-RETURN CHECK: reject this result if it does not contain eight separated pose groups in the required order; neighboring poses overlap; foreground is cropped at the outer canvas edge; any frame changes sprite scale, body or head size, baseline, or planted-body position; the row visibly reverses into the wrong half of the loop; or 180 does not continue from 157.5 or 337.5 does not flow evenly into 000. Minor intermediate pupil or nose deviations are not rejection reasons. Exact cell cropping, resizing, and recentering happen deterministically after generation.
+
+Do not rotate, skew, or tilt the whole sprite to fake gaze. Do not add replacement/googly eyes, labels, degree text, arrows, clocks, grids, shadows, glows, scenery, detached effects, or chroma-key colors inside the pet.

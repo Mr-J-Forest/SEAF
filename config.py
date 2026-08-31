@@ -8,7 +8,8 @@
 MODULE_SWITCHES = {
     'enable_positional_encoding': True,   # 空间位置编码
     'enable_time_encoding': True,         # 时间傅里叶编码
-    'enable_climatology_anomaly': True,   # 使用训练期月气候态构造 anomaly 学习目标
+    'enable_climatology_anomaly': True,   # 输入变量使用训练期月气候态 anomaly
+    'enable_target_climatology_anomaly': True,  # 目标变量使用 anomaly；可独立消融
 }
 
 # ========== 数据相关参数 ==========
@@ -72,6 +73,7 @@ DATA_CONFIG = {
 
     # 气候态 / anomaly 建模
     'anomaly_variables': ['TEMP', 'SALT'],       # 对这些变量减去训练期月气候态后再标准化
+    'target_anomaly_variables': ['TEMP', 'SALT'],
     'climatology_period': 12,                    # 月气候态周期
     'include_climatology_features': True,        # 将目标变量气候态作为额外输入通道
     'climatology_feature_variables': ['TEMP', 'SALT'],
@@ -90,6 +92,7 @@ DATA_CONFIG = {
 # ========== 模型相关参数 ==========
 MODEL_CONFIG = {
     'model_type': 'seaf',
+    'model_display_name': 'SEAF',
     'hidden_dims': [64, 96, 128, 128],  # 隐藏层维度
     'kernel_size': (3, 3),              # 卷积核大小
     'num_layers': 4,                    # 层数
@@ -99,6 +102,19 @@ MODEL_CONFIG = {
     'seaf_spectral_modes': [8, 8],
     'seaf_spectral_layers': 2,
     'seaf_ensemble_members': 4,
+    # 模块化 SEAF 结构开关。默认值保持已归档模型的前向与 state_dict 兼容；
+    # 新结构只通过显式实验配置逐项启用。
+    'use_temporal_depth_mixer': False,
+    'use_local_path': False,
+    'use_spectral_path': True,
+    'router_type': 'spatial',  # spatial | uniform | lead
+    'use_forcing_encoder': False,
+    'seaf_spectral_scale_init': 0.1,
+    'seaf_forcing_scale_init': 0.1,
+    'ablation_disable_spectral': False,
+    'ablation_disable_ensemble': False,
+    'ablation_uniform_ensemble': False,
+    'ablation_direct_full_field': False,
 }
 
 # ========== 训练相关参数 ==========
@@ -239,6 +255,23 @@ def validate_config(config):
         elif not set(anomaly_variables).issubset(set(config.get('input_variables', []))):
             errors.append("anomaly_variables 必须是 input_variables 的子集")
 
+    if config.get(
+        'enable_target_climatology_anomaly',
+        config.get('enable_climatology_anomaly', False),
+    ):
+        target_anomaly_variables = config.get(
+            'target_anomaly_variables', config.get('target_variables', [])
+        )
+        if not isinstance(target_anomaly_variables, (list, tuple)) or not target_anomaly_variables:
+            errors.append(
+                "启用 enable_target_climatology_anomaly 时 "
+                "target_anomaly_variables 不能为空"
+            )
+        elif not set(target_anomaly_variables).issubset(
+            set(config.get('target_variables', []))
+        ):
+            errors.append("target_anomaly_variables 必须是 target_variables 的子集")
+
     if config.get('include_climatology_features', False):
         feature_variables = config.get('climatology_feature_variables', [])
         if not isinstance(feature_variables, (list, tuple)) or len(feature_variables) == 0:
@@ -346,17 +379,26 @@ def validate_config(config):
         errors.append(f"未知 model_type: {config.get('model_type')!r}")
 
     if normalized_model_type in seaf_model_types:
-        if (
-            not config.get('enable_climatology_anomaly', False)
-            and not config.get('ablation_direct_full_field', False)
-        ):
-            errors.append("SEAF 直接异常场预测要求启用 climatology anomaly")
-        elif config.get('enable_climatology_anomaly', False) and not set(
-            config.get('target_variables', [])
-        ).issubset(
+        input_anomaly = bool(config.get('enable_climatology_anomaly', False))
+        target_anomaly = bool(config.get(
+            'enable_target_climatology_anomaly', input_anomaly
+        ))
+        direct_full_field = bool(config.get('ablation_direct_full_field', False))
+        if not input_anomaly:
+            errors.append("SEAF 正式协议要求输入使用 climatology anomaly")
+        elif not set(config.get('target_variables', [])).issubset(
             set(config.get('anomaly_variables', []))
         ):
-            errors.append("SEAF 要求所有 target_variables 都属于 anomaly_variables")
+            errors.append("SEAF 要求所有 target_variables 都属于输入 anomaly_variables")
+        if direct_full_field == target_anomaly:
+            errors.append(
+                "ablation_direct_full_field 必须与 "
+                "enable_target_climatology_anomaly 互斥"
+            )
+        if target_anomaly and not set(config.get('target_variables', [])).issubset(
+            set(config.get('target_anomaly_variables', []))
+        ):
+            errors.append("SEAF anomaly target 必须覆盖所有 target_variables")
         if int(config.get('seaf_hidden_dim', 0)) <= 0:
             errors.append("seaf_hidden_dim 必须为正")
         spectral_modes = config.get('seaf_spectral_modes', [8, 8])
@@ -370,14 +412,66 @@ def validate_config(config):
             errors.append("seaf_spectral_layers 必须为正")
         if int(config.get('seaf_ensemble_members', 0)) <= 0:
             errors.append("seaf_ensemble_members 必须为正")
+        router_type = str(config.get('router_type', 'spatial')).lower()
+        if router_type not in {'spatial', 'uniform', 'lead'}:
+            errors.append("router_type 必须为 spatial、uniform 或 lead")
+        if (
+            router_type == 'lead'
+            and not config.get('ablation_disable_ensemble', False)
+            and int(config.get('seaf_ensemble_members', 0)) < 2
+        ):
+            errors.append("lead router 至少需要两个 ensemble members")
+        if (
+            config.get('ablation_uniform_ensemble', False)
+            and router_type == 'lead'
+        ):
+            errors.append("lead router 与 uniform-ensemble 消融不能同时启用")
+        for key in ('seaf_spectral_scale_init', 'seaf_forcing_scale_init'):
+            value = float(config.get(key, 0.1))
+            if not 0.0 <= value <= 1.0:
+                errors.append(f"{key} 必须位于[0, 1]")
+        if (
+            config.get('use_forcing_encoder', False)
+            and not config.get('external_dynamic_variables', [])
+        ):
+            errors.append(
+                "启用 use_forcing_encoder 时 external_dynamic_variables 不能为空"
+            )
+        if (
+            config.get('ablation_disable_ensemble', False)
+            and config.get('ablation_uniform_ensemble', False)
+        ):
+            errors.append("single-head 与 uniform-ensemble 消融不能同时启用")
+        if (
+            config.get('ablation_uniform_ensemble', False)
+            and int(config.get('seaf_ensemble_members', 0)) < 2
+        ):
+            errors.append("uniform-ensemble 消融至少需要两个 member")
 
     if normalized_model_type in recent_baseline_types:
         if not config.get('enable_climatology_anomaly', False):
             errors.append("OceanForecastBench adapters 直接异常场预测要求启用 anomaly")
-        elif not set(config.get('target_variables', [])).issubset(
-            set(config.get('anomaly_variables', []))
+        elif not config.get(
+            'enable_target_climatology_anomaly',
+            config.get('enable_climatology_anomaly', False),
         ):
-            errors.append("OceanForecastBench adapters 要求 targets 属于 anomaly_variables")
+            errors.append("OceanForecastBench adapters 的 target 必须是 anomaly")
+        elif not set(config.get('target_variables', [])).issubset(
+            set(config.get('target_anomaly_variables', []))
+        ):
+            errors.append(
+                "OceanForecastBench adapters 要求 targets 属于 "
+                "target_anomaly_variables"
+            )
+
+    for forbidden_key in (
+        'enable_persistence_residual',
+        'enable_persistence_projection',
+        'learned_persistence_scale',
+        'ap_scale',
+    ):
+        if config.get(forbidden_key, False):
+            errors.append(f"正式模型禁止启用 {forbidden_key}")
 
     if normalized_model_type in recent_baseline_types:
         patch_size = int(config.get('baseline_patch_size', 0))
@@ -503,6 +597,17 @@ def merge_configs(file_config, default_config=None):
     
     merged = default_config.copy()
     merged.update(file_config)
+    if 'enable_target_climatology_anomaly' not in file_config:
+        merged['enable_target_climatology_anomaly'] = bool(
+            file_config.get(
+                'enable_climatology_anomaly',
+                merged.get('enable_climatology_anomaly', False),
+            )
+        )
+    if 'target_anomaly_variables' not in file_config:
+        merged['target_anomaly_variables'] = list(
+            file_config.get('target_variables', merged.get('target_variables', []))
+        )
     return merged
 
 if __name__ == "__main__":

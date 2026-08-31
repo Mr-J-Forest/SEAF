@@ -15,15 +15,15 @@ Let the training-only climatology be $C_t$ and the anomaly be $A_t=Y_t-C_t$. SEA
 \widehat Y_{t+h}=C_{t+h}+\widehat A_{t+h}.
 \]
 
-SEAF contains no anomaly-persistence skip, persistence projection, or learned persistence scale. Anomaly persistence remains an evaluation baseline, not a component of the formal model.
+SEAF contains no anomaly-persistence skip, persistence projection, or learned persistence scale. Anomaly persistence remains an evaluation baseline, not a component of the formal model. A zero anomaly in physical anomaly space corresponds to climatology; zero in the network's standardized output space should not be interpreted directly as physical climatology.
 
 ## Formal input contract
 
 The frozen ORAS5 configuration is [`configs/experiments/oras5_seaf.json`](configs/experiments/oras5_seaf.json). It uses:
 
-- prognostic state: `TEMP`, `SALT`;
+- prognostic state anomalies: `TEMP`, `SALT`;
 - causal tendencies: one-step backward differences of `TEMP`, `SALT`;
-- external dynamics: `UVEL`, `VVEL`, `SSHA`, `MLD`, `TAUX`, `TAUY`, `QNET`, `WFLUX`;
+- anomalized external dynamics: `UVEL`, `VVEL`, `SSHA`, `MLD`, `TAUX`, `TAUY`, `QNET`, `WFLUX`;
 - targets: joint future `TEMP` and `SALT` anomalies for all configured leads and depths.
 
 Climatologies and scalers are fitted from training years only. The repository does not maintain separate temperature-only or salinity-only formal models.
@@ -52,27 +52,27 @@ The dataset configuration expects `Data/oras5/ORAS5_197901_201412_1deg.nc`.
 .venv/bin/python main.py --config configs/experiments/oras5_smoke.json --mode train
 ```
 
-Run the SEAF/recent-baseline screen:
+Validate the unified formal matrix:
+
+```bash
+.venv/bin/python scripts/validate_experiment_matrix.py \
+  --matrix configs/oras5_seaf_full_matrix.json \
+  --contrasts configs/oras5_full_contrasts.json
+```
+
+The unified matrix contains LR calibration, smoke, and three-seed validation confirmation stages for SEAF, strict and validation-tuned full-field controls, architecture ablations, a local CNN control, and the three learned architecture adapters. Exact campaign commands and final-test freezing rules are in [`NEXT_STEPS_SEAF.md`](NEXT_STEPS_SEAF.md).
+
+Run a selected stage:
 
 ```bash
 .venv/bin/python -u scripts/run_experiment_queue.py \
-  --matrix configs/oras5_recent_baseline_matrix.json \
-  --stage screen \
-  --campaign <training_source_hash>_screen \
+  --matrix configs/oras5_seaf_full_matrix.json \
+  --stage confirm_validation \
+  --campaign <training_source_hash>_seaf_confirm_v1 \
   --max-parallel 2
 ```
 
-Run formal ablations:
-
-```bash
-.venv/bin/python -u scripts/run_experiment_queue.py \
-  --matrix configs/oras5_ablation_matrix.json \
-  --stage screen \
-  --campaign <training_source_hash>_ablation \
-  --max-parallel 2
-```
-
-The six predeclared variants isolate the anomaly target, causal tendencies, external dynamics, spectral encoder, and ensemble gate. The former `no_ap_residual` variant is now the full SEAF model and is no longer an ablation.
+The strict full-field control keeps the anomaly-centered inputs and changes only the target prediction space. A separate validation-tuned full-field comparator tests whether the target result survives architecture-specific LR selection. Uniform multi-head averaging and a single-head control separately test the spatial gate and the value of multiple forecast hypotheses.
 
 ## Baselines and metrics
 

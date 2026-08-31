@@ -47,7 +47,11 @@ def main():
 
     results = trainer.evaluate(split=args.split)
 
-    out_path = os.path.join(args.result_dir, 'evaluation.json')
+    out_filename = (
+        'evaluation_results.json' if args.split == 'test'
+        else 'validation_results.json'
+    )
+    out_path = os.path.join(args.result_dir, out_filename)
     with open(out_path, 'w', encoding='utf-8') as handle:
         json.dump(results, handle, indent=2, ensure_ascii=False)
     print(f'\nEvaluation written to {out_path}')

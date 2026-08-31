@@ -1,0 +1,6 @@
+{
+  "extends": "oras5_seaf_local_global.json",
+  "model_display_name": "SEAF",
+  "router_type": "spatial",
+  "use_forcing_encoder": false
+}

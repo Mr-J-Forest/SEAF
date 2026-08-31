@@ -1,5 +1,6 @@
 {
   "extends": "oras5_seaf.json",
-  "enable_climatology_anomaly": false,
+  "enable_climatology_anomaly": true,
+  "enable_target_climatology_anomaly": false,
   "ablation_direct_full_field": true
 }

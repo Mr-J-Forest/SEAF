@@ -1,0 +1,19 @@
+{
+  "protocol": {
+    "primary_metric": "mse",
+    "paired_unit": "forecast_origin",
+    "moving_block_length": 5,
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260826,
+    "screening_fdr": 0.10,
+    "confirmation_fdr": 0.05,
+    "positive_score": "log(full_field_mse / anomaly_mse); positive favors direct anomaly",
+    "meaningful_reduction_fraction": 0.01
+  },
+  "contrast": {
+    "name": "local_cnn_anomaly_target",
+    "candidate": "local_cnn",
+    "reference": "local_cnn_full_field",
+    "variables": ["TEMP", "SALT"]
+  }
+}

@@ -4,7 +4,7 @@
   "group_batches_by_time": false,
   "batch_size": 8,
   "optimizer_type": "adam",
-  "learning_rate": 0.00001,
+  "learning_rate": 0.000003,
   "weight_decay": 0.0,
   "baseline_patch_size": 2,
   "baseline_embed_dim": 416,
@@ -16,7 +16,7 @@
   "afno_num_blocks": 16,
   "afno_sparsity_threshold": 0.01,
   "afno_hard_thresholding_fraction": 1.0,
-  "expected_parameter_count": 21665664,
+  "expected_parameter_count": 20048256,
   "baseline_provenance": {
     "kind": "benchmark_architecture_adapter",
     "method_name": "FourCastNet (AFNO)",

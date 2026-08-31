@@ -4,6 +4,7 @@ import json
 import inspect
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -26,6 +27,7 @@ from predict import (
     interleaved_batches,
 )
 from scripts.run_experiment_queue import (
+    _run_deferred_evaluations,
     expand_matrix,
     is_complete,
     linux_process_tree_rss_bytes,
@@ -156,6 +158,29 @@ class PipelineIntegrityTests(unittest.TestCase):
         return config
 
     @classmethod
+    def _small_modular_seaf_config(cls):
+        config = cls._small_seaf_config()
+        config.update({
+            'actual_input_channels': 12,
+            'input_variables': ['TEMP', 'SALT', 'FORCING'],
+            'external_dynamic_variables': ['FORCING'],
+            'input_channel_slices': {
+                'TEMP': [0, 2],
+                'SALT': [2, 4],
+                'FORCING': [4, 8],
+                'TENDENCY_TEMP': [8, 10],
+                'TENDENCY_SALT': [10, 12],
+            },
+            'use_temporal_depth_mixer': True,
+            'use_local_path': True,
+            'use_spectral_path': True,
+            'router_type': 'lead',
+            'use_forcing_encoder': True,
+            'seaf_ensemble_members': 4,
+        })
+        return config
+
+    @classmethod
     def _small_recent_baseline_config(cls, model_type):
         config = cls._small_seaf_config()
         config.update({
@@ -217,6 +242,46 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertEqual(dataset.input_channel_slices['TIME_ENCODING'], slice(12, 15))
         self.assertEqual(dataset.target_channel_slices['TEMP'], slice(0, 2))
         self.assertEqual(dataset.target_channel_slices['SALT'], slice(2, 5))
+
+    def test_ocean_dataset_item_preserves_channel_first_layout(self):
+        dataset = OceanDataset.__new__(OceanDataset)
+        dataset.sequences = [(1, 0)]
+        dataset.sequence_length = 2
+        dataset.prediction_length = 1
+        dataset.input_variables = ['TEMP', 'SSHA']
+        dataset.actual_input_variables = ['TEMP', 'SSHA']
+        dataset.target_variables = ['TEMP', 'SALT']
+        dataset.include_climatology_features = False
+        dataset.include_tendency_features = False
+        dataset.config = {
+            'enable_positional_encoding': False,
+            'enable_time_encoding': False,
+        }
+        temp = np.arange(5 * 2 * 3 * 4, dtype=np.float32).reshape(5, 2, 3, 4)
+        ssha = np.arange(5 * 3 * 4, dtype=np.float32).reshape(5, 3, 4)
+        salt = (1000.0 + np.arange(5 * 3 * 3 * 4, dtype=np.float32)).reshape(
+            5, 3, 3, 4
+        )
+        dataset.all_regions_data = [{
+            'normalized_data': {'TEMP': temp, 'SSHA': ssha, 'SALT': salt},
+        }]
+        dataset.input_channel_slices = {}
+        dataset.target_channel_slices = {}
+        dataset.return_sample_index = True
+
+        inputs, targets, sample_index = dataset[0]
+
+        expected_inputs = torch.from_numpy(np.concatenate(
+            [temp[1:3], ssha[1:3, np.newaxis, :, :]], axis=1
+        ))
+        expected_targets = torch.from_numpy(np.concatenate(
+            [temp[3:4], salt[3:4]], axis=1
+        ))
+        torch.testing.assert_close(inputs, expected_inputs)
+        torch.testing.assert_close(targets, expected_targets)
+        self.assertEqual(sample_index, 0)
+        self.assertEqual(tuple(inputs.shape), (2, 3, 3, 4))
+        self.assertEqual(tuple(targets.shape), (1, 5, 3, 4))
 
     def test_tendency_feature_is_causal_backward_difference(self):
         source = np.asarray([0.0, 1.0, 4.0, 2.0], dtype=np.float32).reshape(4, 1, 1)
@@ -307,7 +372,11 @@ class PipelineIntegrityTests(unittest.TestCase):
             'oras5_ablation_no_tendency.json',
             'oras5_ablation_no_external_dynamics.json',
             'oras5_ablation_no_spectral.json',
+            'oras5_ablation_uniform_ensemble.json',
+            'oras5_ablation_single_head.json',
             'oras5_ablation_no_ensemble.json',
+            'oras5_baseline_local_cnn_anomaly.json',
+            'oras5_baseline_direct_full_field_tuned.json',
         )
         for name in names:
             with self.subTest(config=name):
@@ -321,6 +390,35 @@ class PipelineIntegrityTests(unittest.TestCase):
         no_tendency.update(load_config(experiment_dir / 'oras5_ablation_no_tendency.json'))
         self.assertTrue(full['include_tendency_features'])
         self.assertFalse(no_tendency['include_tendency_features'])
+
+        direct = DEFAULT_CONFIG.copy()
+        direct.update(load_config(
+            experiment_dir / 'oras5_ablation_direct_full_field.json'
+        ))
+        self.assertTrue(direct['enable_climatology_anomaly'])
+        self.assertFalse(direct['enable_target_climatology_anomaly'])
+        self.assertTrue(direct['ablation_direct_full_field'])
+
+    def test_strict_full_field_ablation_keeps_anomaly_inputs(self):
+        dataset = OceanDataset.__new__(OceanDataset)
+        dataset.enable_climatology_anomaly = True
+        dataset.enable_target_climatology_anomaly = False
+        dataset.anomaly_variables = {'TEMP'}
+        dataset.target_anomaly_variables = {'TEMP'}
+        region = {
+            'data': {'TEMP': np.asarray([10.0], dtype=np.float32)},
+            'anomaly_data': {'TEMP': np.asarray([2.0], dtype=np.float32)},
+        }
+
+        np.testing.assert_array_equal(
+            dataset._get_model_source_data(region, 'TEMP'),
+            np.asarray([2.0], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            dataset._get_target_source_data(region, 'TEMP'),
+            np.asarray([10.0], dtype=np.float32),
+        )
+        self.assertEqual(dataset._target_scaler_name('TEMP'), 'TARGET_TEMP')
 
     def test_compact_auxiliary_features_broadcast_only_on_allowed_axes(self):
         spatial = np.arange(24, dtype=np.float32).reshape(1, 2, 3, 4)
@@ -702,6 +800,82 @@ class PipelineIntegrityTests(unittest.TestCase):
         self.assertEqual(outputs.shape, (3, 2, 3, 5, 6))
         self.assertIsNotNone(inputs.grad)
 
+    def test_modular_seaf_forward_backward_and_channel_separation(self):
+        config = self._small_modular_seaf_config()
+        model = create_ocean_model(config).train()
+        inputs = torch.randn(2, 3, 12, 5, 6, requires_grad=True)
+        outputs = model(inputs)
+        torch.nn.functional.mse_loss(outputs, torch.zeros_like(outputs)).backward()
+
+        self.assertEqual(outputs.shape, (2, 2, 3, 5, 6))
+        self.assertTrue(torch.isfinite(outputs).all())
+        self.assertIsNotNone(inputs.grad)
+        encoder = model.spectral_encoder
+        self.assertEqual(encoder.profile_indices.tolist(), [0, 1, 2, 3])
+        self.assertEqual(encoder.forcing_indices.tolist(), [4, 5, 6, 7])
+        self.assertEqual(encoder.context_indices.tolist(), [8, 9, 10, 11])
+        self.assertIsNotNone(encoder.forcing_scale.grad)
+
+    def test_lead_router_is_uniform_at_initialization_and_normalized(self):
+        model = create_ocean_model(self._small_modular_seaf_config())
+        weights = torch.softmax(model.lead_router_logits, dim=-1)
+        torch.testing.assert_close(
+            weights,
+            torch.full_like(weights, 1.0 / len(model.member_heads)),
+        )
+        torch.testing.assert_close(
+            weights.sum(dim=-1), torch.ones(model.prediction_length)
+        )
+
+    def test_legacy_seaf_checkpoint_layout_remains_strictly_loadable(self):
+        config = self._small_seaf_config()
+        original = create_ocean_model(config)
+        restored = create_ocean_model(config)
+        restored.load_state_dict(original.state_dict(), strict=True)
+        self.assertFalse(original.structured_encoder_enabled)
+        self.assertEqual(original.router_type, 'spatial')
+
+    def test_full_modular_seaf_stays_below_parameter_ceiling(self):
+        config = self._small_modular_seaf_config()
+        config.update({
+            'sequence_length': 12,
+            'prediction_length': 5,
+            'actual_input_channels': 126,
+            'actual_output_channels': 40,
+            'seaf_hidden_dim': 112,
+            'seaf_spectral_modes': [8, 8],
+            'seaf_spectral_layers': 2,
+            'input_channel_slices': {
+                'TEMP': [0, 20],
+                'SALT': [20, 40],
+                'UVEL': [40, 60],
+                'VVEL': [60, 80],
+                'SSHA': [80, 81],
+                'MLD': [81, 82],
+                'TAUX': [82, 83],
+                'TAUY': [83, 84],
+                'QNET': [84, 85],
+                'WFLUX': [85, 86],
+                'TENDENCY_TEMP': [86, 106],
+                'TENDENCY_SALT': [106, 126],
+            },
+            'external_dynamic_variables': [
+                'UVEL', 'VVEL', 'SSHA', 'MLD',
+                'TAUX', 'TAUY', 'QNET', 'WFLUX',
+            ],
+        })
+        model = create_ocean_model(config)
+        parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        self.assertGreaterEqual(parameter_count, 2_000_000)
+        self.assertLess(parameter_count, 5_000_000)
+        self.assertEqual(
+            model.parameter_breakdown()['total'], parameter_count
+        )
+        with torch.no_grad():
+            output = model(torch.randn(1, 12, 126, 4, 5))
+        self.assertEqual(output.shape, (1, 5, 40, 4, 5))
+        self.assertTrue(torch.isfinite(output).all())
+
     def test_ablation_removes_disabled_parameters(self):
         full = create_ocean_model(self._small_seaf_config())
 
@@ -722,6 +896,29 @@ class PipelineIntegrityTests(unittest.TestCase):
         no_ensemble = create_ocean_model(no_ensemble_config)
         self.assertEqual(len(no_ensemble.member_heads), 1)
         self.assertIsNone(no_ensemble.ensemble_gate)
+
+        uniform_config = self._small_seaf_config()
+        uniform_config['ablation_uniform_ensemble'] = True
+        uniform = create_ocean_model(uniform_config).eval()
+        self.assertEqual(
+            len(uniform.member_heads), uniform_config['seaf_ensemble_members']
+        )
+        self.assertIsNone(uniform.ensemble_gate)
+        inputs = torch.randn(2, 3, 8, 5, 6)
+        with torch.no_grad():
+            features = uniform.spectral_encoder(inputs.reshape(2, 24, 5, 6))
+            expected = torch.stack([
+                head(features).reshape(2, 2, 3, 5, 6)
+                for head in uniform.member_heads
+            ], dim=1).mean(dim=1)
+            actual = uniform(inputs)
+        torch.testing.assert_close(actual, expected)
+
+        invalid = self._small_seaf_config()
+        invalid['ablation_disable_ensemble'] = True
+        invalid['ablation_uniform_ensemble'] = True
+        with self.assertRaisesRegex(ValueError, '不能同时启用'):
+            validate_config(invalid)
 
         for removed_name in (
             'thermohaline_memory', 'structure_branch', 'fusion_transformer',
@@ -861,6 +1058,33 @@ class PipelineIntegrityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '循环'):
                 load_config(root / 'child.json')
 
+    def test_default_seaf_candidate_excludes_lead_router(self):
+        project_root = Path(__file__).resolve().parents[1]
+        candidate_path = (
+            project_root
+            / 'configs'
+            / 'experiments'
+            / 'oras5_seaf_forcing_fusion.json'
+        )
+        candidate = load_config(candidate_path)
+        self.assertEqual(candidate['router_type'], 'spatial')
+        self.assertTrue(candidate['use_forcing_encoder'])
+        self.assertTrue(candidate['use_local_path'])
+
+        matrix = json.loads(
+            (project_root / 'configs' / 'oras5_seaf_architecture_screen.json')
+            .read_text(encoding='utf-8')
+        )
+        experiments = {item['name']: item for item in matrix['screen']}
+        self.assertEqual(
+            experiments['seaf_lead_router']['compare_to'],
+            'seaf_local_global',
+        )
+        self.assertEqual(
+            experiments['seaf_forcing_fusion']['compare_to'],
+            'seaf_local_global',
+        )
+
     def test_queue_accepts_auditable_no_evaluation_run(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
@@ -874,6 +1098,103 @@ class PipelineIntegrityTests(unittest.TestCase):
             }), encoding='utf-8')
 
             self.assertTrue(is_complete(run_dir, expected_source_hash='abc'))
+
+    def test_queue_can_defer_post_training_evaluation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            matrix_path = project_root / 'matrix.json'
+            config_path = project_root / 'config.json'
+            matrix_path.write_text(json.dumps({
+                'unit': [{
+                    'name': 'fake',
+                    'config': str(config_path),
+                    'seeds': [42],
+                    'overrides': {'post_training_evaluation': 'validation'},
+                }],
+            }), encoding='utf-8')
+            config_path.write_text('{}', encoding='utf-8')
+            (project_root / 'source_state.json').write_text(json.dumps({
+                'training_source_hash': 'abc',
+            }), encoding='utf-8')
+
+            returncode = queue_main([
+                '--matrix', str(matrix_path),
+                '--stage', 'unit',
+                '--campaign', 'abc_deferred',
+                '--defer-post-training-evaluation',
+                '--dry-run',
+            ], project_root=project_root)
+
+            self.assertEqual(returncode, 0)
+            state = json.loads((
+                project_root / 'outputs' / 'results' / 'campaigns' / 'abc_deferred'
+                / 'experiment_queue_state.json'
+            ).read_text(encoding='utf-8'))
+            job = state['jobs'][0]
+            self.assertEqual(job['deferred_evaluation_scope'], 'validation')
+            overrides = json.loads(
+                job['command'][job['command'].index('--overrides_json') + 1]
+            )
+            self.assertEqual(overrides['post_training_evaluation'], 'none')
+
+    def test_deferred_evaluation_finalizes_training_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            run_dir = project_root / 'run'
+            run_dir.mkdir()
+            (run_dir / 'best_model.pth').write_bytes(b'checkpoint')
+            (run_dir / 'run_summary.json').write_text(json.dumps({
+                'status': 'completed',
+                'evaluation_scope': 'none',
+                'evaluation_file': None,
+            }), encoding='utf-8')
+            config_path = project_root / 'config.json'
+            config_path.write_text('{}', encoding='utf-8')
+            log_path = project_root / 'run.log'
+            state_path = project_root / 'state.json'
+            state = {
+                'jobs': [{
+                    'run_id': 'unit__fake_seed42',
+                    'status': 'completed',
+                    'deferred_evaluation_scope': 'validation',
+                    'config': str(config_path),
+                    'result_dir': str(run_dir),
+                    'overrides': {'post_training_evaluation': 'validation'},
+                    'log': str(log_path),
+                }],
+            }
+            state_path.write_text(json.dumps(state), encoding='utf-8')
+
+            def fake_evaluation(command, **_kwargs):
+                result_dir = Path(command[command.index('--result_dir') + 1])
+                (result_dir / 'validation_results.json').write_text(json.dumps({
+                    'evaluation_loss': 0.5,
+                    'evaluation_data_loss': 0.4,
+                    'physical_rmse_TEMP': 0.3,
+                    'physical_rmse_SALT': 0.07,
+                }), encoding='utf-8')
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch(
+                'scripts.run_experiment_queue.subprocess.run',
+                side_effect=fake_evaluation,
+            ):
+                failures = _run_deferred_evaluations(
+                    state,
+                    state_path,
+                    project_root,
+                    sys.executable,
+                    {},
+                    continue_on_error=False,
+                )
+
+            self.assertEqual(failures, 0)
+            self.assertEqual(state['jobs'][0]['status'], 'completed')
+            self.assertEqual(state['jobs'][0]['evaluation_status'], 'completed')
+            summary = json.loads((run_dir / 'run_summary.json').read_text(encoding='utf-8'))
+            self.assertEqual(summary['evaluation_scope'], 'validation')
+            self.assertEqual(summary['evaluation_file'], 'validation_results.json')
+            self.assertEqual(summary['primary_metrics']['rmse_TEMP'], 0.3)
 
     def test_queue_sums_linux_process_tree_rss(self):
         with tempfile.TemporaryDirectory() as temporary:

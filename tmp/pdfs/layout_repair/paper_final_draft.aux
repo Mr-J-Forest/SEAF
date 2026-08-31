@@ -1,0 +1,128 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{copernicus2021oras5}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{eq:intro_anomaly}{{1}{1}{Introduction}{equation.1}{}}
+\newlabel{eq:intro_direct}{{2}{1}{Introduction}{equation.2}{}}
+\newlabel{eq:intro_ap}{{3}{1}{Introduction}{equation.3}{}}
+\newlabel{eq:intro_dap}{{4}{1}{Introduction}{equation.4}{}}
+\citation{jacox2019dampedpersistence}
+\citation{xiaoSpatiotemporalDeepLearning2019}
+\citation{pathak2022fourcastnet}
+\citation{chen2023fuxi,bi2023accurate}
+\citation{shiConvolutionalLSTMNetwork2015}
+\citation{wangPredRNNRecurrentNeural2017}
+\citation{shiSeaSurfaceTemperature2024}
+\citation{boninoMachineLearningMethods2024,zhaoDeepLearningOcean2024}
+\citation{cuiWenHaiForecastingEddying2025}
+\citation{elAouniGLONETMercatorEndtoEnd2024}
+\citation{huangFuXiOceanGlobalOcean2025,wuAxiomOceanForecastingThreeDimensional2026}
+\citation{molteni1996ecmwf}
+\citation{huangFuXiONSDataDrivenEnsemble2026}
+\citation{yangMultiFactorDeepLearning2025}
+\citation{stortoCorrectionSeaSurface2025}
+\citation{hamDeepLearningMultiyear2019}
+\citation{zuo2019ocean5}
+\citation{copernicus2021oras5}
+\@writefile{toc}{\contentsline {section}{\numberline {II}Related Work}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}Persistence and Anomaly Prediction}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-B}}Spectral and Spatiotemporal Forecasting}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-C}}Data-Driven Ocean Models and Physical Inputs}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {III}Data and Problem Definition}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}ORAS5 Dataset and Grid}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}Forecast Task and Splits}{2}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Reference Forecasts and Skill}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{eq:references}{{8}{3}{Reference Forecasts and Skill}{equation.8}{}}
+\newlabel{eq:ssap}{{9}{3}{Reference Forecasts and Skill}{equation.9}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {IV}SEAF: Direct Anomaly Forecasting}{3}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-A}}Architecture Overview}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-B}}Direct Anomaly Target}{3}{subsection.4.2}\protected@file@percent }
+\newlabel{eq:seaf_target}{{10}{3}{Direct Anomaly Target}{equation.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-C}}Profile and Local--Global Encoders}{3}{subsection.4.3}\protected@file@percent }
+\newlabel{eq:profile_shape}{{11}{3}{Profile and Local--Global Encoders}{equation.11}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-D}}Input Information Groups}{3}{subsection.4.4}\protected@file@percent }
+\newlabel{eq:tendency}{{12}{3}{Input Information Groups}{equation.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-E}}Low-Mode Spatial Spectral Mixer}{3}{subsection.4.5}\protected@file@percent }
+\newlabel{eq:spectral}{{15}{3}{Low-Mode Spatial Spectral Mixer}{equation.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-F}}Multiple Deterministic Hypotheses}{3}{subsection.4.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces SEAF for direct joint anomaly prediction. Profile-aware encoding and local--global spatial mixing produce four deterministic TEMP/SALT anomaly hypotheses. LCFF jointly denotes the dedicated forcing representation and lead-conditioned hypothesis aggregation; the four heads remain part of the shared decoder. The training-period climatology is restored only after prediction, and AP/DAP remain external evaluation references.}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:architecture}{{1}{4}{SEAF for direct joint anomaly prediction. Profile-aware encoding and local--global spatial mixing produce four deterministic TEMP/SALT anomaly hypotheses. LCFF jointly denotes the dedicated forcing representation and lead-conditioned hypothesis aggregation; the four heads remain part of the shared decoder. The training-period climatology is restored only after prediction, and AP/DAP remain external evaluation references}{figure.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-G}}Lead-Conditioned Forcing Fusion}{4}{subsection.4.7}\protected@file@percent }
+\newlabel{eq:lcff}{{17}{4}{Lead-Conditioned Forcing Fusion}{equation.17}{}}
+\newlabel{eq:lcff_aggregate}{{18}{4}{Lead-Conditioned Forcing Fusion}{equation.18}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-H}}Objective}{4}{subsection.4.8}\protected@file@percent }
+\newlabel{eq:loss}{{19}{4}{Objective}{equation.19}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Experimental Protocol}{4}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-A}}Campaign and Reproducibility}{4}{subsection.5.1}\protected@file@percent }
+\citation{han2026oceanforecastbench,oceanforecastbenchCode2025}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Validation convergence under the common 30-epoch budget. Colored lines show seeds 42, 123, and 3407; the black line is their mean, and the gray band denotes one sample standard deviation. Markers identify the validation-best checkpoint for each seed. SEAF, FourCastNet, ClimaX, and Swin all enter stable validation regimes within the budget, supporting comparison under a common training horizon and validation-best checkpoint rule. The figure does not assert identical convergence rates or globally converged optimizer states.}}{5}{figure.2}\protected@file@percent }
+\newlabel{fig:backbone_convergence}{{2}{5}{Validation convergence under the common 30-epoch budget. Colored lines show seeds 42, 123, and 3407; the black line is their mean, and the gray band denotes one sample standard deviation. Markers identify the validation-best checkpoint for each seed. SEAF, FourCastNet, ClimaX, and Swin all enter stable validation regimes within the budget, supporting comparison under a common training horizon and validation-best checkpoint rule. The figure does not assert identical convergence rates or globally converged optimizer states}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-B}}Learned Baselines}{5}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-C}}Controlled Target and LCFF Contrasts}{5}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-D}}Metrics and Paired Contrasts}{5}{subsection.5.4}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Validation performance over three random seeds (mean $\pm $ standard deviation). All methods use the direct anomaly target and the same data protocol.}}{6}{table.1}\protected@file@percent }
+\newlabel{tab:validation_main}{{I}{6}{Validation performance over three random seeds (mean $\pm $ standard deviation). All methods use the direct anomaly target and the same data protocol}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Results}{6}{section.6}\protected@file@percent }
+\newlabel{sec:results}{{VI}{6}{Results}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-A}}Validation Comparison with Learned Baselines}{6}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-B}}Capacity Confirmation}{6}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-C}}Held-out Test Evaluation}{6}{subsection.6.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Three-seed validation capacity comparison within the same SEAF design. The width-192 setting is the frozen paper-facing SEAF model.}}{6}{table.2}\protected@file@percent }
+\newlabel{tab:capacity}{{II}{6}{Three-seed validation capacity comparison within the same SEAF design. The width-192 setting is the frozen paper-facing SEAF model}{table.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {III}{\ignorespaces Held-out 2011--2014 test performance over three random seeds (mean $\pm $ sample standard deviation).}}{6}{table.3}\protected@file@percent }
+\newlabel{tab:test_main}{{III}{6}{Held-out 2011--2014 test performance over three random seeds (mean $\pm $ sample standard deviation)}{table.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-D}}Depth-Resolved Test Skill}{6}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-E}}Target Formulation Is the Main Effect}{6}{subsection.6.5}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {IV}{\ignorespaces Paired validation contrasts between SEAF direct anomaly prediction and full-field controls. Positive reduction indicates lower geometric MSE for direct anomaly prediction; $q$ is BH-adjusted.}}{7}{table.4}\protected@file@percent }
+\newlabel{tab:target_contrast}{{IV}{7}{Paired validation contrasts between SEAF direct anomaly prediction and full-field controls. Positive reduction indicates lower geometric MSE for direct anomaly prediction; $q$ is BH-adjusted}{table.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-F}}LCFF as a Coupled Design Choice}{7}{subsection.6.6}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {V}{\ignorespaces Matched-width three-seed validation comparison with and without the atomic LCFF mechanism. Both variants use hidden width 112; capacity is held fixed.}}{7}{table.5}\protected@file@percent }
+\newlabel{tab:lcff}{{V}{7}{Matched-width three-seed validation comparison with and without the atomic LCFF mechanism. Both variants use hidden width 112; capacity is held fixed}{table.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-G}}Qualitative Regional Forecast Analysis}{7}{subsection.6.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VII}Discussion}{7}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-A}}Evidence Synthesis}{7}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-B}}Position Relative to Learned Baselines}{7}{subsection.7.2}\protected@file@percent }
+\newlabel{fig:regional_temp}{{3a}{8}{Subfigure 3a}{subfigure.3.1}{}}
+\newlabel{sub@fig:regional_temp}{{(a)}{a}{Subfigure 3a\relax }{subfigure.3.1}{}}
+\newlabel{fig:regional_salt}{{3b}{8}{Subfigure 3b}{subfigure.3.2}{}}
+\newlabel{sub@fig:regional_salt}{{(b)}{b}{Subfigure 3b\relax }{subfigure.3.2}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Final-test regional surface forecasts from the frozen SEAF checkpoint at leads 1, 3, and 5. Each panel shows the ORAS5 target, SEAF, AP, DAP, and signed forecast errors (forecast minus ORAS5 target). TEMP is shown in $^\circ $C and SALT in PSU.}}{8}{figure.3}\protected@file@percent }
+\newlabel{fig:regional_maps}{{3}{8}{Final-test regional surface forecasts from the frozen SEAF checkpoint at leads 1, 3, and 5. Each panel shows the ORAS5 target, SEAF, AP, DAP, and signed forecast errors (forecast minus ORAS5 target). TEMP is shown in $^\circ $C and SALT in PSU}{figure.3}{}}
+\@writefile{lof}{\contentsline {subfigure}{\numberline{(a)}{\ignorespaces {TEMP surface forecast.}}}{8}{subfigure.3.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {subfigure}{\numberline{(b)}{\ignorespaces {SALT surface forecast.}}}{8}{subfigure.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VII-C}}Limitations}{8}{subsection.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VIII}Conclusion}{8}{section.8}\protected@file@percent }
+\bibstyle{IEEEtran}
+\bibdata{reference}
+\bibcite{copernicus2021oras5}{1}
+\bibcite{jacox2019dampedpersistence}{2}
+\bibcite{xiaoSpatiotemporalDeepLearning2019}{3}
+\bibcite{pathak2022fourcastnet}{4}
+\bibcite{chen2023fuxi}{5}
+\bibcite{bi2023accurate}{6}
+\bibcite{shiConvolutionalLSTMNetwork2015}{7}
+\bibcite{wangPredRNNRecurrentNeural2017}{8}
+\bibcite{shiSeaSurfaceTemperature2024}{9}
+\bibcite{boninoMachineLearningMethods2024}{10}
+\bibcite{zhaoDeepLearningOcean2024}{11}
+\bibcite{cuiWenHaiForecastingEddying2025}{12}
+\bibcite{elAouniGLONETMercatorEndtoEnd2024}{13}
+\bibcite{huangFuXiOceanGlobalOcean2025}{14}
+\bibcite{wuAxiomOceanForecastingThreeDimensional2026}{15}
+\bibcite{molteni1996ecmwf}{16}
+\bibcite{huangFuXiONSDataDrivenEnsemble2026}{17}
+\bibcite{yangMultiFactorDeepLearning2025}{18}
+\bibcite{stortoCorrectionSeaSurface2025}{19}
+\bibcite{hamDeepLearningMultiyear2019}{20}
+\bibcite{zuo2019ocean5}{21}
+\bibcite{han2026oceanforecastbench}{22}
+\bibcite{oceanforecastbenchCode2025}{23}
+\@writefile{toc}{\contentsline {section}{Appendix\nobreakspace  A: LCFF Diagnostics}{9}{section*.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {VI}{\ignorespaces Per-seed validation changes from adding LCFF.}}{9}{table.6}\protected@file@percent }
+\newlabel{tab:lcff_seed_delta}{{VI}{9}{Per-seed validation changes from adding LCFF}{table.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {VII}{\ignorespaces Seed-42 LCFF interaction diagnostic. Entries are validation Macro $\mathrm  {SS}_{\mathrm  {AP}}$.}}{9}{table.7}\protected@file@percent }
+\newlabel{tab:lcff_interaction}{{VII}{9}{Seed-42 LCFF interaction diagnostic. Entries are validation Macro $\mathrm {SS}_{\mathrm {AP}}$}{table.7}{}}
+\@writefile{toc}{\contentsline {section}{References}{9}{section*.3}\protected@file@percent }
+\gdef \@abspage@last{9}

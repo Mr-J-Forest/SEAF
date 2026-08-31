@@ -1,0 +1,16 @@
+{"pairs":[
+  {"pair":"horizontal-1","A":"ambiguous","B":"screen-right","reason":"A is frontal with no definite pupil offset; B's face and nose turn right."},
+  {"pair":"horizontal-2","A":"screen-right","B":"screen-left","reason":"A's nose points right; B's nose and face plane point left."},
+  {"pair":"horizontal-3","A":"screen-right","B":"screen-left","reason":"A's face surface and nose point right; B's point left."},
+  {"pair":"horizontal-4","A":"screen-left","B":"screen-right","reason":"A's profile points left; B's face and nose point right."},
+  {"pair":"horizontal-5","A":"screen-left","B":"screen-right","reason":"A's profile points left; B's face and nose point right."},
+  {"pair":"horizontal-6","A":"screen-right","B":"screen-left","reason":"A's profile points right; B's profile points left."},
+  {"pair":"horizontal-7","A":"screen-right","B":"screen-left","reason":"A's face points right; B's face points left."},
+  {"pair":"vertical-1","A":"ambiguous","B":"ambiguous","reason":"A is frontal and B is back-facing; neither shows a definite up/down cue."},
+  {"pair":"vertical-2","A":"ambiguous","B":"ambiguous","reason":"A is side-facing and B frontal; no definite vertical aiming cue is visible."},
+  {"pair":"vertical-3","A":"ambiguous","B":"ambiguous","reason":"Both faces turn horizontally with no definite up/down landmark."},
+  {"pair":"vertical-4","A":"ambiguous","B":"ambiguous","reason":"Both are side-facing without a readable vertical cue."},
+  {"pair":"vertical-5","A":"ambiguous","B":"ambiguous","reason":"A is frontal and B side/back-facing; up/down is not definite."},
+  {"pair":"vertical-6","A":"ambiguous","B":"ambiguous","reason":"Both are left-facing profiles with no definite up/down cue."},
+  {"pair":"vertical-7","A":"ambiguous","B":"ambiguous","reason":"Both faces point horizontally; no definite vertical aiming landmark is readable."}
+]}

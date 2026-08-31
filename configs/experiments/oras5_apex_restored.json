@@ -1,0 +1,16 @@
+{
+  "extends": "../datasets/oras5_icdc_1deg_1979_2014.json",
+  "model_type": "apex_restored",
+  "learning_rate": 0.0003,
+  "epochs": 30,
+  "batch_size": 76,
+  "apex_hidden_dim": 64,
+  "apex_spectral_modes": [8, 8],
+  "apex_spectral_layers": 2,
+  "apex_ensemble_members": 4,
+  "enable_ap_residual": true,
+  "ablation_disable_spectral": false,
+  "ablation_disable_ensemble": false,
+  "post_training_evaluation": "validation",
+  "save_last": false
+}

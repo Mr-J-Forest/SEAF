@@ -207,6 +207,7 @@ class SmartOceanPredictor:
         if 'enable_climatology_anomaly' not in model_config:
             # Older checkpoints were trained without anomaly/climatology channels.
             merged_config['enable_climatology_anomaly'] = False
+            merged_config['enable_target_climatology_anomaly'] = False
             merged_config['include_climatology_features'] = False
         self.config = merged_config
         return result_dir, model_path
@@ -512,6 +513,7 @@ class SmartOceanPredictor:
 
             blended_pred = None
             blended_target = None
+            blended_baselines = {}
             weight_sum = np.zeros((full_h, full_w), dtype=np.float64)
             valid_windows = 0
             inference_batch_size = max(
@@ -546,6 +548,14 @@ class SmartOceanPredictor:
                         torch.stack(batch_targets, dim=0).numpy(),
                         sample_indices=batch_indices,
                     )[:, pred_step]
+                    baseline_batch = dense_dataset.build_reference_forecasts(
+                        sample_indices=batch_indices,
+                        spaces=("physical",),
+                    ).get("physical", {})
+                    baseline_phys_batch = {
+                        name: values[:, pred_step]
+                        for name, values in baseline_batch.items()
+                    }
 
                     for local_idx, sample_idx in enumerate(batch_indices):
                         pred_phys = pred_phys_batch[local_idx]
@@ -564,6 +574,10 @@ class SmartOceanPredictor:
                             out_channels = pred_phys.shape[0]
                             blended_pred = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
                             blended_target = np.zeros((out_channels, full_h, full_w), dtype=np.float64)
+                            blended_baselines = {
+                                name: np.zeros((out_channels, full_h, full_w), dtype=np.float64)
+                                for name in baseline_phys_batch
+                            }
 
                         win_h = len(window_lats)
                         win_w = len(window_lons)
@@ -602,6 +616,11 @@ class SmartOceanPredictor:
 
                         blended_pred[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += pred_slice * weights_3d
                         blended_target[:, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += target_slice * weights_3d
+                        for name, baseline_values in baseline_phys_batch.items():
+                            baseline_slice = baseline_values[local_idx, :, p_h_start:p_h_end, p_w_start:p_w_end]
+                            blended_baselines[name][
+                                :, lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end
+                            ] += baseline_slice * weights_3d
                         weight_sum[lat_idx_start:lat_idx_end, lon_idx_start:lon_idx_end] += weights_slice
                         valid_windows += 1
 
@@ -611,6 +630,14 @@ class SmartOceanPredictor:
             blended_pred, blended_target, coverage_mask = finalize_weighted_blend(
                 blended_pred, blended_target, weight_sum
             )
+            finalized_baselines = {}
+            for name, values in blended_baselines.items():
+                finalized, _, _ = finalize_weighted_blend(
+                    values,
+                    values,
+                    weight_sum,
+                )
+                finalized_baselines[name] = finalized.astype(np.float32)
             coverage_pct = float(np.mean(coverage_mask) * 100.0)
             ocean_points = int(ocean_domain_mask.sum())
             covered_ocean_points = int(np.count_nonzero(coverage_mask & ocean_domain_mask))
@@ -627,6 +654,7 @@ class SmartOceanPredictor:
             return {
                 'blended_pred': blended_pred.astype(np.float32),
                 'blended_target': blended_target.astype(np.float32),
+                'blended_baselines': finalized_baselines,
                 'weight_sum': weight_sum.astype(np.float32),
                 'coverage_mask': coverage_mask,
                 'ocean_domain_mask': ocean_domain_mask,

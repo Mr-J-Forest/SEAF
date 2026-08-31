@@ -12,10 +12,12 @@
 
 | 服务器 | 地址 |
 |--------|------|
-| Host | `connect.westd.seetacloud.com` |
-| Port | `39323` |
+| Host | `connect.westc.seetacloud.com` |
+| Port | `48312` |
 | User | `root` |
 | 远程路径 | `/root/TSC-Fusion` |
+
+注意：AutoDL 实例重启/迁移后 Host 和 Port 会变化，连接被拒时先到 AutoDL 控制台确认新的 SSH 命令。本地同步需显式指定：`TSC_SERVER=root@connect.westc.seetacloud.com TSC_SERVER_PORT=48312 ./sync_to_server.sh`。
 
 同步使用 `tar + ssh` 管道，不依赖 rsync，Windows/Mac/Linux 均可运行。
 

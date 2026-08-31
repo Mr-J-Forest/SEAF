@@ -86,6 +86,7 @@ def plot_full_map_result(result, pred_step, output_dir, model_index):
     full_lats = result['lats']
     blended_pred = result['blended_pred']
     blended_target = result['blended_target']
+    blended_baselines = result.get('blended_baselines', {})
     levels = np.asarray(result.get('levels', []))
 
     for var_name, ch_slice in _target_slices(result).items():
@@ -149,6 +150,101 @@ def plot_full_map_result(result, pred_step, output_dir, model_index):
         plt.close(fig)
         print(f"  Saved: {path}")
 
+        if blended_baselines:
+            baseline_items = [
+                ('Truth', var_target),
+                ('Prediction', var_pred),
+            ]
+            for baseline_name in ('anomaly_persistence', 'damped_anomaly_persistence'):
+                if baseline_name in blended_baselines:
+                    baseline_items.append(
+                        (baseline_name, blended_baselines[baseline_name][ch_slice])
+                    )
+            baseline_rows = len(baseline_items)
+            fig, axes = plt.subplots(
+                baseline_rows * nrows,
+                ncols,
+                figsize=(ncols * 4.5, baseline_rows * nrows * 3.6),
+                squeeze=False,
+            )
+            fig.suptitle(
+                f'{var_name} Forecast Comparison, Step {pred_step + 1}',
+                fontsize=14,
+            )
+            for item_idx, (label, values) in enumerate(baseline_items):
+                for depth_idx in range(n_depth):
+                    row, col = divmod(depth_idx, ncols)
+                    ax = axes[item_idx * nrows + row, col]
+                    if label in {'Truth', 'Prediction'}:
+                        data = values[depth_idx]
+                    else:
+                        data = values[depth_idx]
+                    finite = _finite_limits(data)
+                    vmin, vmax = finite
+                    if vmax <= vmin:
+                        vmax = vmin + 1e-12
+                    im = ax.pcolormesh(
+                        full_lons,
+                        full_lats,
+                        data,
+                        shading='auto',
+                        cmap='turbo',
+                        vmin=vmin,
+                        vmax=vmax,
+                    )
+                    ax.set_title(f'{label} depth={var_levels[depth_idx]:g}m')
+                    ax.set_xlabel('Longitude')
+                    ax.set_ylabel('Latitude')
+                    plt.colorbar(im, ax=ax, shrink=0.8)
+            plt.tight_layout()
+            path = os.path.join(
+                output_dir,
+                f'fullmap_{model_index}_step{pred_step + 1}_{var_name}_baselines.png',
+            )
+            plt.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  Saved: {path}")
+
+            ap_field = blended_baselines.get('anomaly_persistence')
+            if ap_field is not None:
+                improvement = np.abs(ap_field[ch_slice] - var_target) - np.abs(var_pred - var_target)
+                fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 4), squeeze=False)
+                fig.suptitle(
+                    f'{var_name} AP absolute-error advantage (positive = model better), '
+                    f'Step {pred_step + 1}',
+                    fontsize=14,
+                )
+                for depth_idx in range(n_depth):
+                    row, col = divmod(depth_idx, ncols)
+                    data = improvement[depth_idx]
+                    finite = np.abs(data[np.isfinite(data)])
+                    limit = max(float(finite.max()), 1e-12) if finite.size else 1.0
+                    ax = axes[row, col]
+                    im = ax.pcolormesh(
+                        full_lons,
+                        full_lats,
+                        data,
+                        shading='auto',
+                        cmap='RdYlGn',
+                        vmin=-limit,
+                        vmax=limit,
+                    )
+                    ax.set_title(f'depth={var_levels[depth_idx]:g}m')
+                    ax.set_xlabel('Longitude')
+                    ax.set_ylabel('Latitude')
+                    plt.colorbar(im, ax=ax, shrink=0.8, label='|e_AP| - |e_model|')
+                for depth_idx in range(n_depth, nrows * ncols):
+                    row, col = divmod(depth_idx, ncols)
+                    axes[row, col].axis('off')
+                plt.tight_layout()
+                path = os.path.join(
+                    output_dir,
+                    f'fullmap_{model_index}_step{pred_step + 1}_{var_name}_ap_advantage.png',
+                )
+                plt.savefig(path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                print(f"  Saved: {path}")
+
     coverage = np.asarray(result.get('coverage_mask', result['weight_sum'] > 0), dtype=bool)
     ocean = np.asarray(result.get('ocean_domain_mask', coverage), dtype=bool)
     coverage_class = np.zeros_like(coverage, dtype=np.uint8)
@@ -188,11 +284,33 @@ def save_full_map_result(result, pred_step, output_dir, model_label, provenance)
     array_path = os.path.join(output_dir, prefix + '.npz')
     prediction = np.asarray(result['blended_pred'], dtype=np.float32)
     target = np.asarray(result['blended_target'], dtype=np.float32)
+    baselines = {
+        name: np.asarray(values, dtype=np.float32)
+        for name, values in result.get('blended_baselines', {}).items()
+    }
+    climatology = baselines.get('climatology')
+    anomaly_prediction = prediction - climatology if climatology is not None else None
+    anomaly_target = target - climatology if climatology is not None else None
     np.savez_compressed(
         array_path,
         prediction=prediction,
         target=target,
         error=prediction - target,
+        **({
+            'climatology': climatology,
+            'anomaly_prediction': anomaly_prediction,
+            'anomaly_target': anomaly_target,
+        } if climatology is not None else {}),
+        **{
+            f'{name}_physical': values
+            for name, values in baselines.items()
+        },
+        **({
+            'ap_absolute_error_advantage': (
+                np.abs(baselines['anomaly_persistence'] - target)
+                - np.abs(prediction - target)
+            )
+        } if 'anomaly_persistence' in baselines else {}),
         weight_sum=np.asarray(result['weight_sum'], dtype=np.float32),
         coverage_mask=np.asarray(result['coverage_mask'], dtype=bool),
         ocean_domain_mask=np.asarray(result['ocean_domain_mask'], dtype=bool),
@@ -212,6 +330,21 @@ def save_full_map_result(result, pred_step, output_dir, model_label, provenance)
         metric_space='physical',
         depth_values=[float(value) for value in result.get('levels', [])],
     )
+    baseline_metrics = {}
+    if baselines:
+        baseline_metric_inputs = {
+            name: values[np.newaxis, np.newaxis, ...]
+            for name, values in baselines.items()
+        }
+        baseline_metrics = compute_metric_report(
+            prediction[np.newaxis, np.newaxis, ...],
+            target[np.newaxis, np.newaxis, ...],
+            list(result.get('target_variables', [])),
+            channel_slices=channel_slices,
+            baselines=baseline_metric_inputs,
+            metric_space='physical',
+            depth_values=[float(value) for value in result.get('levels', [])],
+        )
     metadata = {
         key: value for key, value in result.items()
         if key not in {
@@ -227,6 +360,8 @@ def save_full_map_result(result, pred_step, output_dir, model_label, provenance)
         'saved_at_utc': datetime.now(timezone.utc).isoformat(),
         'provenance': provenance,
         'physical_metrics_on_covered_cells': physical_metrics,
+        'physical_metrics_with_frozen_baselines': baseline_metrics,
+        'baseline_names': sorted(baselines),
     })
     metadata_path = os.path.join(output_dir, prefix + '.json')
     with open(metadata_path, 'w', encoding='utf-8') as handle:

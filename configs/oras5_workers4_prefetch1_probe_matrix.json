@@ -1,0 +1,29 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "purpose": "measure two-job data-pipeline throughput with four workers and unchanged in-flight batch count",
+    "comparison_reference": "two-job workers=2,prefetch=2 eager epochs: approximately 83-104s",
+    "expected_jobs": 2
+  },
+  "_stage_overrides": {
+    "speed_probe": {
+      "epochs": 2,
+      "scheduler_patience": 8,
+      "early_stopping_patience": 25,
+      "post_training_evaluation": "none",
+      "save_last": false,
+      "num_workers": 4,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "compile_model": false,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "speed_probe": [
+    {
+      "name": "direct_full_field_strict_workers4_prefetch1",
+      "config": "configs/experiments/oras5_ablation_direct_full_field.json",
+      "seeds": [123, 3407]
+    }
+  ]
+}

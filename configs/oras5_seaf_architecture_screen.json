@@ -1,0 +1,58 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "paper_model_name": "SEAF",
+    "purpose": "validation-only progressive architecture screening",
+    "task": "12-month direct anomaly history to 5-month joint TEMP/SALT anomaly forecast",
+    "reference": "AP and DAP are evaluation-only; no persistence skip is present",
+    "selection_split": "validation",
+    "test_access": "forbidden during screening",
+    "training_budget": "exactly 30 epochs per run",
+    "promotion_rule": "retain a module when Macro SS_AP improves by more than 0.01 or another pre-declared validation metric shows a clear gain"
+  },
+  "_stage_overrides": {
+    "screen": {
+      "epochs": 30,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "validation",
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "screen": [
+    {
+      "name": "seaf_reference",
+      "config": "configs/experiments/oras5_seaf.json",
+      "seeds": [42]
+    },
+    {
+      "name": "seaf_capacity_control",
+      "config": "configs/experiments/oras5_seaf_capacity_control.json",
+      "compare_to": "seaf_reference",
+      "seeds": [42]
+    },
+    {
+      "name": "seaf_profile_mixer",
+      "config": "configs/experiments/oras5_seaf_profile_mixer.json",
+      "compare_to": "seaf_capacity_control",
+      "seeds": [42]
+    },
+    {
+      "name": "seaf_local_global",
+      "config": "configs/experiments/oras5_seaf_local_global.json",
+      "compare_to": "seaf_profile_mixer",
+      "seeds": [42]
+    },
+    {
+      "name": "seaf_lead_router",
+      "config": "configs/experiments/oras5_seaf_lead_router.json",
+      "compare_to": "seaf_local_global",
+      "seeds": [42]
+    },
+    {
+      "name": "seaf_forcing_fusion",
+      "config": "configs/experiments/oras5_seaf_forcing_fusion.json",
+      "compare_to": "seaf_local_global",
+      "seeds": [42]
+    }
+  ]
+}

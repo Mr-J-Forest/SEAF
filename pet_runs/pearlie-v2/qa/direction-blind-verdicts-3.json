@@ -1,0 +1,16 @@
+{"pairs":[
+  {"pair":"horizontal-1","A":"ambiguous","B":"screen-right","reason":"A is front-facing with no definite left/right turn; B's nose and face plane point screen-right."},
+  {"pair":"horizontal-2","A":"screen-right","B":"screen-left","reason":"A's nose points right; B's nose and face plane point left."},
+  {"pair":"horizontal-3","A":"screen-right","B":"screen-left","reason":"The two clear side profiles point in opposite screen directions."},
+  {"pair":"horizontal-4","A":"screen-left","B":"screen-right","reason":"A's nose points left; B's face turns right."},
+  {"pair":"horizontal-5","A":"screen-left","B":"screen-right","reason":"A's visible face and nose point left; B's point right."},
+  {"pair":"horizontal-6","A":"screen-right","B":"screen-left","reason":"A is a right-facing profile; B is a left-facing profile."},
+  {"pair":"horizontal-7","A":"screen-right","B":"screen-left","reason":"A's nose points right; B's nose points left."},
+  {"pair":"vertical-1","A":"down","B":"up","reason":"A shows the frontal/down-facing face; B shows the back-of-head silhouette aimed away/up."},
+  {"pair":"vertical-2","A":"ambiguous","B":"down","reason":"A is a pure right profile without a readable vertical tilt; B is clearly frontal/down-facing."},
+  {"pair":"vertical-3","A":"up","B":"down","reason":"A turns slightly back/up-right; B exposes more of the front/down-right face."},
+  {"pair":"vertical-4","A":"ambiguous","B":"down","reason":"A reads as a pure right profile; B has a clear lower/front down-right turn."},
+  {"pair":"vertical-5","A":"down","B":"ambiguous","reason":"A is clearly frontal/down-facing; B is a pure left profile with no definite vertical cue."},
+  {"pair":"vertical-6","A":"ambiguous","B":"down","reason":"A is a pure left profile; B shows a lower/front down-left face turn."},
+  {"pair":"vertical-7","A":"up","B":"down","reason":"A has the more back/upper left head turn; B exposes more frontal/lower left facial surface."}
+]}

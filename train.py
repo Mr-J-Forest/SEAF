@@ -125,6 +125,62 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def configure_torch_threading() -> Dict[str, Optional[int]]:
+    """Apply an optional CPU-thread cap for multi-job GPU training.
+
+    The training workload is GPU-resident, while the container exposes many
+    logical CPUs but only a small CPU quota.  PyTorch otherwise sizes its
+    intra-op/inter-op pools from the host CPU count, so several concurrent
+    jobs can oversubscribe the quota and leave the GPU waiting for batches.
+    Keep the default behavior unchanged and make the cap an explicit runtime
+    setting so it does not alter the scientific model or data protocol.
+    """
+    def _read_positive(name: str) -> Optional[int]:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return None
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f'{name} 必须是正整数，实际为 {raw!r}') from exc
+        if value <= 0:
+            raise ValueError(f'{name} 必须是正整数，实际为 {value}')
+        return value
+
+    requested_intra = _read_positive('TSC_TORCH_NUM_THREADS')
+    requested_inter = _read_positive('TSC_TORCH_NUM_INTEROP_THREADS')
+
+    if requested_intra is not None:
+        torch.set_num_threads(requested_intra)
+
+    interop_error = None
+    if requested_inter is not None:
+        try:
+            # PyTorch permits this only before inter-op work has started.  A
+            # fresh training process satisfies that requirement; retain the
+            # actual value in metadata if an embedding caller already used it.
+            torch.set_num_interop_threads(requested_inter)
+        except RuntimeError as exc:
+            interop_error = str(exc)
+
+    runtime = {
+        'requested_intraop_threads': requested_intra,
+        'requested_interop_threads': requested_inter,
+        'actual_intraop_threads': int(torch.get_num_threads()),
+        'actual_interop_threads': int(torch.get_num_interop_threads()),
+    }
+    if interop_error:
+        runtime['interop_configuration_error'] = interop_error
+        print(f'警告: 无法设置 PyTorch inter-op 线程数: {interop_error}')
+    if requested_intra is not None or requested_inter is not None:
+        print(
+            'CPU 线程运行时配置: '
+            f"intra-op={runtime['actual_intraop_threads']}, "
+            f"inter-op={runtime['actual_interop_threads']}"
+        )
+    return runtime
+
+
 def capture_rng_state() -> dict:
     """Capture every RNG that can affect the next training epoch."""
     numpy_state = np.random.get_state()
@@ -418,6 +474,12 @@ class OceanModelTrainer:
 
         self.parameter_count = sum(p.numel() for p in self.model.parameters())
         print(f"模型参数数量: {self.parameter_count:,}")
+        initial_diagnostics = self.collect_model_diagnostics()
+        parameter_breakdown = initial_diagnostics.get('parameter_breakdown', {})
+        if parameter_breakdown:
+            print("SEAF 参数量分解:")
+            for component, count in parameter_breakdown.items():
+                print(f"  {component}: {int(count):,}")
         expected_parameter_count = config.get('expected_parameter_count')
         if (
             expected_parameter_count is not None
@@ -523,6 +585,17 @@ class OceanModelTrainer:
                     note_file.write("\n--- 继续训练 ---\n")
                 note_file.write(f"备注: {config['training_note']}\n")
                 note_file.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    def collect_model_diagnostics(self) -> Dict:
+        """Collect JSON-safe architecture diagnostics from the eager model."""
+        diagnostics_fn = getattr(self.model, 'model_diagnostics', None)
+        if diagnostics_fn is None:
+            return {}
+        with torch.no_grad():
+            diagnostics = diagnostics_fn()
+        if not isinstance(diagnostics, dict):
+            raise TypeError('model_diagnostics() 必须返回字典')
+        return diagnostics
 
     @staticmethod
     def _next_result_index(base_dir: str) -> int:
@@ -640,6 +713,29 @@ class OceanModelTrainer:
                 )
         return dtype
 
+    def _gradient_kernels(self, pred):
+        """Return cached Sobel kernels on the prediction device/dtype."""
+        cache = getattr(self, '_gradient_kernel_cache', None)
+        if cache is None:
+            cache = {}
+            self._gradient_kernel_cache = cache
+        key = (pred.device.type, pred.device.index, pred.dtype)
+        kernels = cache.get(key)
+        if kernels is None:
+            sobel_x = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                dtype=pred.dtype,
+                device=pred.device,
+            ).view(1, 1, 3, 3) / 8.0
+            sobel_y = torch.tensor(
+                [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                dtype=pred.dtype,
+                device=pred.device,
+            ).view(1, 1, 3, 3) / 8.0
+            kernels = (sobel_x, sobel_y)
+            cache[key] = kernels
+        return kernels
+
     def compute_gradient_loss(self, pred, target):
         """
         计算空间梯度损失。默认分别匹配 x/y 分量，保留梯度方向；
@@ -647,9 +743,7 @@ class OceanModelTrainer:
         """
         # pred, target: (B, T, C, H, W)
         # 计算空间梯度 (Sobel算子近似)
-        # 定义Sobel核
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3) / 8.0
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3) / 8.0
+        sobel_x, sobel_y = self._gradient_kernels(pred)
 
         b, t, c, h, w = pred.shape
         pred_flat = pred.reshape(b*t*c, 1, h, w)
@@ -673,7 +767,7 @@ class OceanModelTrainer:
             + F.mse_loss(grad_pred_y, grad_target_y)
         )
 
-    def compute_weighted_loss(self, outputs, targets):
+    def compute_weighted_loss(self, outputs, targets, *, detach_metrics=True):
         """
         计算温度和盐度的加权损失
 
@@ -700,8 +794,13 @@ class OceanModelTrainer:
             weighted_loss = weighted_loss + self.target_loss_weights[var_name] * var_loss
 
         total_loss = weighted_loss + grad_loss
-        detached_losses = {name: float(value.detach().item()) for name, value in variable_losses.items()}
-        return total_loss, detached_losses, float(grad_loss.detach().item())
+        if detach_metrics:
+            variable_losses = {
+                name: float(value.detach().item())
+                for name, value in variable_losses.items()
+            }
+            grad_loss = float(grad_loss.detach().item())
+        return total_loss, variable_losses, grad_loss
 
     def train_epoch(self) -> float:
         """
@@ -712,10 +811,11 @@ class OceanModelTrainer:
         """
         self.model.train()
         self.forward_model.train()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device)
         num_batches = len(self.train_loader)
         valid_batches = 0
         valid_samples = 0
+        log_interval = max(1, int(self.config.get('log_interval', 50)))
 
         progress_bar = tqdm(self.train_loader, desc=f'Epoch {self.epoch+1} 训练')
         for batch_idx, batch in enumerate(progress_bar):
@@ -731,18 +831,16 @@ class OceanModelTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                 outputs = self._forward(inputs)
-                loss, variable_losses, grad_loss_val = self.compute_weighted_loss(outputs, targets)
-
-            # 非有限 batch 会破坏跨实验公平性，必须立即失败并保留现场。
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    f"epoch {self.epoch + 1} batch {batch_idx} 训练损失非有限: {loss.item()}"
+                loss, variable_losses, grad_loss_val = self.compute_weighted_loss(
+                    outputs, targets, detach_metrics=False
                 )
 
-            # 检查输出是否包含异常值
-            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+            # 非有限 batch 会破坏跨实验公平性，必须立即失败并保留现场。
+            if not bool(torch.isfinite(loss).item()):
+                output_is_finite = bool(torch.isfinite(outputs).all().item())
                 raise FloatingPointError(
-                    f"epoch {self.epoch + 1} batch {batch_idx} 训练输出包含 NaN/Inf"
+                    f"epoch {self.epoch + 1} batch {batch_idx} 训练损失非有限: "
+                    f"{loss.item()} (output_finite={output_is_finite})"
                 )
 
             # 反向传播
@@ -785,33 +883,52 @@ class OceanModelTrainer:
                 self.grad_scaler.update()
 
             batch_samples = int(inputs.shape[0])
-            total_loss += loss.item() * batch_samples
+            total_loss += loss.detach() * batch_samples
             valid_batches += 1
             valid_samples += batch_samples
 
-            # 更新进度条
-            if len(self.target_variables) > 1:
-                postfix = {'Loss': f'{loss.item():.6f}', 'Avg': f'{total_loss/valid_samples:.6f}'}
-                postfix.update({name: f'{value:.6f}' for name, value in variable_losses.items()})
-                postfix['Grad'] = f'{grad_loss_val:.6f}'
-                progress_bar.set_postfix(postfix)
-            else:
-                progress_bar.set_postfix({
-                    'Loss': f'{loss.item():.6f}',
-                    'Avg Loss': f'{total_loss/valid_samples:.6f}'
-                })
+            # 训练热路径避免逐 batch 的 GPU->CPU 同步；日志间隔内只保留设备端累计值。
+            should_report = (
+                (batch_idx + 1) % log_interval == 0
+                or batch_idx == num_batches - 1
+            )
+            if should_report:
+                loss_value = float(loss.detach().item())
+                average_loss = float((total_loss / valid_samples).item())
+                variable_values = {
+                    name: float(value.detach().item())
+                    for name, value in variable_losses.items()
+                }
+                grad_value = float(grad_loss_val.detach().item())
+                if len(self.target_variables) > 1:
+                    postfix = {
+                        'Loss': f'{loss_value:.6f}',
+                        'Avg': f'{average_loss:.6f}',
+                    }
+                    postfix.update({
+                        name: f'{value:.6f}'
+                        for name, value in variable_values.items()
+                    })
+                    postfix['Grad'] = f'{grad_value:.6f}'
+                    progress_bar.set_postfix(postfix)
+                else:
+                    progress_bar.set_postfix({
+                        'Loss': f'{loss_value:.6f}',
+                        'Avg Loss': f'{average_loss:.6f}',
+                    })
 
-            # 记录到TensorBoard
-            global_step = self.epoch * num_batches + batch_idx
-            self.writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-            for var_name, var_loss in variable_losses.items():
-                self.writer.add_scalar(f'Loss/Train_{var_name}', var_loss, global_step)
-            self.writer.add_scalar('Loss/Train_Gradient', grad_loss_val, global_step)
+                global_step = self.epoch * num_batches + batch_idx
+                self.writer.add_scalar('Loss/Train_Batch', loss_value, global_step)
+                for var_name, var_loss in variable_values.items():
+                    self.writer.add_scalar(
+                        f'Loss/Train_{var_name}', var_loss, global_step
+                    )
+                self.writer.add_scalar('Loss/Train_Gradient', grad_value, global_step)
 
         if valid_batches == 0:
             raise RuntimeError("训练 epoch 中没有有效 batch")
         avg_loss = total_loss / valid_samples
-        return avg_loss
+        return float(avg_loss.item())
 
     def validate_epoch(self) -> float:
         """
@@ -822,8 +939,8 @@ class OceanModelTrainer:
         """
         self.model.eval()
         self.forward_model.eval()
-        total_objective = 0.0
-        total_selection_loss = 0.0
+        total_objective = torch.zeros((), device=self.device)
+        total_selection_loss = torch.zeros((), device=self.device)
         num_batches = len(self.val_loader)
 
         # 检查验证集是否为空
@@ -847,50 +964,57 @@ class OceanModelTrainer:
                 targets = targets.to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self._forward(inputs)
-                    loss, variable_losses, grad_loss_val = self.compute_weighted_loss(outputs, targets)
-
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(
-                        f"epoch {self.epoch + 1} validation batch {valid_batches} 损失非有限: {loss.item()}"
+                    loss, variable_losses, grad_loss_val = self.compute_weighted_loss(
+                        outputs, targets, detach_metrics=False
                     )
-                if not torch.isfinite(outputs).all():
+
+                if not bool(torch.isfinite(loss).item()):
+                    output_is_finite = bool(torch.isfinite(outputs).all().item())
                     raise FloatingPointError(
-                        f"epoch {self.epoch + 1} validation batch {valid_batches} 输出包含 NaN/Inf"
+                        f"epoch {self.epoch + 1} validation batch {valid_batches} "
+                        f"损失非有限: {loss.item()} (output_finite={output_is_finite})"
                     )
                 batch_samples = int(inputs.shape[0])
                 selection_loss = sum(
                     self.target_loss_weights[name] * value
                     for name, value in variable_losses.items()
                 )
-                total_objective += loss.item() * batch_samples
-                total_selection_loss += selection_loss * batch_samples
+                total_objective += loss.detach() * batch_samples
+                total_selection_loss += selection_loss.detach() * batch_samples
                 valid_batches += 1
                 valid_samples += batch_samples
 
                 if len(self.target_variables) > 1:
                     postfix = {
-                        'ValMSE': f'{selection_loss:.6f}',
-                        'Avg': f'{total_selection_loss/max(valid_samples, 1):.6f}',
-                        'Obj': f'{loss.item():.6f}',
+                        'ValMSE': f'{selection_loss.detach().item():.6f}',
+                        'Avg': f'{(total_selection_loss / max(valid_samples, 1)).item():.6f}',
+                        'Obj': f'{loss.detach().item():.6f}',
                     }
-                    postfix.update({name: f'{value:.6f}' for name, value in variable_losses.items()})
-                    postfix['Grad'] = f'{grad_loss_val:.6f}'
+                    postfix.update({
+                        name: f'{value.detach().item():.6f}'
+                        for name, value in variable_losses.items()
+                    })
+                    postfix['Grad'] = f'{grad_loss_val.detach().item():.6f}'
                     progress_bar.set_postfix(postfix)
                 else:
                     progress_bar.set_postfix({
-                        'Val Loss': f'{loss.item():.6f}',
+                        'Val Loss': f'{loss.detach().item():.6f}',
                         'Avg Val Loss': (
-                            f'{total_selection_loss / max(valid_samples, 1):.6f}'
+                            f'{(total_selection_loss / max(valid_samples, 1)).item():.6f}'
                         ),
                     })
 
                 # 记录验证损失到TensorBoard
                 if valid_batches == 1:  # 只记录第一个批次，避免过多记录
                     val_step = self.epoch
-                    self.writer.add_scalar('Loss/Val_Batch', loss.item(), val_step)
+                    self.writer.add_scalar('Loss/Val_Batch', loss.detach().item(), val_step)
                     for var_name, var_loss in variable_losses.items():
-                        self.writer.add_scalar(f'Loss/Val_{var_name}', var_loss, val_step)
-                    self.writer.add_scalar('Loss/Val_Gradient', grad_loss_val, val_step)
+                        self.writer.add_scalar(
+                            f'Loss/Val_{var_name}', var_loss.detach().item(), val_step
+                        )
+                    self.writer.add_scalar(
+                        'Loss/Val_Gradient', grad_loss_val.detach().item(), val_step
+                    )
 
         # 防止除零错误
         if valid_batches == 0:
@@ -899,7 +1023,7 @@ class OceanModelTrainer:
 
         # Checkpoint selection excludes gradient regularization so the same
         # criterion is used by full/no-gradient/magnitude ablations.
-        return total_selection_loss / valid_samples
+        return float((total_selection_loss / valid_samples).item())
 
     def save_checkpoint(self, is_best: bool = False):
         """
@@ -1447,6 +1571,7 @@ class OceanModelTrainer:
             'evaluation_timings_seconds': {
                 name: float(value) for name, value in evaluation_timings.items()
             },
+            'model_diagnostics': self.collect_model_diagnostics(),
             # uppercase aliases for ablation script compatibility
             'MAE': float(mae) if mae is not None else None,
             'RMSE': float(rmse) if rmse is not None else None,
@@ -1544,6 +1669,13 @@ class OceanModelTrainer:
                     improvement_text = f"{improvement:.2f}%" if improvement is not None else "nan"
                     print(f"        [{var_name}] skill={skill_text}, RMSE improvement={improvement_text}")
 
+        lead_weights = results['model_diagnostics'].get('lead_member_weights')
+        if lead_weights is not None:
+            print("  SEAF lead-aware member weights:")
+            for lead_index, weights in enumerate(lead_weights, start=1):
+                formatted = ", ".join(f"{value:.4f}" for value in weights)
+                print(f"    lead {lead_index}: [{formatted}]")
+
         # 保存评估结果
         evaluation_filename = (
             'evaluation_results.json' if split == 'test' else 'validation_results.json'
@@ -1607,6 +1739,11 @@ def main():
     if args.result_dir:
         config['explicit_result_dir'] = args.result_dir
 
+    # This is an explicit runtime performance control.  It is intentionally
+    # applied before DataLoader/model construction and is not part of the
+    # scientific configuration fingerprint.
+    torch_thread_runtime = configure_torch_threading()
+
     # 验证配置
     validate_config(config)
 
@@ -1628,10 +1765,31 @@ def main():
     print(f"  [TimeEncode] 时间编码: {'开启' if config.get('enable_time_encoding', False) else '关闭'}")
     if model_type == 'seaf':
         print("  SEAF 正式组件状态:")
-        print(f"    [Spectral] 全局频谱分支: {'关闭(消融)' if config.get('ablation_disable_spectral', False) else '开启'}")
-        print(f"    [Ensemble] 门控集成: {'关闭(消融)' if config.get('ablation_disable_ensemble', False) else '开启'}")
+        spectral_enabled = (
+            config.get('use_spectral_path', True)
+            and not config.get('ablation_disable_spectral', False)
+        )
+        print(f"    [TemporalDepth] {'开启' if config.get('use_temporal_depth_mixer', False) else '关闭'}")
+        print(f"    [Local] 局地空间分支: {'开启' if config.get('use_local_path', False) else '关闭'}")
+        print(f"    [Spectral] 全局频谱分支: {'开启' if spectral_enabled else '关闭'}")
+        if config.get('ablation_disable_ensemble', False):
+            ensemble_status = '单预测头(消融)'
+        elif config.get('ablation_uniform_ensemble', False):
+            ensemble_status = '多预测头固定均匀平均(消融)'
+        else:
+            router_labels = {
+                'spatial': '空间门控集成',
+                'uniform': '多预测头固定均匀平均',
+                'lead': '按预报时效路由的多预测头集成',
+            }
+            ensemble_status = router_labels.get(
+                str(config.get('router_type', 'spatial')).lower(),
+                str(config.get('router_type')),
+            )
+        print(f"    [Ensemble] {ensemble_status}")
         print(f"    [Tendency] 因果差分输入: {'开启' if config.get('include_tendency_features', False) else '关闭(消融)'}")
         print(f"    [Dynamics] 外部动力输入: {config.get('external_dynamic_variables', [])}")
+        print(f"    [ForcingEncoder] {'独立编码' if config.get('use_forcing_encoder', False) else '共享上下文编码'}")
     elif model_type in {
         'ofb_fourcastnet', 'ofb-fourcastnet',
         'ofb_climax', 'ofb-climax',
@@ -1736,6 +1894,7 @@ def main():
                 if trainer.device.type == 'cuda' else None
             ),
             'peak_host_memory_bytes': peak_host_memory_bytes(),
+            'torch_thread_runtime': torch_thread_runtime,
             'phase_timings_seconds': {
                 name: float(value) for name, value in phase_timings.items()
             },
@@ -1770,6 +1929,7 @@ def main():
                 'rmse_TEMP': results.get('physical_rmse_TEMP'),
                 'rmse_SALT': results.get('physical_rmse_SALT'),
             },
+            'model_diagnostics': trainer.collect_model_diagnostics(),
         }
         with open(os.path.join(trainer.result_dir, 'run_summary.json'), 'w', encoding='utf-8') as f:
             json.dump(run_summary, f, indent=2, ensure_ascii=False)

@@ -1,4 +1,3 @@
 {
-  "extends": "oras5_seaf.json",
-  "ablation_disable_ensemble": true
+  "extends": "oras5_ablation_single_head.json"
 }

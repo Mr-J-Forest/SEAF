@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_ablation_direct_full_field.json",
+  "learning_rate": 0.0008,
+  "comparison_role": "validation_tuned_full_field"
+}

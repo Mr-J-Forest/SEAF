@@ -1,0 +1,30 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "paper_model_name": "SEAF",
+    "purpose": "validation-only confirmation of the larger hidden width 256",
+    "task": "12-month direct anomaly history to 5-month joint TEMP/SALT anomaly forecast",
+    "capacity_change": "increase seaf_hidden_dim from 192 to 256; keep the complete LCFF-enabled SEAF architecture and all other scientific settings fixed",
+    "reference": "compare against the audited three-seed hidden-192 SEAF results and audited baselines; AP and DAP remain evaluation-only",
+    "comparison_stage": "confirm_validation",
+    "selection_split": "validation",
+    "test_access": "forbidden",
+    "training_budget": "exactly 30 epochs per run",
+    "seeds": [42, 123, 3407]
+  },
+  "_stage_overrides": {
+    "confirm_validation": {
+      "epochs": 30,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "validation",
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "confirm_validation": [
+    {
+      "name": "seaf_h256",
+      "config": "configs/experiments/oras5_seaf_h256.json",
+      "seeds": [42, 123, 3407]
+    }
+  ]
+}

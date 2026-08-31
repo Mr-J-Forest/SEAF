@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_seaf_profile_mixer.json",
+  "model_display_name": "SEAF",
+  "use_local_path": true
+}

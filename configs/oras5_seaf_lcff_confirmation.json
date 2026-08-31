@@ -1,0 +1,37 @@
+{
+  "_contrasts": "configs/oras5_seaf_lcff_contrasts.json",
+  "_protocol": {
+    "paper_model_name": "SEAF",
+    "purpose": "validation-only three-seed confirmation of LCFF as one atomic module",
+    "task": "12-month direct anomaly history to 5-month joint TEMP/SALT anomaly forecast",
+    "module_boundary": "LCFF jointly enables the dedicated forcing encoder and lead-specific hypothesis aggregation; original external inputs remain present when LCFF is disabled",
+    "reference": "AP and DAP are evaluation-only; no persistence skip is present",
+    "comparison_stage": "confirm_validation",
+    "selection_split": "validation",
+    "test_access": "forbidden",
+    "training_budget": "exactly 30 epochs per run",
+    "seed_42_policy": "reuse the strict-load-compatible archived screen runs after provenance audit",
+    "missing_run_policy": "this matrix contains only missing seeds 123 and 3407"
+  },
+  "_stage_overrides": {
+    "confirm_validation": {
+      "epochs": 30,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "validation",
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "confirm_validation": [
+    {
+      "name": "seaf_no_lcff",
+      "config": "configs/experiments/oras5_seaf_no_lcff.json",
+      "seeds": [123, 3407]
+    },
+    {
+      "name": "seaf_lcff",
+      "config": "configs/experiments/oras5_seaf_lcff.json",
+      "compare_to": "seaf_no_lcff",
+      "seeds": [123, 3407]
+    }
+  ]
+}

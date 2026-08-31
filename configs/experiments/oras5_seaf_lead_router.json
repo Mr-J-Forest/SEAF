@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_seaf_local_global.json",
+  "model_display_name": "SEAF",
+  "router_type": "lead"
+}
