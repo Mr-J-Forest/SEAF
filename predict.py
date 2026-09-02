@@ -155,6 +155,9 @@ class SmartOceanPredictor:
         
         # 加载模型
         self._load_model()
+        self.is_dynaseaf = (
+            str(self.config.get('model_type', 'seaf')).lower() == 'dynaseaf'
+        )
 
         self.target_variables = self.config.get('target_variables', [])
         self.selected_variables = list(selected_variables) if selected_variables else None
@@ -262,12 +265,18 @@ class SmartOceanPredictor:
             return parts[0]
         return torch.cat(parts, dim=1)
     
-    def predict(self, num_samples: Optional[int] = None):
+    def predict(
+        self,
+        num_samples: Optional[int] = None,
+        save_dynaseaf_diagnostics: bool = False,
+    ):
         """
         进行预测
         
         Args:
             num_samples: 预测样本数量，如果为None则使用配置中的默认值
+            save_dynaseaf_diagnostics: 是否额外保存 DynaSEAF 的分解张量；
+                该导出只调用模型生成的 diagnostics，不读取未来动力学标签。
         """
         if num_samples is None:
             num_samples = self.config['num_samples']
@@ -276,13 +285,17 @@ class SmartOceanPredictor:
         
         # 创建测试数据集（包含所有100%海洋窗口）
         scalers = self.preprocessing_scalers
+        inference_config = dict(self.config)
+        inference_config['return_future_dynamics_targets'] = False
         if scalers is None:
-            ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
+            ref_dataset = OceanDataset(
+                inference_config['data_path'], inference_config, mode='train'
+            )
             scalers = ref_dataset.scalers
             if getattr(ref_dataset, 'dataset', None) is not None:
                 ref_dataset.dataset.close()
         test_dataset = OceanDataset(
-            self.config['data_path'], self.config, mode='test', scalers=scalers
+            inference_config['data_path'], inference_config, mode='test', scalers=scalers
         )
         dataset_slices = getattr(test_dataset, 'target_channel_slices', {}) or {}
         if dataset_slices:
@@ -301,6 +314,7 @@ class SmartOceanPredictor:
         targets = []
         inputs_list = []
         sample_indices = []
+        dynaseaf_diagnostics = {}
         
         print(f"数据集大小: {len(test_dataset)}")
         print(f"实际预测样本数: {num_samples}")
@@ -327,11 +341,29 @@ class SmartOceanPredictor:
             pin_memory=bool(self.config.get('pin_memory', True)),
         )
         with torch.no_grad():
-            for group_idx, (batch_inputs, batch_targets, batch_indices) in enumerate(loader):
+            for group_idx, batch in enumerate(loader):
+                batch_inputs, batch_targets, batch_indices = batch[:3]
                 remaining = num_samples - len(predictions)
                 if remaining <= 0:
                     break
-                outputs = self.model(batch_inputs.to(self.device, non_blocking=True)).cpu()
+                model_output = self.model(
+                    batch_inputs.to(self.device, non_blocking=True),
+                    return_diagnostics=(
+                        bool(save_dynaseaf_diagnostics) and self.is_dynaseaf
+                    ),
+                ) if bool(save_dynaseaf_diagnostics) and self.is_dynaseaf else self.model(
+                    batch_inputs.to(self.device, non_blocking=True)
+                )
+                if isinstance(model_output, dict):
+                    outputs = model_output['forecast'].cpu()
+                    batch_diagnostics = {
+                        name: value.detach().float().cpu()
+                        for name, value in model_output.items()
+                        if name != 'forecast' and torch.is_tensor(value)
+                    }
+                else:
+                    outputs = model_output.cpu()
+                    batch_diagnostics = {}
                 for local_idx in retained_positions[group_idx]:
                     sample_idx = int(batch_indices[local_idx])
                     output = outputs[local_idx]
@@ -342,6 +374,10 @@ class SmartOceanPredictor:
                     targets.append(batch_targets[local_idx])
                     inputs_list.append(batch_inputs[local_idx])
                     sample_indices.append(sample_idx)
+                    for name, value in batch_diagnostics.items():
+                        dynaseaf_diagnostics.setdefault(name, []).append(
+                            value[local_idx]
+                        )
                 print(f"已完成 {len(predictions)}/{num_samples} 个样本的预测")
         
         if len(predictions) == 0:
@@ -377,6 +413,8 @@ class SmartOceanPredictor:
             inputs_list,
             test_dataset,
             sample_indices,
+            dynaseaf_diagnostics=dynaseaf_diagnostics
+            if save_dynaseaf_diagnostics and self.is_dynaseaf else None,
         )
         self._visualize_results(
             predictions_original,
@@ -430,14 +468,18 @@ class SmartOceanPredictor:
         print("获取训练期标准化参数...")
         ref_dataset = None
         scalers = self.preprocessing_scalers
+        inference_config = dict(self.config)
+        inference_config['return_future_dynamics_targets'] = False
         if scalers is None:
-            ref_dataset = OceanDataset(self.config['data_path'], self.config, mode='train')
+            ref_dataset = OceanDataset(
+                inference_config['data_path'], inference_config, mode='train'
+            )
             scalers = ref_dataset.scalers
 
         print("构建密集推理窗口数据集...")
         dense_dataset = OceanDataset(
-            self.config['data_path'],
-            self.config,
+            inference_config['data_path'],
+            inference_config,
             mode='test',
             scalers=scalers,
             override_stride_lon=stride_lon,
@@ -744,7 +786,15 @@ class SmartOceanPredictor:
         print("反标准化完成")
         return predictions_original, targets_original
     
-    def _save_results(self, predictions, targets, inputs_list, dataset, sample_indices):
+    def _save_results(
+        self,
+        predictions,
+        targets,
+        inputs_list,
+        dataset,
+        sample_indices,
+        dynaseaf_diagnostics: Optional[Dict[str, List[torch.Tensor]]] = None,
+    ):
         """保存预测结果"""
         print("保存预测结果...")
         
@@ -761,6 +811,20 @@ class SmartOceanPredictor:
             inputs=inputs_np,
             sample_indices=np.asarray(sample_indices, dtype=np.int64),
         )
+
+        diagnostics_file = None
+        if dynaseaf_diagnostics:
+            diagnostics_arrays = {}
+            for name, values in dynaseaf_diagnostics.items():
+                if values:
+                    diagnostics_arrays[name] = torch.stack(values).numpy()
+            if diagnostics_arrays:
+                diagnostics_file = 'dynaseaf_diagnostics.npz'
+                np.savez_compressed(
+                    os.path.join(self.output_dir, diagnostics_file),
+                    sample_indices=np.asarray(sample_indices, dtype=np.int64),
+                    **diagnostics_arrays,
+                )
         
         # 保存配置
         with open(os.path.join(self.output_dir, 'config.json'), 'w') as f:
@@ -795,6 +859,11 @@ class SmartOceanPredictor:
             'input_space': 'normalized model features',
             'sample_provenance': provenance,
         }
+        if diagnostics_file is not None:
+            info['dynaseaf_diagnostics_file'] = diagnostics_file
+            info['dynaseaf_diagnostics_keys'] = sorted(
+                dynaseaf_diagnostics.keys()
+            )
         
         with open(os.path.join(self.output_dir, 'info.json'), 'w') as f:
             json.dump(info, f, indent=4)
@@ -1821,6 +1890,11 @@ def main():
     model_group.add_argument('--model_dir', type=str, help='直接指定确定性的训练结果目录')
     parser.add_argument('--samples', type=int, default=None, help='预测样本数（覆盖配置）')
     parser.add_argument('--output_dir', type=str, default=None, help='自定义预测输出目录')
+    parser.add_argument(
+        '--save-dynaseaf-diagnostics',
+        action='store_true',
+        help='DynaSEAF 额外导出 direct/transport/gate/innovation/dynamics 分解',
+    )
     args = parser.parse_args()
     print("ConvLSTM海洋预测系统 - 统一配置版本")
     print("=" * 50)
@@ -1854,7 +1928,10 @@ def main():
         )
 
         # 进行预测
-        predictor.predict(num_samples=args.samples)
+        predictor.predict(
+            num_samples=args.samples,
+            save_dynaseaf_diagnostics=args.save_dynaseaf_diagnostics,
+        )
 
         print("预测任务完成!")
 

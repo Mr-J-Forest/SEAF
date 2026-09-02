@@ -1,0 +1,33 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
+    "task": "12-month anomaly-centered history to 5-month joint TEMP/SALT anomaly forecast",
+    "purpose": "complete the remaining seeds for the already screened Full DynaSEAF configuration",
+    "selection_split": "validation",
+    "test_access": "forbidden",
+    "parent_campaign": "5d106ad2d2cc1877abc23fb6b17fbfd441900509_screen",
+    "seeds": {
+      "screen": [123, 3407]
+    },
+    "formal_epochs": 30
+  },
+  "_stage_overrides": {
+    "screen": {
+      "epochs": 30,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "validation",
+      "num_workers": 2,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "screen": [
+    {
+      "name": "dynaseaf_full",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "seeds": [123, 3407]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_dynaseaf.json",
+  "model_display_name": "DynaSEAF-no-innovation",
+  "dynaseaf_use_innovation": false
+}

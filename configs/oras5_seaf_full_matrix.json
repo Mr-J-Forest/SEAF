@@ -6,6 +6,7 @@
     "reference": "AP and DAP are evaluation-only; no learned model contains a persistence skip",
     "selection_rule": "learning rates and checkpoints use validation only; final test is eval-only after freezing",
     "learning_rate_selection": "coarse_grid_tail_median; supplemental boundary refinement skipped by explicit user decision",
+    "formal_epochs": 30,
     "comparison_stage": "confirm_validation",
     "expected_confirmation_experiments": [
       "full",
@@ -46,7 +47,7 @@
       "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
     },
     "confirm_validation": {
-      "epochs": 80,
+      "epochs": 30,
       "scheduler_patience": 8,
       "early_stopping_patience": 25,
       "post_training_evaluation": "validation",

@@ -1,0 +1,129 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
+    "task": "12-month anomaly-centered history to 5-month joint TEMP/SALT anomaly forecast",
+    "purpose": "incremental DynaSEAF ablation ladder (A0-A4) plus component contrasts",
+    "ladder": {
+      "A0": "SEAF-v1 direct anomaly forecaster (frozen paper-facing backbone)",
+      "A1": "A0 + future dynamics auxiliary prediction (transport/innovation/gate disabled)",
+      "A2": "A1 + transport (fixed equal direct/transport mixture, no adaptive gate)",
+      "A3": "A2 + innovation head (still fixed mixture)",
+      "A4": "full DynaSEAF: future dynamics + transport + innovation + adaptive gate"
+    },
+    "contrasts": {
+      "no_dynamics_aux": "full DynaSEAF minus the auxiliary dynamics loss; model-predicted dynamics still condition transport/innovation/gate",
+      "no_transport": "full DynaSEAF minus the deformation/warp path",
+      "no_innovation": "full DynaSEAF minus the innovation head",
+      "no_gate": "full DynaSEAF with the adaptive gate replaced by a fixed 0.5 mixture"
+    },
+    "selection_split": "validation",
+    "test_policy": "test stays sealed until the protocol is frozen after three-seed confirmation",
+    "seeds": {
+      "screen": [42],
+      "confirm_validation": [42, 123, 3407]
+    },
+    "reporting": "mean and sample standard deviation across seeds; AP/DAP remain evaluation-only references",
+    "formal_epochs": 30
+  },
+  "_stage_overrides": {
+    "smoke": {
+      "epochs": 2,
+      "scheduler_patience": 2,
+      "early_stopping_patience": 2,
+      "post_training_evaluation": "none",
+      "num_workers": 2,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "compile_model": false
+    },
+    "screen": {
+      "epochs": 30,
+      "scheduler_patience": 4,
+      "early_stopping_patience": 10,
+      "post_training_evaluation": "validation",
+      "num_workers": 2,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    },
+    "confirm_validation": {
+      "epochs": 30,
+      "scheduler_patience": 8,
+      "early_stopping_patience": 25,
+      "post_training_evaluation": "validation",
+      "save_last": false,
+      "num_workers": 2,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "compile_model": false,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "smoke": [
+    {
+      "name": "dynaseaf_smoke",
+      "config": "configs/experiments/oras5_dynaseaf_smoke.json",
+      "seeds": [42]
+    }
+  ],
+  "screen": [
+    {
+      "name": "dynaseaf_a0_seaf_reference",
+      "config": "configs/experiments/oras5_seaf_h192.json",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_a1_dynamics_only",
+      "config": "configs/experiments/oras5_dynaseaf_dynamics_only.json",
+      "compare_to": "dynaseaf_a0_seaf_reference",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_a2_transport",
+      "config": "configs/experiments/oras5_dynaseaf_transport.json",
+      "compare_to": "dynaseaf_a1_dynamics_only",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_a3_transport_innovation",
+      "config": "configs/experiments/oras5_dynaseaf_transport_innovation.json",
+      "compare_to": "dynaseaf_a2_transport",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_a4_full",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "compare_to": "dynaseaf_a3_transport_innovation",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_no_dynamics_aux",
+      "config": "configs/experiments/oras5_dynaseaf_no_dynamics_aux.json",
+      "compare_to": "dynaseaf_a4_full",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_no_transport",
+      "config": "configs/experiments/oras5_dynaseaf_no_transport.json",
+      "compare_to": "dynaseaf_a4_full",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_no_innovation",
+      "config": "configs/experiments/oras5_dynaseaf_no_innovation.json",
+      "compare_to": "dynaseaf_a4_full",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_no_gate",
+      "config": "configs/experiments/oras5_dynaseaf_no_gate.json",
+      "compare_to": "dynaseaf_a4_full",
+      "seeds": [42]
+    }
+  ],
+  "confirm_validation": {
+    "from_stage": "screen",
+    "seeds": [42, 123, 3407]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "extends": "oras5_smoke.json",
+  "model_type": "dynaseaf",
+  "model_display_name": "DynaSEAF-smoke",
+  "epochs": 2
+}

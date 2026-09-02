@@ -1,5 +1,5 @@
 {
-  "epochs": 80,
+  "epochs": 30,
   "batch_size": 151,
   "expected_canonical_windows_per_origin": 151,
   "learning_rate": 0.0008,

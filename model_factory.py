@@ -3,12 +3,15 @@
 import torch.nn as nn
 
 from seaf_model import SEAFNet
+from dynaseaf_model import DynaSEAFNet
 
 
 def create_ocean_model(config: dict) -> nn.Module:
     model_type = str(config.get("model_type", "seaf")).lower()
     if model_type == "seaf":
         return SEAFNet(config)
+    if model_type == "dynaseaf":
+        return DynaSEAFNet(config)
 
     from recent_baseline_models import create_recent_baseline, is_recent_baseline
 

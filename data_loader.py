@@ -73,6 +73,18 @@ class OceanDataset(Dataset):
         )
         self.damped_persistence_coefficients = {}
         self.return_sample_index = bool(config.get('return_sample_index', False))
+        self.return_future_dynamics_targets = bool(
+            config.get('return_future_dynamics_targets', False)
+        )
+        self.future_dynamics_target_variables = list(
+            config.get(
+                'future_dynamics_target_variables',
+                config.get(
+                    'dynaseaf_future_dynamics_variables',
+                    ['UVEL', 'VVEL', 'SSHA', 'MLD'],
+                ),
+            )
+        )
         # 数据范围设置（优先使用配置中的范围）
         self.lon_range = list(config.get('lon_range', [130.5, 162.5]))
         self.lat_range = list(config.get('lat_range', [6.5, 27.5]))
@@ -125,6 +137,7 @@ class OceanDataset(Dataset):
         self._create_sequences()
         self.input_channel_slices = {}
         self.target_channel_slices = {}
+        self.future_dynamics_target_channel_slices = {}
         if getattr(self, '_preassembled_mmap_enabled', False):
             self._initialize_preassembled_channel_schema()
         else:
@@ -177,6 +190,9 @@ class OceanDataset(Dataset):
         view.override_stride_lon = None
         view.override_stride_lat = None
         view.return_sample_index = False
+        # Future dynamics are training-only supervision.  Validation/test
+        # views expose only history inputs and TEMP/SALT targets.
+        view.return_future_dynamics_targets = mode == 'train'
         view.provided_scalers = self.scalers
         view._resolve_stride(self.config)
         view._split_data()
@@ -263,6 +279,16 @@ class OceanDataset(Dataset):
         if int(manifest.get('prediction_length', -1)) != int(self.prediction_length):
             raise ValueError('预组装 mmap 的 prediction_length 与当前配置不一致')
 
+        # Version-1 mmap payloads predate the optional DynaSEAF supervision
+        # array.  Fall back to the normal preprocessing path instead of ever
+        # treating history inputs as future labels or silently returning an
+        # incomplete auxiliary target.
+        if (
+            getattr(self, 'return_future_dynamics_targets', False)
+            and not manifest.get('future_dynamics_target_file')
+        ):
+            return False
+
         input_path = os.path.join(cache_dir, manifest['input_file'])
         fullfield_target_path = os.path.join(cache_dir, manifest['fullfield_target_file'])
         climatology_path = os.path.join(cache_dir, manifest['target_climatology_file'])
@@ -279,16 +305,36 @@ class OceanDataset(Dataset):
         self._mmap_target_climatology = np.load(
             climatology_path, mmap_mode='c', allow_pickle=False
         )
+        self._mmap_future_dynamics_targets = None
+        if getattr(self, 'return_future_dynamics_targets', False):
+            future_path = os.path.join(
+                cache_dir, manifest['future_dynamics_target_file']
+            )
+            if not os.path.isfile(future_path):
+                raise FileNotFoundError(
+                    f'预组装 mmap 缺少未来动力学数组: {future_path}'
+                )
+            self._mmap_future_dynamics_targets = np.load(
+                future_path, mmap_mode='c', allow_pickle=False
+            )
         expected_shapes = {
             'inputs': tuple(manifest['input_shape']),
             'fullfield_targets': tuple(manifest['fullfield_target_shape']),
             'target_climatology': tuple(manifest['target_climatology_shape']),
         }
+        if self._mmap_future_dynamics_targets is not None:
+            expected_shapes['future_dynamics_targets'] = tuple(
+                manifest['future_dynamics_target_shape']
+            )
         actual_shapes = {
             'inputs': tuple(self._mmap_inputs.shape),
             'fullfield_targets': tuple(self._mmap_fullfield_targets.shape),
             'target_climatology': tuple(self._mmap_target_climatology.shape),
         }
+        if self._mmap_future_dynamics_targets is not None:
+            actual_shapes['future_dynamics_targets'] = tuple(
+                self._mmap_future_dynamics_targets.shape
+            )
         if actual_shapes != expected_shapes:
             raise ValueError(
                 f'预组装 mmap shape 不匹配: expected={expected_shapes}, actual={actual_shapes}'
@@ -314,6 +360,12 @@ class OceanDataset(Dataset):
             for name, bounds in manifest['target_channel_slices'].items()
         }
         self._preassembled_target_source_slices = target_slices
+        self._preassembled_future_dynamics_source_slices = {
+            name: slice(int(bounds[0]), int(bounds[1]))
+            for name, bounds in manifest.get(
+                'future_dynamics_target_channel_slices', {}
+            ).items()
+        }
         self._preassembled_fullfield_scaler_names = dict(
             manifest['fullfield_target_scalers']
         )
@@ -371,6 +423,31 @@ class OceanDataset(Dataset):
                 selected_targets, dtype=np.int64
             )
 
+        if getattr(self, 'return_future_dynamics_targets', False):
+            missing_future = [
+                name for name in self.future_dynamics_target_variables
+                if name not in self._preassembled_future_dynamics_source_slices
+            ]
+            if missing_future:
+                raise ValueError(
+                    '预组装 mmap 不覆盖未来动力学监督通道: '
+                    f'{missing_future}'
+                )
+            selected_future = []
+            for name in self.future_dynamics_target_variables:
+                source_slice = self._preassembled_future_dynamics_source_slices[name]
+                selected_future.extend(range(source_slice.start, source_slice.stop))
+            if selected_future == list(
+                range(selected_future[0], selected_future[-1] + 1)
+            ):
+                self._preassembled_future_dynamics_selection = slice(
+                    selected_future[0], selected_future[-1] + 1
+                )
+            else:
+                self._preassembled_future_dynamics_selection = np.asarray(
+                    selected_future, dtype=np.int64
+                )
+
         self.all_regions_data = []
         for region_idx, region_meta in enumerate(manifest['regions']):
             climatology = {}
@@ -415,6 +492,23 @@ class OceanDataset(Dataset):
             self.target_channel_slices[variable] = slice(offset, offset + length)
             offset += length
 
+        if getattr(self, 'return_future_dynamics_targets', False):
+            offset = 0
+            future_slices = getattr(
+                self, '_preassembled_future_dynamics_source_slices', {}
+            )
+            for variable in self.future_dynamics_target_variables:
+                source_slice = future_slices.get(variable)
+                if source_slice is None:
+                    raise ValueError(
+                        f'预组装 mmap 缺少未来动力学变量通道: {variable}'
+                    )
+                length = int(source_slice.stop - source_slice.start)
+                self.future_dynamics_target_channel_slices[variable] = slice(
+                    offset, offset + length
+                )
+                offset += length
+
     # ========== 预处理缓存持久化 ==========
 
     # v5 introduced terminal anchors; v6 shares mode-independent payloads;
@@ -431,6 +525,8 @@ class OceanDataset(Dataset):
         'tendency_feature_variables',
         'climatology_baseline_variables',
         'enable_climatology_anomaly', 'enable_target_climatology_anomaly',
+        'return_future_dynamics_targets', 'future_dynamics_target_variables',
+        'dynaseaf_future_dynamics_variables',
     })
 
     def _compute_cache_key(self) -> str:
@@ -456,6 +552,8 @@ class OceanDataset(Dataset):
         required_variables.update(self.config.get('climatology_feature_variables', []))
         required_variables.update(self.config.get('climatology_baseline_variables', []))
         required_variables.update(self.config.get('tendency_feature_variables', []))
+        if getattr(self, 'return_future_dynamics_targets', False):
+            required_variables.update(self.future_dynamics_target_variables)
         relevant['required_physical_variables'] = sorted(required_variables)
         relevant['sliding_enabled'] = self.sliding_enabled
         relevant['stride_lon'] = self.stride_lon
@@ -703,6 +801,8 @@ class OceanDataset(Dataset):
 
             # Reconstruct raw data from normalized data for baseline computation
             needed_vars = set(self.target_variables) | set(self.tendency_feature_variables)
+            if getattr(self, 'return_future_dynamics_targets', False):
+                needed_vars.update(self.future_dynamics_target_variables)
             for region in self.all_regions_data:
                 if not region.get('data'):
                     region['data'] = {}
@@ -956,8 +1056,12 @@ class OceanDataset(Dataset):
             if var in self.available_variables and var in dataset.data_vars:
                 valid_input_vars.append(var)
 
+        requested_variables = list(valid_input_vars) + list(self.target_variables)
+        if getattr(self, 'return_future_dynamics_targets', False):
+            requested_variables.extend(self.future_dynamics_target_variables)
+
         # 处理所有有效变量
-        for var in valid_input_vars + self.target_variables:
+        for var in dict.fromkeys(requested_variables):
             if var in dataset.data_vars:
                 # 获取变量数据
                 data = dataset[var].values
@@ -1052,6 +1156,8 @@ class OceanDataset(Dataset):
             ))
         if self.include_climatology_features:
             variables.update(self.climatology_feature_variables)
+        if getattr(self, 'return_future_dynamics_targets', False):
+            variables.update(self.future_dynamics_target_variables)
 
         for var in variables:
             if var not in region['data']:
@@ -1763,6 +1869,18 @@ class OceanDataset(Dataset):
             self.target_channel_slices[var_name] = slice(offset, offset + channels)
             offset += channels
 
+        if getattr(self, 'return_future_dynamics_targets', False):
+            offset = 0
+            for var_name in self.future_dynamics_target_variables:
+                arr = normalized_data.get(var_name)
+                if arr is None:
+                    continue
+                channels = int(arr.shape[1]) if arr.ndim == 4 else 1
+                self.future_dynamics_target_channel_slices[var_name] = slice(
+                    offset, offset + channels
+                )
+                offset += channels
+
     def _validate_channel_schema(self):
         """Fail when configured variables/features did not become real channels."""
         missing_inputs = [
@@ -1807,6 +1925,16 @@ class OceanDataset(Dataset):
                 f'缺失输入={missing_inputs}, 缺失目标={missing_targets}, '
                 f'缺失特征={missing_features}'
             )
+        if getattr(self, 'return_future_dynamics_targets', False):
+            missing_dynamics = [
+                name for name in self.future_dynamics_target_variables
+                if name not in self.future_dynamics_target_channel_slices
+            ]
+            if missing_dynamics:
+                raise ValueError(
+                    '未来动力学监督通道 schema 缺失；拒绝把它们混入 history input。'
+                    f'缺失变量={missing_dynamics}'
+                )
 
     @staticmethod
     def _slice_and_broadcast_input(
@@ -1946,6 +2074,31 @@ class OceanDataset(Dataset):
                 var_data = normalized_target_data[var][start_idx + self.sequence_length:start_idx + self.sequence_length + self.prediction_length]
                 target_sequence.append(var_data)
 
+        future_dynamics_sequence = []
+        future_dynamics_masks = []
+        if getattr(self, 'return_future_dynamics_targets', False):
+            future_start = start_idx + self.sequence_length
+            for var in self.future_dynamics_target_variables:
+                if var not in normalized_data:
+                    raise ValueError(
+                        f'未来动力学监督变量 {var!r} 不在 normalized_data 中'
+                    )
+                var_data = normalized_data[var][
+                    future_start:future_start + self.prediction_length
+                ]
+                if var_data.ndim == 3:
+                    var_data = var_data[:, np.newaxis, :, :]
+                elif var_data.ndim != 4:
+                    raise ValueError(
+                        f'未来动力学变量样本维度必须为 3 或 4，实际为 {var_data.shape}'
+                    )
+                var_data = np.asarray(var_data, dtype=np.float32)
+                finite = np.isfinite(var_data)
+                future_dynamics_sequence.append(
+                    np.nan_to_num(var_data, nan=0.0, posinf=0.0, neginf=0.0)
+                )
+                future_dynamics_masks.append(finite.astype(np.float32))
+
         # 统一为 channel-first，避免先转置到 channel-last、拼接后再转回去。
         # 预处理缓存中的物理变量约定为 (time, channels, height, width)。
         input_arrays = []
@@ -1984,13 +2137,28 @@ class OceanDataset(Dataset):
         input_seq = np.ascontiguousarray(np.concatenate(input_arrays, axis=1))
         target_seq = np.ascontiguousarray(np.concatenate(target_arrays, axis=1))
 
+        future_dynamics_tensor = None
+        future_dynamics_mask_tensor = None
+        if getattr(self, 'return_future_dynamics_targets', False):
+            future_seq = np.ascontiguousarray(
+                np.concatenate(future_dynamics_sequence, axis=1)
+            )
+            future_mask_seq = np.ascontiguousarray(
+                np.concatenate(future_dynamics_masks, axis=1)
+            )
+            future_dynamics_tensor = torch.from_numpy(future_seq)
+            future_dynamics_mask_tensor = torch.from_numpy(future_mask_seq)
+
         # 数据已经是 (time, channels, height, width)，无需再 permute。
         input_tensor = torch.from_numpy(input_seq)
         target_tensor = torch.from_numpy(target_seq)
 
+        result = [input_tensor, target_tensor]
+        if future_dynamics_tensor is not None:
+            result.extend([future_dynamics_tensor, future_dynamics_mask_tensor])
         if self.return_sample_index:
-            return input_tensor, target_tensor, idx
-        return input_tensor, target_tensor
+            result.append(idx)
+        return tuple(result)
 
     def _get_preassembled_item(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """Slice one sample from the shared time-axis mmap cache."""
@@ -2009,9 +2177,28 @@ class OceanDataset(Dataset):
         ][:, self._preassembled_target_selection, :, :]
         input_tensor = torch.from_numpy(np.asarray(input_values, dtype=np.float32))
         target_tensor = torch.from_numpy(np.asarray(target_values, dtype=np.float32))
+        result = [input_tensor, target_tensor]
+        if getattr(self, 'return_future_dynamics_targets', False):
+            future_source = getattr(self, '_mmap_future_dynamics_targets', None)
+            if future_source is None:
+                raise RuntimeError(
+                    '预组装 mmap 没有未来动力学监督数组；拒绝伪造辅助 target'
+                )
+            future_values = future_source[
+                region_idx, target_start:target_start + self.prediction_length
+            ][:, self._preassembled_future_dynamics_selection, :, :]
+            future_values = np.asarray(future_values, dtype=np.float32)
+            future_mask = np.isfinite(future_values).astype(np.float32)
+            future_values = np.nan_to_num(
+                future_values, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            result.extend([
+                torch.from_numpy(future_values),
+                torch.from_numpy(future_mask),
+            ])
         if self.return_sample_index:
-            return input_tensor, target_tensor, idx
-        return input_tensor, target_tensor
+            result.append(idx)
+        return tuple(result)
 
     @staticmethod
     def _series_to_channel_first(data: np.ndarray) -> np.ndarray:
@@ -2505,6 +2692,13 @@ def create_data_loaders(
     # 获取训练集计算出的scalers
     scalers = train_dataset.scalers
 
+    # Future dynamics are labels for the auxiliary training objective only.
+    # Independent validation/test construction must receive an explicit copy
+    # with that request disabled; otherwise those labels could be materialized
+    # even though the evaluation path intentionally never consumes them.
+    eval_config = dict(config)
+    eval_config['return_future_dynamics_targets'] = False
+
     # 时间 split 不应复制整套空间数组。只有模式对应的滑窗开关/步长不同
     # （例如区域训练、全球验证）时，才构建独立的预处理 payload。
     print("初始化验证集 (使用训练集标准化参数)...")
@@ -2513,7 +2707,7 @@ def create_data_loaders(
         val_dataset = train_dataset.temporal_split_view('val')
     else:
         val_dataset = OceanDataset(
-            data_path, config, mode='val',
+            data_path, eval_config, mode='val',
             train_ratio=train_ratio, val_ratio=val_ratio,
             scalers=scalers,
         )
@@ -2524,7 +2718,7 @@ def create_data_loaders(
         test_dataset = val_dataset.temporal_split_view('test')
     else:
         test_dataset = OceanDataset(
-            data_path, config, mode='test',
+            data_path, eval_config, mode='test',
             train_ratio=train_ratio, val_ratio=val_ratio,
             scalers=scalers,
         )

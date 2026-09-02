@@ -4,6 +4,8 @@
 定义所有训练和预测相关的参数
 """
 
+import math
+
 # ========== 模块开关集中管理 ==========
 MODULE_SWITCHES = {
     'enable_positional_encoding': True,   # 空间位置编码
@@ -115,6 +117,20 @@ MODEL_CONFIG = {
     'ablation_disable_ensemble': False,
     'ablation_uniform_ensemble': False,
     'ablation_direct_full_field': False,
+
+    # DynaSEAF transport--innovation decomposition.  These keys are inert for
+    # model_type='seaf' and therefore do not alter the frozen SEAF path.
+    'dynaseaf_future_dynamics_variables': ['UVEL', 'VVEL', 'SSHA', 'MLD'],
+    'dynaseaf_lambda_dynamics': 0.10,
+    'dynaseaf_max_deformation_cells': 1.0,
+    'dynaseaf_gate_resolution': 'target',  # target | depth
+    'dynaseaf_gate_initial_bias': -1.7346,  # sigmoid ~= 0.15
+    'dynaseaf_zero_init_innovation': True,
+    'dynaseaf_use_future_dynamics_aux': True,
+    'dynaseaf_use_transport': True,
+    'dynaseaf_use_innovation': True,
+    'dynaseaf_use_adaptive_gate': True,
+    'dynaseaf_use_temporal_depth_mixer': False,
 }
 
 # ========== 训练相关参数 ==========
@@ -362,6 +378,7 @@ def validate_config(config):
 
     normalized_model_type = str(config.get('model_type', '')).lower()
     seaf_model_types = {'seaf'}
+    dynaseaf_model_types = {'dynaseaf'}
     recent_baseline_types = {
         'ofb_fourcastnet', 'ofb-fourcastnet',
         'ofb_climax', 'ofb-climax',
@@ -369,6 +386,7 @@ def validate_config(config):
     }
     supported_model_types = {
         *seaf_model_types,
+        *dynaseaf_model_types,
         *recent_baseline_types,
         'tianhai_paper', 'tianhai-reimpl',
         'fuxi_ocean_paper', 'fuxi-ocean-reimpl',
@@ -447,6 +465,74 @@ def validate_config(config):
             and int(config.get('seaf_ensemble_members', 0)) < 2
         ):
             errors.append("uniform-ensemble 消融至少需要两个 member")
+
+    if normalized_model_type in dynaseaf_model_types:
+        if config.get('use_gradient_loss', False):
+            errors.append(
+                "DynaSEAF 第一阶段必须关闭 gradient loss；该实验只比较主任务与 dynamics auxiliary loss"
+            )
+        input_anomaly = bool(config.get('enable_climatology_anomaly', False))
+        target_anomaly = bool(config.get(
+            'enable_target_climatology_anomaly', input_anomaly
+        ))
+        if not input_anomaly:
+            errors.append("DynaSEAF 正式协议要求输入使用 climatology anomaly")
+        if not target_anomaly:
+            errors.append("DynaSEAF 正式协议要求 TEMP/SALT target 使用 anomaly")
+        if not set(config.get('target_variables', [])).issubset(
+            set(config.get('anomaly_variables', []))
+        ):
+            errors.append("DynaSEAF 要求所有 target_variables 都属于输入 anomaly_variables")
+        if not set(config.get('target_variables', [])).issubset(
+            set(config.get('target_anomaly_variables', []))
+        ):
+            errors.append("DynaSEAF anomaly target 必须覆盖所有 target_variables")
+
+        dynamics_variables = config.get(
+            'dynaseaf_future_dynamics_variables',
+            ['UVEL', 'VVEL', 'SSHA', 'MLD'],
+        )
+        if (
+            not isinstance(dynamics_variables, (list, tuple))
+            or not dynamics_variables
+            or not all(isinstance(name, str) and name for name in dynamics_variables)
+            or len(set(dynamics_variables)) != len(dynamics_variables)
+        ):
+            errors.append(
+                "dynaseaf_future_dynamics_variables 必须是非空且不重复的字符串列表"
+            )
+        try:
+            lambda_dynamics = float(config.get('dynaseaf_lambda_dynamics', 0.1))
+            max_deformation = float(
+                config.get('dynaseaf_max_deformation_cells', 1.0)
+            )
+            gate_bias = float(config.get('dynaseaf_gate_initial_bias', -1.7346))
+            if not math.isfinite(lambda_dynamics) or lambda_dynamics < 0:
+                errors.append("dynaseaf_lambda_dynamics 必须为非负有限数")
+            if not math.isfinite(max_deformation) or max_deformation < 0:
+                errors.append("dynaseaf_max_deformation_cells 必须为非负有限数")
+            if not math.isfinite(gate_bias) or not -20.0 <= gate_bias <= 20.0:
+                errors.append("dynaseaf_gate_initial_bias 必须位于[-20, 20]")
+        except (TypeError, ValueError):
+            errors.append(
+                "dynaseaf_lambda_dynamics、dynaseaf_max_deformation_cells、"
+                "dynaseaf_gate_initial_bias 必须为数值"
+            )
+        if str(config.get('dynaseaf_gate_resolution', 'target')).lower() not in {
+            'target', 'channel', 'target_channel', 'depth', 'shared_depth'
+        }:
+            errors.append("dynaseaf_gate_resolution 必须为 target 或 depth")
+        dyna_boolean_defaults = {
+            'dynaseaf_zero_init_innovation': True,
+            'dynaseaf_use_future_dynamics_aux': True,
+            'dynaseaf_use_transport': True,
+            'dynaseaf_use_innovation': True,
+            'dynaseaf_use_adaptive_gate': True,
+            'dynaseaf_use_temporal_depth_mixer': False,
+        }
+        for key, default in dyna_boolean_defaults.items():
+            if not isinstance(config.get(key, default), bool):
+                errors.append(f"{key} 必须为布尔值")
 
     if normalized_model_type in recent_baseline_types:
         if not config.get('enable_climatology_anomaly', False):

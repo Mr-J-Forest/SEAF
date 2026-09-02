@@ -1,0 +1,69 @@
+{
+  "_contrasts": null,
+  "_protocol": {
+    "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
+    "task": "12-month anomaly-centered history to 5-month joint TEMP/SALT anomaly forecast",
+    "purpose": "one-seed validation-only hyperparameter screen for DynaSEAF (Stage B)",
+    "selection_split": "validation",
+    "test_access": "forbidden during screening",
+    "screened_knobs": [
+      "dynaseaf_lambda_dynamics",
+      "dynaseaf_max_deformation_cells"
+    ],
+    "fixed_defaults": {
+      "dynaseaf_gate_initial_bias": -1.7346,
+      "dynaseaf_gate_resolution": "target",
+      "dynaseaf_future_dynamics_variables": ["UVEL", "VVEL", "SSHA", "MLD"]
+    },
+    "formal_epochs": 30,
+    "promotion_rule": "keep the default unless a variant clearly improves TEMP/SALT RMSE, Macro SS_AP, or geometric MSE reduction relative to the A0 SEAF-v1 reference on validation"
+  },
+  "_stage_overrides": {
+    "screen": {
+      "epochs": 30,
+      "early_stopping_patience": 30,
+      "post_training_evaluation": "validation",
+      "num_workers": 2,
+      "persistent_workers": true,
+      "prefetch_factor": 1,
+      "cache_preprocessed_dir": "/tmp/seaf_cache/oras5_1979_2014"
+    }
+  },
+  "screen": [
+    {
+      "name": "dynaseaf_a0_seaf_reference",
+      "config": "configs/experiments/oras5_seaf_h192.json",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_full",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "compare_to": "dynaseaf_a0_seaf_reference",
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_lambda_dyn_0.05",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "overrides": {"dynaseaf_lambda_dynamics": 0.05},
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_lambda_dyn_0.2",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "overrides": {"dynaseaf_lambda_dynamics": 0.2},
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_max_deform_0.5",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "overrides": {"dynaseaf_max_deformation_cells": 0.5},
+      "seeds": [42]
+    },
+    {
+      "name": "dynaseaf_max_deform_2.0",
+      "config": "configs/experiments/oras5_dynaseaf.json",
+      "overrides": {"dynaseaf_max_deformation_cells": 2.0},
+      "seeds": [42]
+    }
+  ]
+}

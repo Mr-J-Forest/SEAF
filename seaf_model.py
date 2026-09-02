@@ -671,6 +671,11 @@ class SEAFNet(nn.Module):
         self, x: torch.Tensor, targets: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         del targets
+        features = self.encode_features(x)
+        return self.forecast_from_features(features)
+
+    def encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode a history once so compatible heads can reuse the representation."""
         batch, sequence, channels, height, width = x.shape
         if sequence != self.sequence_length or channels != self.input_dim:
             raise ValueError(
@@ -684,6 +689,16 @@ class SEAFNet(nn.Module):
             features = self.spectral_encoder(
                 x.reshape(batch, sequence * channels, height, width)
             )
+        return features
+
+    def forecast_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Run the frozen SEAF direct prediction path from encoded features."""
+        if features.ndim != 4 or features.shape[1] != self.member_heads[0][0].net[0].out_channels:
+            raise ValueError(
+                "SEAF feature shape does not match the configured hidden width: "
+                f"got {tuple(features.shape)}"
+            )
+        batch, _, height, width = features.shape
         members = torch.stack(
             [
                 head(features).reshape(

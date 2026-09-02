@@ -365,6 +365,25 @@ class OceanModelTrainer:
             config = DEFAULT_CONFIG
 
         self.config = config
+        self.is_dynaseaf = str(config.get('model_type', 'seaf')).lower() == 'dynaseaf'
+        self.dynaseaf_aux_enabled = bool(
+            self.is_dynaseaf
+            and config.get('dynaseaf_use_future_dynamics_aux', True)
+        )
+        if self.dynaseaf_aux_enabled:
+            # Future dynamics are an auxiliary training-only target.  Set this
+            # before constructing loaders so the train dataset requests the
+            # extra labels; temporal validation/test views disable the flag.
+            config['return_future_dynamics_targets'] = True
+            config['future_dynamics_target_variables'] = list(
+                config.get(
+                    'future_dynamics_target_variables',
+                    config.get(
+                        'dynaseaf_future_dynamics_variables',
+                        ['UVEL', 'VVEL', 'SSHA', 'MLD'],
+                    ),
+                )
+            )
 
         # Set seed for reproducibility (if specified in config)
         seed = config.get('seed', None)
@@ -430,10 +449,35 @@ class OceanModelTrainer:
         if train_dataset is not None:
             input_slices = _serialize_channel_slices(getattr(train_dataset, 'input_channel_slices', {}))
             target_slices = _serialize_channel_slices(getattr(train_dataset, 'target_channel_slices', {}))
+            future_slices = _serialize_channel_slices(
+                getattr(train_dataset, 'future_dynamics_target_channel_slices', {})
+            )
             if input_slices:
                 config['input_channel_slices'] = input_slices
             if target_slices:
                 config['target_channel_slices'] = target_slices
+            if future_slices:
+                config['future_dynamics_target_channel_slices'] = future_slices
+                config['dynaseaf_future_dynamics_channel_slices'] = future_slices
+
+        self.dynaseaf_future_dynamics_variables = list(
+            config.get(
+                'future_dynamics_target_variables',
+                config.get(
+                    'dynaseaf_future_dynamics_variables',
+                    ['UVEL', 'VVEL', 'SSHA', 'MLD'],
+                ),
+            )
+        )
+        self.future_dynamics_target_channel_slices = dict(
+            config.get('future_dynamics_target_channel_slices', {})
+        )
+
+        if self.is_dynaseaf and len(sample_batch) >= 4:
+            future_sample = sample_batch[2]
+            config['actual_future_dynamics_channels'] = int(future_sample.shape[2])
+        elif self.is_dynaseaf:
+            config['actual_future_dynamics_channels'] = 0
 
         # 创建模型
         self.model = create_ocean_model(config).to(self.device)
@@ -477,7 +521,9 @@ class OceanModelTrainer:
         initial_diagnostics = self.collect_model_diagnostics()
         parameter_breakdown = initial_diagnostics.get('parameter_breakdown', {})
         if parameter_breakdown:
-            print("SEAF 参数量分解:")
+            print(
+                f"{config.get('model_display_name', 'SEAF')} 参数量分解:"
+            )
             for component, count in parameter_breakdown.items():
                 print(f"  {component}: {int(count):,}")
         expected_parameter_count = config.get('expected_parameter_count')
@@ -654,10 +700,41 @@ class OceanModelTrainer:
             if callable(close_source):
                 close_source()
 
-    def _forward(self, inputs):
+    def _unpack_batch(self, batch):
+        """Unpack baseline or DynaSEAF batches without leaking aux labels.
+
+        The stable first two fields are history inputs and TEMP/SALT targets.
+        DynaSEAF training may append ``future_dynamics`` and its validity mask;
+        all later consumers explicitly decide whether those fields are allowed.
+        """
+        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+            raise TypeError(
+                '训练 batch 必须是至少包含输入和目标的 tuple/list'
+            )
+        inputs, targets = batch[0], batch[1]
+        future_dynamics = None
+        future_mask = None
+        sample_indices = None
+        if len(batch) >= 4:
+            # DynaSEAF train format: inputs, targets, future dynamics, mask,
+            # and optionally sample index.
+            future_dynamics, future_mask = batch[2], batch[3]
+            if len(batch) >= 5:
+                sample_indices = batch[4]
+        elif len(batch) == 3:
+            # Baseline/evaluation format: inputs, targets, sample index.
+            sample_indices = batch[2]
+        return inputs, targets, future_dynamics, future_mask, sample_indices
+
+    def _forward(self, inputs, *, return_diagnostics: bool = False):
         """执行模型前向；compile 协议默认严格，避免静默混用后端。"""
         try:
-            outputs = self.forward_model(inputs)
+            if return_diagnostics:
+                if not self.is_dynaseaf:
+                    raise ValueError('只有 DynaSEAF 支持 forward diagnostics')
+                outputs = self.forward_model(inputs, return_diagnostics=True)
+            else:
+                outputs = self.forward_model(inputs)
             if self.compile_active:
                 self._compiled_forward_verified = True
             return outputs
@@ -675,6 +752,8 @@ class OceanModelTrainer:
             self.compile_active = False
             self.compile_fallback_used = True
             self.config['compile_model'] = False
+            if return_diagnostics:
+                return self.model(inputs, return_diagnostics=True)
             return self.model(inputs)
 
     def _resolve_amp_dtype(self, requested) -> torch.dtype:
@@ -802,6 +881,84 @@ class OceanModelTrainer:
             grad_loss = float(grad_loss.detach().item())
         return total_loss, variable_losses, grad_loss
 
+    def compute_dynamics_loss(self, predicted, targets, valid_mask=None):
+        """Compute the auxiliary future-dynamics loss with an explicit schema.
+
+        The target tensor is supplied by the training loader only.  Every
+        variable is averaged over its own declared channel slice, then the
+        variable losses are averaged uniformly; this keeps a 20-level field
+        from receiving twenty times the weight of a scalar field.
+        """
+        if predicted is None or targets is None:
+            raise ValueError('DynaSEAF dynamics loss requires predicted and target tensors')
+        if predicted.ndim != 5 or targets.ndim != 5:
+            raise ValueError(
+                'future dynamics tensors must be [B,K,D,H,W]'
+            )
+        if tuple(predicted.shape) != tuple(targets.shape):
+            raise ValueError(
+                'future dynamics prediction/target shapes do not match: '
+                f'{tuple(predicted.shape)} != {tuple(targets.shape)}'
+            )
+
+        variable_names = list(
+            getattr(
+                self,
+                'dynaseaf_future_dynamics_variables',
+                self.config.get(
+                    'dynaseaf_future_dynamics_variables',
+                    self.config.get('future_dynamics_target_variables', []),
+                ),
+            )
+        )
+        if not variable_names:
+            variable_names = ['future_dynamics']
+            channel_slices = {'future_dynamics': slice(0, predicted.shape[2])}
+        else:
+            raw_slices = getattr(
+                self,
+                'future_dynamics_target_channel_slices',
+                self.config.get(
+                    'future_dynamics_target_channel_slices',
+                    self.config.get('dynaseaf_future_dynamics_channel_slices', {}),
+                ),
+            )
+            channel_slices = resolve_variable_slices(
+                variable_names, raw_slices, predicted.shape[2]
+            )
+
+        if valid_mask is None:
+            valid = torch.isfinite(targets)
+        else:
+            valid = valid_mask.to(device=targets.device, dtype=torch.bool)
+            if tuple(valid.shape) != tuple(targets.shape):
+                raise ValueError(
+                    'future dynamics validity mask shape does not match targets: '
+                    f'{tuple(valid.shape)} != {tuple(targets.shape)}'
+                )
+            valid = valid & torch.isfinite(targets)
+        safe_targets = torch.nan_to_num(
+            targets, nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        losses = {}
+        for name in variable_names:
+            channel_slice = channel_slices[name]
+            diff_square = (
+                predicted[:, :, channel_slice] - safe_targets[:, :, channel_slice]
+            ).square()
+            mask = valid[:, :, channel_slice]
+            denominator = mask.sum()
+            denominator_safe = denominator.clamp_min(1).to(diff_square.dtype)
+            numerator = (diff_square * mask.to(diff_square.dtype)).sum()
+            losses[name] = torch.where(
+                denominator > 0,
+                numerator / denominator_safe,
+                diff_square.new_zeros(()),
+            )
+        total = torch.stack(list(losses.values())).mean()
+        return total, losses
+
     def train_epoch(self) -> float:
         """
         训练一个epoch
@@ -816,24 +973,63 @@ class OceanModelTrainer:
         valid_batches = 0
         valid_samples = 0
         log_interval = max(1, int(self.config.get('log_interval', 50)))
+        dynamics_epoch_total = torch.zeros((), device=self.device)
 
         progress_bar = tqdm(self.train_loader, desc=f'Epoch {self.epoch+1} 训练')
         for batch_idx, batch in enumerate(progress_bar):
-            if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                inputs, targets, _ = batch
-            else:
-                inputs, targets = batch
+            (
+                inputs,
+                targets,
+                future_dynamics_targets,
+                future_dynamics_mask,
+                _,
+            ) = self._unpack_batch(batch)
 
             inputs = inputs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+            if future_dynamics_targets is not None:
+                future_dynamics_targets = future_dynamics_targets.to(
+                    self.device, non_blocking=True
+                )
+            if future_dynamics_mask is not None:
+                future_dynamics_mask = future_dynamics_mask.to(
+                    self.device, non_blocking=True
+                )
 
             # 前向传播
             self.optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
-                outputs = self._forward(inputs)
+                model_output = self._forward(
+                    inputs,
+                    return_diagnostics=bool(getattr(self, 'is_dynaseaf', False)),
+                )
+                if getattr(self, 'is_dynaseaf', False):
+                    if not isinstance(model_output, dict) or 'forecast' not in model_output:
+                        raise RuntimeError(
+                            'DynaSEAF diagnostics 前向必须返回 forecast 字段'
+                        )
+                    outputs = model_output['forecast']
+                else:
+                    outputs = model_output
                 loss, variable_losses, grad_loss_val = self.compute_weighted_loss(
                     outputs, targets, detach_metrics=False
                 )
+                dynamics_loss_val = outputs.new_zeros(())
+                dynamics_losses = {}
+                if getattr(self, 'dynaseaf_aux_enabled', False):
+                    if future_dynamics_targets is None:
+                        raise RuntimeError(
+                            'DynaSEAF auxiliary supervision is enabled, but the '
+                            'training batch has no future dynamics labels'
+                        )
+                    dynamics_loss_val, dynamics_losses = self.compute_dynamics_loss(
+                        model_output.get('predicted_dynamics'),
+                        future_dynamics_targets,
+                        future_dynamics_mask,
+                    )
+                    loss = loss + float(
+                        self.config.get('dynaseaf_lambda_dynamics', 0.1)
+                    ) * dynamics_loss_val
 
             # 非有限 batch 会破坏跨实验公平性，必须立即失败并保留现场。
             if not bool(torch.isfinite(loss).item()):
@@ -884,6 +1080,7 @@ class OceanModelTrainer:
 
             batch_samples = int(inputs.shape[0])
             total_loss += loss.detach() * batch_samples
+            dynamics_epoch_total += dynamics_loss_val.detach() * batch_samples
             valid_batches += 1
             valid_samples += batch_samples
 
@@ -900,6 +1097,7 @@ class OceanModelTrainer:
                     for name, value in variable_losses.items()
                 }
                 grad_value = float(grad_loss_val.detach().item())
+                dynamics_value = float(dynamics_loss_val.detach().item())
                 if len(self.target_variables) > 1:
                     postfix = {
                         'Loss': f'{loss_value:.6f}',
@@ -910,12 +1108,17 @@ class OceanModelTrainer:
                         for name, value in variable_values.items()
                     })
                     postfix['Grad'] = f'{grad_value:.6f}'
+                    if getattr(self, 'dynaseaf_aux_enabled', False):
+                        postfix['Dyn'] = f'{dynamics_value:.6f}'
                     progress_bar.set_postfix(postfix)
                 else:
-                    progress_bar.set_postfix({
+                    postfix = {
                         'Loss': f'{loss_value:.6f}',
                         'Avg Loss': f'{average_loss:.6f}',
-                    })
+                    }
+                    if getattr(self, 'dynaseaf_aux_enabled', False):
+                        postfix['Dyn'] = f'{dynamics_value:.6f}'
+                    progress_bar.set_postfix(postfix)
 
                 global_step = self.epoch * num_batches + batch_idx
                 self.writer.add_scalar('Loss/Train_Batch', loss_value, global_step)
@@ -924,10 +1127,21 @@ class OceanModelTrainer:
                         f'Loss/Train_{var_name}', var_loss, global_step
                     )
                 self.writer.add_scalar('Loss/Train_Gradient', grad_value, global_step)
+                if getattr(self, 'dynaseaf_aux_enabled', False):
+                    self.writer.add_scalar(
+                        'Loss/Train_FutureDynamics', dynamics_value, global_step
+                    )
 
         if valid_batches == 0:
             raise RuntimeError("训练 epoch 中没有有效 batch")
         avg_loss = total_loss / valid_samples
+        if getattr(self, 'dynaseaf_aux_enabled', False):
+            dynamics_average = float((dynamics_epoch_total / valid_samples).item())
+            history = getattr(self, 'dynaseaf_dynamics_losses', None)
+            if history is None:
+                self.dynaseaf_dynamics_losses = []
+                history = self.dynaseaf_dynamics_losses
+            history.append(dynamics_average)
         return float(avg_loss.item())
 
     def validate_epoch(self) -> float:
@@ -955,10 +1169,7 @@ class OceanModelTrainer:
             progress_bar = tqdm(self.val_loader, desc=f'Epoch {self.epoch+1} 验证')
 
             for batch in progress_bar:
-                if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    inputs, targets, _ = batch
-                else:
-                    inputs, targets = batch
+                inputs, targets, _, _, _ = self._unpack_batch(batch)
 
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
@@ -1325,11 +1536,9 @@ class OceanModelTrainer:
 
         with torch.no_grad():
             for batch in tqdm(evaluation_loader, desc=f"{split_label}集评估"):
-                if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    inputs, targets, batch_indices = batch
+                inputs, targets, _, _, batch_indices = self._unpack_batch(batch)
+                if batch_indices is not None:
                     sample_indices.extend([int(idx) for idx in batch_indices])
-                else:
-                    inputs, targets = batch
 
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
@@ -1790,6 +1999,24 @@ def main():
         print(f"    [Tendency] 因果差分输入: {'开启' if config.get('include_tendency_features', False) else '关闭(消融)'}")
         print(f"    [Dynamics] 外部动力输入: {config.get('external_dynamic_variables', [])}")
         print(f"    [ForcingEncoder] {'独立编码' if config.get('use_forcing_encoder', False) else '共享上下文编码'}")
+    elif model_type == 'dynaseaf':
+        print("  DynaSEAF transport--innovation 状态:")
+        print(
+            f"    [FutureDynamics] 训练期辅助监督: "
+            f"{'开启' if config.get('dynaseaf_use_future_dynamics_aux', True) else '关闭'}"
+        )
+        print(
+            f"    [Transport] 有效变形输运: "
+            f"{'开启' if config.get('dynaseaf_use_transport', True) else '关闭'}"
+        )
+        print(
+            f"    [Gate] 自适应 direct/transport gate: "
+            f"{'开启' if config.get('dynaseaf_use_adaptive_gate', True) else '关闭'}"
+        )
+        print(
+            f"    [Innovation] 残差创新头: "
+            f"{'开启' if config.get('dynaseaf_use_innovation', True) else '关闭'}"
+        )
     elif model_type in {
         'ofb_fourcastnet', 'ofb-fourcastnet',
         'ofb_climax', 'ofb-climax',
@@ -1873,6 +2100,10 @@ def main():
             'data_protocol': trainer.data_protocol,
             'completed_epochs': len(trainer.train_losses),
             'training_objective_losses': [float(value) for value in trainer.train_losses],
+            'dynaseaf_future_dynamics_losses': [
+                float(value)
+                for value in getattr(trainer, 'dynaseaf_dynamics_losses', [])
+            ],
             'validation_selection_losses': [float(value) for value in trainer.val_losses],
             'best_epoch': trainer.best_epoch,
             'best_val_loss': trainer.best_val_loss,

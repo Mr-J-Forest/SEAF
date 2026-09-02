@@ -1,0 +1,7 @@
+{
+  "extends": "oras5_seaf_h192.json",
+  "model_type": "dynaseaf",
+  "model_display_name": "DynaSEAF",
+  "epochs": 30,
+  "_dynaseaf_protocol": "future dynamics (UVEL/VVEL/SSHA/MLD) are training-only auxiliary supervision; forward never receives ground-truth future fields; final checkpoint selection stays on the TEMP/SALT validation objective"
+}

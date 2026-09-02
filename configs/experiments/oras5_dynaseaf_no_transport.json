@@ -1,0 +1,6 @@
+{
+  "extends": "oras5_dynaseaf.json",
+  "model_display_name": "DynaSEAF-no-transport",
+  "dynaseaf_use_transport": false,
+  "dynaseaf_use_adaptive_gate": false
+}

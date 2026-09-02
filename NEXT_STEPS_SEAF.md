@@ -26,7 +26,7 @@ A_t=Y_t-C_t,\qquad
 - external dynamics/forcing：UVEL、VVEL、SSHA、MLD、TAUX、TAUY、QNET、WFLUX；
 - split：现有 chronological train/validation/test，`split_context_policy=carry_history`；
 - formal seeds：42、123、3407；
-- maximum epochs：80；scheduler patience：8；early-stopping patience：25；
+- formal maximum epochs：30；scheduler patience：8；early-stopping patience：25；smoke 固定 2 epochs；
 - ORAS5 SEAF batch：76，DataLoader workers：2；大模型基线可用其已校准的 batch 8；
 - server concurrency：`--max-parallel 2`，不得在未重新测量 cgroup 峰值前提高；
 - 远端正式 campaign 的预处理 cache 使用 `/tmp/seaf_cache/oras5_1979_2014`，训练结果建议放在 `/tmp/seaf_runs/` 对应的 campaign symlink 下，避免占满 50 GB 项目盘；`/tmp` 仅用于本次容器会话，完成后必须归档结果；
@@ -164,7 +164,7 @@ primary metric 使用 forecast-origin MSE；moving block length 5；10,000 boots
 | `ofb_climax` | 1.5e-4, 5e-4, 1e-3 |
 | `ofb_swin` | 1.5e-5, 5e-5, 1.5e-4 |
 
-统一 seed 42、30 epochs、scheduler patience 6、early-stopping patience 30、`post_training_evaluation=none`。8 epochs 只足以排除明显发散的 LR，不足以在 SEAF、AFNO、ClimaX 和 Swin 之间建立可靠的架构内排序。正式选择规则是最后 5 个 epoch validation-selection loss 的 median 最小，其次 best validation loss 最小。
+统一 seed 42、30 epochs、scheduler patience 6、early-stopping patience 30、`post_training_evaluation=none`。正式选择规则是最后 5 个 epoch validation-selection loss 的 median 最小，其次 best validation loss 最小；不再使用 8 epochs 的短校准预算。
 
 若某个模型族满足以下任一条件，不得立即冻结 LR：
 
@@ -172,7 +172,7 @@ primary metric 使用 forecast-origin MSE；moving block length 5；10,000 boots
 - 前两名的 tail-median validation loss 相差不足 1%；
 - 30 epoch 时最优候选仍在明显下降，尚未形成稳定排序。
 
-此时对该模型族补充 interior LR，或将前两名候选延长到总计 50 epochs，再按相同的最后 5 epoch median 规则选择。补充运行仍然只能访问 validation-selection loss，不能生成或查看 test report。
+此时可对该模型族补充 interior LR，但每个补充任务仍固定为 30 epochs；不得自行延长到 50 或 80 epochs。补充运行仍然只能访问 validation-selection loss，不能生成或查看 test report。
 
 服务器运行：
 
@@ -381,8 +381,8 @@ nohup .venv/bin/python -u scripts/run_experiment_queue.py \
 | 阶段 | 任务数 | 是否正式训练 |
 |---|---:|---|
 | LR calibration | 15 + 必要时 refinement | 每个 coarse run 30 epochs |
-| Smoke | 12 | 短训练 |
-| Three-seed confirmation | 36 | 正式训练 |
+| Smoke | 12 | 2 epochs |
+| Three-seed confirmation | 36 | 每个 30 epochs |
 | Frozen final-test evaluation | 36 | 仅评估，不训练 |
 | Optional sensitivity | 4 | validation-only 短训练 |
 

@@ -1,0 +1,5 @@
+{
+  "extends": "oras5_dynaseaf.json",
+  "model_display_name": "DynaSEAF-no-dynamics-aux",
+  "dynaseaf_use_future_dynamics_aux": false
+}

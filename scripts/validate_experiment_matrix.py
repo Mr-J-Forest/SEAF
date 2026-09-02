@@ -30,6 +30,17 @@ VALIDATION_CONFIRMATION_STAGES = {
     'confirm_validation',
     'paper_reimplementation_confirm_validation',
 }
+FORMAL_EPOCHS = 30
+LR_CALIBRATION_STAGES = {
+    'global_lr_calibrate',
+    'global_lr_refine',
+    'paper_reimplementation_lr_calibrate',
+}
+FORMAL_BUDGET_STAGES = (
+    LR_CALIBRATION_STAGES
+    | VALIDATION_SCREEN_STAGES
+    | VALIDATION_CONFIRMATION_STAGES
+)
 PAPER_REIMPLEMENTATION_STAGES = {
     'paper_reimplementation_lr_calibrate',
     'paper_reimplementation_baselines',
@@ -48,8 +59,19 @@ def main() -> int:
 
     matrix_path = (PROJECT_ROOT / args.matrix).resolve()
     matrix = json.loads(matrix_path.read_text(encoding='utf-8'))
+    matrix_protocol = matrix.get('_protocol', {})
     stages = [name for name in matrix if not name.startswith('_')]
     errors: list[str] = []
+    declared_formal_epochs = matrix_protocol.get('formal_epochs')
+    if declared_formal_epochs is not None:
+        try:
+            if int(declared_formal_epochs) != FORMAL_EPOCHS:
+                errors.append(
+                    f'matrix formal_epochs must be {FORMAL_EPOCHS}, '
+                    f'got {declared_formal_epochs!r}'
+                )
+        except (TypeError, ValueError):
+            errors.append('matrix formal_epochs must be an integer')
     if 'final_test' in stages:
         errors.append(
             'final_test must be eval-only from frozen confirmation checkpoints, '
@@ -78,6 +100,11 @@ def main() -> int:
             if stage in NO_TEST_STAGES and scope == 'test':
                 errors.append(
                     f"{stage}/{job['name']}: test evaluation is forbidden before confirmation"
+                )
+            if stage in FORMAL_BUDGET_STAGES and int(config['epochs']) != FORMAL_EPOCHS:
+                errors.append(
+                    f"{stage}/{job['name']}: formal training budget must be "
+                    f"{FORMAL_EPOCHS} epochs (got {config['epochs']})"
                 )
             if stage in VALIDATION_SCREEN_STAGES and scope != 'validation':
                 errors.append(f"{stage}/{job['name']}: screening must evaluate validation")
@@ -157,7 +184,6 @@ def main() -> int:
         json.loads(contrast_path.read_text(encoding='utf-8'))
         if contrast_path else {}
     )
-    matrix_protocol = matrix.get('_protocol', {})
     comparison_stage = str(
         matrix_protocol.get(
             'comparison_stage',

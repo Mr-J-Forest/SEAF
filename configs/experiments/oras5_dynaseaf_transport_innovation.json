@@ -1,0 +1,7 @@
+{
+  "extends": "oras5_dynaseaf.json",
+  "model_display_name": "DynaSEAF-A3-transport-innovation",
+  "dynaseaf_use_transport": true,
+  "dynaseaf_use_innovation": true,
+  "dynaseaf_use_adaptive_gate": false
+}

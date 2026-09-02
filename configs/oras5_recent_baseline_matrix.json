@@ -5,11 +5,12 @@
     "task": "12-month history to 5-month TEMP/SALT anomaly forecast",
     "prediction_space": "training-only monthly climatology anomaly",
     "reference": "anomaly persistence is evaluation-only and is not a neural skip",
-    "selection_rule": "validation only; test is reserved for a separately frozen final_test stage"
+    "selection_rule": "validation only; test is reserved for a separately frozen final_test stage",
+    "formal_epochs": 30
   },
   "_stage_overrides": {
     "global_lr_calibrate": {
-      "epochs": 8,
+      "epochs": 30,
       "scheduler_patience": 3,
       "early_stopping_patience": 8,
       "post_training_evaluation": "none"
@@ -21,7 +22,7 @@
       "post_training_evaluation": "validation"
     },
     "confirm_validation": {
-      "epochs": 80,
+      "epochs": 30,
       "scheduler_patience": 8,
       "early_stopping_patience": 25,
       "post_training_evaluation": "validation"

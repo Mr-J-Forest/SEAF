@@ -4,7 +4,8 @@
     "dataset": "ORAS5_ICDC_r1x1_opa0_1979_2014",
     "task": "12-month anomaly-centered history to 5-month joint TEMP/SALT forecast",
     "selection_rule": "all ablations use the frozen full-model hyperparameters and validation only",
-    "test_policy": "test remains sealed; ablations are reported on validation"
+    "test_policy": "test remains sealed; ablations are reported on validation",
+    "formal_epochs": 30
   },
   "_stage_overrides": {
     "screen": {
@@ -14,7 +15,7 @@
       "post_training_evaluation": "validation"
     },
     "confirm_validation": {
-      "epochs": 80,
+      "epochs": 30,
       "scheduler_patience": 8,
       "early_stopping_patience": 25,
       "post_training_evaluation": "validation"
