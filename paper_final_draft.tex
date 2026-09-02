@@ -199,20 +199,20 @@ The tendency group contains causal one-step backward differences,
 for the TEMP/SALT profiles. The external group contains UVEL, VVEL, SSHA, MLD, TAUX, TAUY, QNET, and WFLUX. These variables are inputs rather than future targets and use the same training-period preprocessing as the base fields. DynaSEAF uses UVEL, VVEL, SSHA, and MLD as the future-dynamics auxiliary targets during training, while the forward path consumes only the dynamics predicted from the history. The complete external group remains available to the shared backbone.
 
 \subsection{Low-Mode Spatial Spectral Mixer}
-The history and channel axes are flattened into
+The input features are encoded through three parallel branches: the schema-aware profile encoder $\mathbf{F}_{\mathrm{prof}}$, the tendency context encoder $\mathbf{F}_{\mathrm{tend}}$, and the scaled external forcing encoder $\alpha_{\mathrm{forc}}\mathbf{F}_{\mathrm{forc}}$ with learnable scale $\alpha_{\mathrm{forc}}$. Their additive combination,
 \begin{equation}
-X^{\mathrm{flat}}\in\mathbb{R}^{B\times(JC^+)\times H\times W},
+\mathbf{F}_0 = \mathbf{F}_{\mathrm{prof}} + \mathbf{F}_{\mathrm{tend}} + \alpha_{\mathrm{forc}}\mathbf{F}_{\mathrm{forc}},
 \end{equation}
-where $C^+$ includes the retained input groups. A Conv2D--GroupNorm--GELU block produces a shared feature map. Each spectral stage computes a real two-dimensional FFT,
+is sent to two cascaded Local--Global spatial blocks. Each block combines a local residual $3\times3$ Conv2D path with a global spectral path. In the spectral path, the feature map $U$ is transformed via
 \begin{equation}
 \widehat{U}=\mathrm{rFFT2}(U),
 \end{equation}
-retains an $8\times8$ low-frequency rectangle, applies learned complex diagonal weights to the positive and negative frequency bands, and sets the remaining modes to zero before the inverse transform:
+retains an $8\times8$ low-frequency rectangle, applies learned complex diagonal weights to the frequency bands, and reconstructs spatial features via inverse FFT:
 \begin{equation}
 U'=U+\psi\left(\mathrm{iFFT2}\left(\mathcal{M}_{\mathrm{low}}(\widehat{U})\right)\right).
 \label{eq:spectral}
 \end{equation}
-The reported model uses two spatial stages with pointwise convolutional blocks between them. Temporal ordering is retained through fixed channel positions and causal tendency inputs, while the Fourier transform operates only over the two spatial dimensions.
+The resulting representation $F\in\mathbb{R}^{B\times192\times H\times W}$ is shared across subsequent prediction heads.
 
 \subsection{Multiple Deterministic Hypotheses}
 The shared feature map is sent to $M=4$ parallel decoder heads. Each head contains a Conv2D--GroupNorm--GELU block followed by a $1\times1$ projection to the $K C_y$ joint target channels. The resulting deterministic hypotheses are
@@ -222,18 +222,17 @@ The shared feature map is sent to $M=4$ parallel decoder heads. Each head contai
 The decoder heads represent alternative deterministic anomaly hypotheses rather than independent physical simulations or calibrated uncertainty estimates.
 
 \subsection{Lead-Conditioned Forcing Fusion}
-LCFF is defined as one coupled mechanism rather than two independent modules. From the external input group, a dedicated encoder produces a forcing representation $Z_f$. Given the shared feature map $F$, forecast-lead encoding $e_h$, and the $M=4$ deterministic hypothesis fields, the aggregation network produces
-\begin{align}
-g_m(h,i,j)&=\mathcal{G}_{\theta}(F_{i,j},Z_{f,i,j},e_h)_m,\nonumber\\
-G_m(h,i,j)&=\operatorname{softmax}_m g_m(h,i,j).
-\label{eq:lcff}
-\end{align}
-The final anomaly forecast is
+LCFF couples the dedicated scaled forcing encoder with lead-conditioned hypothesis routing. Given the $M=4$ deterministic hypothesis fields, a lead-specific learnable logit vector $\mathbf{w}_h \in \mathbb{R}^M$ produces global lead-conditioned aggregation weights:
 \begin{equation}
-\widehat{A}_{t+h,i,j}=\sum_{m=1}^{M}G_m(h,i,j)\widehat{A}_{m,t+h,i,j}.
+G_m(h)=\operatorname{softmax}_m(\mathbf{w}_h)_m.
+\label{eq:lcff}
+\end{equation}
+The direct anomaly forecast for lead $h \in \{1,\ldots,K\}$ is
+\begin{equation}
+\widehat{A}^{\mathrm{dir}}_h=\sum_{m=1}^{M}G_m(h)\widehat{A}_{m,h}.
 \label{eq:lcff_aggregate}
 \end{equation}
-The SEAF-v1 LCFF control disables both the dedicated forcing representation and lead-conditioned aggregation, while retaining the raw external inputs, profile mixer, local--global blocks, spectral settings, four deterministic hypotheses, and the base spatial gate. This historical backbone contrast does not isolate either LCFF component and is not interpreted as a DynaSEAF component ablation.
+The SEAF-v1 LCFF control disables both the dedicated forcing representation and lead-conditioned aggregation, while retaining the raw external inputs, profile mixer, local--global blocks, spectral settings, four deterministic hypotheses, and uniform head averaging. This historical backbone contrast does not isolate either LCFF component and is not interpreted as a DynaSEAF component ablation.
 
 \subsection{Dynamics-Guided Transport Refinement}
 Given the shared SEAF-v1 feature map $F$ and a lead embedding $e_h$, DynaSEAF predicts a compact set of future dynamics,
@@ -268,15 +267,15 @@ where the last axis stores the two horizontal components $(\Delta x,\Delta y)$ a
 \end{equation}
 The warp samples values and validity masks separately and renormalizes valid ocean values, so land and non-finite source values do not dilute a valid target cell.
 
-The final forecast combines the direct prediction, transported prediction, and residual correction:
+The final anomaly forecast combines the direct prediction, transported prediction, and residual innovation:
 \begin{align}
 R_h&=H_{\mathrm{innov}}(F,\widehat{D}_h,e_h),\nonumber\\
 g_h&=\sigma\!\left(H_{\mathrm{gate}}(F,\widehat{D}_h,e_h)\right),\nonumber\\
-\widehat{A}_h&=(1-g_h)\widehat{A}^{\mathrm{dir}}_h
-       +g_h\widehat{A}^{\mathrm{trans}}_h+R_h.
+\widehat{A}_h&=(1-g_h)\odot\widehat{A}^{\mathrm{dir}}_h
+       +g_h\odot\widehat{A}^{\mathrm{trans}}_h+R_h.
 \label{eq:dynaseaf_forecast}
 \end{align}
-The full configuration uses a target-resolved adaptive gate. The residual-correction and gate output layers are zero-initialized, and the gate prior is approximately $0.15$, which keeps the initial model close to the direct SEAF-v1 forecast while allowing lead- and location-dependent corrections.
+The residual innovation $R_h$ is a learned non-transport anomaly correction for local physical tendencies and thermodynamic modifications not captured by coordinate advection. The gate output layer pre-activation bias is initialized to $b_0 \approx -1.7346$, setting the initial post-sigmoid gate prior to $\sigma(b_0) \approx 0.15$. The residual-correction and gate layers are zero-initialized, keeping the initial model close to the direct SEAF-v1 forecast while allowing lead- and location-dependent corrections. The physical prediction is then reconstructed as $\widehat{Y}_{t+h}=C_{t+h}+\mathcal{T}^{-1}(\widehat{A}_h)$, where $\mathcal{T}^{-1}$ denotes inverse target standardization.
 
 For DynaSEAF, the training objective is
 \begin{equation}
